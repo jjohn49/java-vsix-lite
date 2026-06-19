@@ -1,8 +1,9 @@
 //! Syntax-level analysis for the pure-Rust default tier.
 //!
 //! Wraps `tree-sitter-java` for error-tolerant, incremental parsing and turns
-//! the resulting tree into LSP artifacts (currently: syntax diagnostics).
-//! Everything here operates on a single open document — no workspace indexing.
+//! the resulting tree into LSP artifacts: syntax diagnostics, document symbols,
+//! and folding/selection ranges. Everything here operates on a single open
+//! document — no workspace indexing.
 //!
 //! ## Position encoding
 //!
@@ -14,7 +15,10 @@
 
 #![forbid(unsafe_code)]
 
-use ls_types::{Diagnostic, DiagnosticSeverity, DocumentSymbol, Position, Range, SymbolKind};
+use ls_types::{
+    Diagnostic, DiagnosticSeverity, DocumentSymbol, FoldingRange, FoldingRangeKind, Position,
+    Range, SelectionRange, SymbolKind,
+};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Re-exported so the server can name `Tree`/`Parser` without a direct
@@ -94,6 +98,33 @@ impl<'a> LineIndex<'a> {
             line: line as u32,
             character: character as u32,
         }
+    }
+
+    /// Convert an LSP [`Position`] back into a byte offset (the inverse of
+    /// [`Self::position`]). Out-of-range lines/characters clamp to the document.
+    pub fn offset(&self, position: Position) -> usize {
+        let Some(&line_start) = self.line_starts.get(position.line as usize) else {
+            return self.text.len();
+        };
+        let line_end = self
+            .line_starts
+            .get(position.line as usize + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        let target = position.character as usize;
+        let mut units = 0usize;
+        let mut byte = line_start;
+        for ch in self.text[line_start..line_end].chars() {
+            if units >= target {
+                break;
+            }
+            units += match self.encoding {
+                PositionEncoding::Utf8 => ch.len_utf8(),
+                PositionEncoding::Utf16 => ch.len_utf16(),
+            };
+            byte += ch.len_utf8();
+        }
+        byte
     }
 
     fn range(&self, node: Node) -> Range {
@@ -277,6 +308,112 @@ fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     found
 }
 
+/// Compute folding ranges: type/method/lambda bodies, switch and array blocks,
+/// multi-line block comments, and the leading import group. tree-sitter rows are
+/// 0-based line numbers, identical to LSP lines, so no encoding conversion is
+/// needed here.
+pub fn folding_ranges(tree: &Tree) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+    let root = tree.root_node();
+    fold_import_group(root, &mut ranges);
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = match node.kind() {
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "block"
+            | "constructor_body"
+            | "switch_block"
+            | "array_initializer" => Some(None),
+            "block_comment" => Some(Some(FoldingRangeKind::Comment)),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            push_fold(node, kind, &mut ranges);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    ranges
+}
+
+fn fold_import_group(root: Node, ranges: &mut Vec<FoldingRange>) {
+    let mut cursor = root.walk();
+    let imports: Vec<Node> = root
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "import_declaration")
+        .collect();
+    if let (Some(first), Some(last)) = (imports.first(), imports.last()) {
+        let (start, end) = (
+            first.start_position().row as u32,
+            last.end_position().row as u32,
+        );
+        if end > start {
+            ranges.push(FoldingRange {
+                start_line: start,
+                end_line: end,
+                kind: Some(FoldingRangeKind::Imports),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn push_fold(node: Node, kind: Option<FoldingRangeKind>, ranges: &mut Vec<FoldingRange>) {
+    let start = node.start_position().row as u32;
+    let end = node.end_position().row as u32;
+    if end > start {
+        ranges.push(FoldingRange {
+            start_line: start,
+            end_line: end,
+            kind,
+            ..Default::default()
+        });
+    }
+}
+
+/// For each requested position, return the chain of enclosing syntax ranges
+/// (innermost first, each pointing to its larger parent up to the file root) —
+/// the data backing editor "expand/shrink selection".
+pub fn selection_ranges(
+    tree: &Tree,
+    index: &LineIndex,
+    positions: &[Position],
+) -> Vec<SelectionRange> {
+    positions
+        .iter()
+        .map(|&position| selection_range_at(tree, index, position))
+        .collect()
+}
+
+fn selection_range_at(tree: &Tree, index: &LineIndex, position: Position) -> SelectionRange {
+    let byte = index.offset(position);
+    let root = tree.root_node();
+    let mut node = root
+        .named_descendant_for_byte_range(byte, byte)
+        .unwrap_or(root);
+
+    // Walk node -> root, collecting the ancestor chain.
+    let mut chain = vec![node];
+    while let Some(parent) = node.parent() {
+        chain.push(parent);
+        node = parent;
+    }
+
+    // Fold outermost -> innermost so each range's `parent` is the larger one.
+    let mut current: Option<SelectionRange> = None;
+    for node in chain.into_iter().rev() {
+        current = Some(SelectionRange {
+            range: index.range(node),
+            parent: current.map(Box::new),
+        });
+    }
+    current.expect("ancestor chain is never empty")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +529,60 @@ mod tests {
         assert_eq!(class.selection_range.start.character, 6);
         assert_eq!(class.selection_range.end.character, 9);
         assert_eq!(class.range.start.character, 0);
+    }
+
+    #[test]
+    fn offset_round_trips_with_position() {
+        let src = "class A {\n  int x;\n}\n";
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        for byte in [0usize, 6, src.find("int").unwrap(), src.find('x').unwrap()] {
+            assert_eq!(index.offset(index.position(byte)), byte);
+        }
+    }
+
+    #[test]
+    fn offset_handles_utf16_surrogates() {
+        let src = "class 😀 {}";
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let brace = src.find('{').unwrap();
+        assert_eq!(index.offset(index.position(brace)), brace);
+    }
+
+    #[test]
+    fn folding_covers_class_and_method_bodies() {
+        let src = "class A {\n  void m() {\n    return;\n  }\n}\n";
+        let folds = folding_ranges(&parse_str(src));
+        // class_body spans lines 0..4, method block spans lines 1..3.
+        assert!(folds.iter().any(|f| f.start_line == 0 && f.end_line == 4));
+        assert!(folds.iter().any(|f| f.start_line == 1 && f.end_line == 3));
+    }
+
+    #[test]
+    fn folding_groups_imports() {
+        let src = "import a.B;\nimport c.D;\nimport e.F;\nclass A {}\n";
+        let folds = folding_ranges(&parse_str(src));
+        let imports = folds
+            .iter()
+            .find(|f| f.kind == Some(FoldingRangeKind::Imports))
+            .expect("import fold");
+        assert_eq!((imports.start_line, imports.end_line), (0, 2));
+    }
+
+    #[test]
+    fn selection_range_widens_from_identifier_to_file() {
+        let src = "class A { int field; }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = Position {
+            line: 0,
+            character: src.find("field").unwrap() as u32,
+        };
+        let inner = &selection_ranges(&tree, &index, &[at])[0];
+        // Innermost range is the `field` identifier; ranges only widen outward.
+        assert_eq!(inner.range.start.character, 14);
+        assert_eq!(inner.range.end.character, 19);
+        let outer = inner.parent.as_ref().expect("has an enclosing range");
+        assert!(outer.range.start.character <= inner.range.start.character);
+        assert!(outer.range.end.character >= inner.range.end.character);
     }
 }

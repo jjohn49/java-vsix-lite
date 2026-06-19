@@ -122,6 +122,8 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -170,6 +172,30 @@ impl LanguageServer for Backend {
         let index = LineIndex::new(&doc.text, self.encoding());
         let symbols = jvl_syntax::document_symbols(&doc.tree, &doc.text, &index);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let docs = self.documents.lock().await;
+        let Some(doc) = docs.get(params.text_document.uri.as_str()) else {
+            return Ok(None);
+        };
+        Ok(Some(jvl_syntax::folding_ranges(&doc.tree)))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let docs = self.documents.lock().await;
+        let Some(doc) = docs.get(params.text_document.uri.as_str()) else {
+            return Ok(None);
+        };
+        let index = LineIndex::new(&doc.text, self.encoding());
+        Ok(Some(jvl_syntax::selection_ranges(
+            &doc.tree,
+            &index,
+            &params.positions,
+        )))
     }
 }
 
