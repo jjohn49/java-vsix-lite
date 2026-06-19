@@ -46,6 +46,10 @@ struct Backend {
     /// Whether the client supports snippet completion (`$1` tab stops). Defaults
     /// to `false` until negotiated during `initialize`.
     snippet_support: OnceLock<bool>,
+    /// Bytecode-backed symbols for imported (JDK/dependency) types. Built lazily
+    /// on first use so the JDK's jmods aren't scanned until completion/hover needs
+    /// them.
+    classpath: OnceLock<jvl_classpath::Classpath>,
 }
 
 impl Backend {
@@ -56,6 +60,7 @@ impl Backend {
             documents: Mutex::new(HashMap::new()),
             encoding: OnceLock::new(),
             snippet_support: OnceLock::new(),
+            classpath: OnceLock::new(),
         }
     }
 
@@ -68,6 +73,11 @@ impl Backend {
 
     fn snippet_support(&self) -> bool {
         self.snippet_support.get().copied().unwrap_or(false)
+    }
+
+    /// The imported-type symbol source, built from the user's JDK on first use.
+    fn classpath(&self) -> &jvl_classpath::Classpath {
+        self.classpath.get_or_init(jvl_classpath::Classpath::from_jdk)
     }
 
     /// Parse `text`, reusing `old` for an incremental reparse when the caller has
@@ -311,7 +321,8 @@ impl LanguageServer for Backend {
         // (for cross-file types). All synchronous — no await held.
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        Ok(jvl_syntax::hover(&open, 0, &index, position))
+        let symbols = ClasspathSymbols(self.classpath());
+        Ok(jvl_syntax::hover(&open, 0, &index, position, &symbols))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -323,8 +334,36 @@ impl LanguageServer for Backend {
         };
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let items = jvl_syntax::completion(&open, 0, &index, position, self.snippet_support());
+        let symbols = ClasspathSymbols(self.classpath());
+        let items =
+            jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+    }
+}
+
+/// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
+/// bytecode model into the analysis crate's external-symbol types.
+struct ClasspathSymbols<'a>(&'a jvl_classpath::Classpath);
+
+impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
+    fn class(&self, fqn: &str) -> Option<jvl_syntax::ExternalClass> {
+        let info = self.0.class(fqn)?;
+        Some(jvl_syntax::ExternalClass {
+            supers: info.supers.clone(),
+            members: info
+                .members
+                .iter()
+                .map(|m| jvl_syntax::ExternalMember {
+                    name: m.name.clone(),
+                    kind: match m.kind {
+                        jvl_classpath::MemberKind::Method => jvl_syntax::ExternalMemberKind::Method,
+                        jvl_classpath::MemberKind::Field => jvl_syntax::ExternalMemberKind::Field,
+                    },
+                    signature: m.signature.clone(),
+                    is_static: m.is_static,
+                })
+                .collect(),
+        })
     }
 }
 

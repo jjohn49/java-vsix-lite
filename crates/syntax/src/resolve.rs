@@ -3,8 +3,12 @@
 //! unresolved query yields `None`, never a panic, even on tree-sitter
 //! ERROR/MISSING recovery nodes.
 
+use std::collections::HashSet;
+
 use tree_sitter::{Node, Tree};
 
+use crate::external::{ExternalMember, SymbolSource};
+use crate::imports::Imports;
 use crate::model::{base_type_name, named_children, Member, MemberKind, TypeDecl, TypeTable};
 use crate::{node_text, OpenDoc};
 
@@ -12,6 +16,15 @@ use crate::{node_text, OpenDoc};
 /// deep; this bounds stack use on pathological nesting without affecting any
 /// legitimate code.
 const MAX_RESOLVE_DEPTH: usize = 64;
+
+/// Everything resolution needs: the cursor's document, the in-project type table,
+/// the file's imports, and the external symbol source (JDK/deps).
+pub(crate) struct Ctx<'a, 't> {
+    pub doc: &'a OpenDoc<'t>,
+    pub table: &'a TypeTable<'t>,
+    pub imports: &'a Imports,
+    pub symbols: &'a dyn SymbolSource,
+}
 
 /// A binding visible at the cursor (local, parameter, for-variable, or field).
 #[derive(Clone)]
@@ -33,16 +46,23 @@ pub(crate) enum BindingKind {
     Field,
 }
 
+/// A receiver type: either declared in an open document or an external
+/// (JDK/dependency) type named by its FQN.
+pub(crate) enum ResolvedType<'t> {
+    InProject(TypeDecl<'t>),
+    External(String),
+}
+
 /// A resolved receiver type plus whether the access is static (the receiver was
 /// a bare type name, e.g. `Math.`), which filters member completion.
 pub(crate) struct Resolved<'t> {
-    pub decl: TypeDecl<'t>,
+    pub ty: ResolvedType<'t>,
     pub static_only: bool,
 }
 
-fn instance(decl: TypeDecl) -> Resolved {
+fn instance(ty: ResolvedType) -> Resolved {
     Resolved {
-        decl,
+        ty,
         static_only: false,
     }
 }
@@ -129,82 +149,137 @@ fn receiver_ending_at<'t>(tree: &'t Tree, dot: usize) -> Option<Node<'t>> {
 /// Resolve a receiver expression node to the type whose members it exposes.
 pub(crate) fn resolve_receiver_type<'t>(
     recv: Node<'t>,
-    doc: &OpenDoc<'t>,
-    table: &TypeTable<'t>,
+    ctx: &Ctx<'_, 't>,
 ) -> Option<Resolved<'t>> {
-    resolve_receiver_depth(recv, doc, table, 0)
+    resolve_receiver_depth(recv, ctx, 0)
 }
 
 fn resolve_receiver_depth<'t>(
     recv: Node<'t>,
-    doc: &OpenDoc<'t>,
-    table: &TypeTable<'t>,
+    ctx: &Ctx<'_, 't>,
     depth: usize,
 ) -> Option<Resolved<'t>> {
     if depth > MAX_RESOLVE_DEPTH {
         return None;
     }
     match recv.kind() {
-        "this" => enclosing_typedecl(recv, doc.source).map(instance),
+        "this" => enclosing_typedecl(recv, ctx.doc.source).map(|td| instance(ResolvedType::InProject(td))),
         "super" => {
-            let td = enclosing_typedecl(recv, doc.source)?;
+            let td = enclosing_typedecl(recv, ctx.doc.source)?;
             let sup = td.supers.first()?;
-            table.get(sup).cloned().map(instance)
+            resolve_super(sup, ctx).map(instance)
         }
         // `type_identifier` is how tree-sitter parses a bare name in the common
         // mid-edit shape `recv.partial` (an ERROR / scoped_type_identifier), so
         // it must resolve like `identifier` — instance var or static type name.
         "identifier" | "type_identifier" => {
-            resolve_name_to_type(node_text(recv, doc.source), recv.start_byte(), doc, table)
+            resolve_name_to_type(node_text(recv, ctx.doc.source), recv.start_byte(), ctx)
         }
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
             let field = recv.child_by_field_name("field")?;
-            let obj_ty = resolve_receiver_depth(obj, doc, table, depth + 1)?;
-            let member = table.find_member(&obj_ty.decl, node_text(field, doc.source))?;
-            member_type_decl(&member, table).map(instance)
+            let obj_ty = resolve_receiver_depth(obj, ctx, depth + 1)?;
+            // Only an in-project object exposes a field whose declared type we can
+            // re-resolve (external field-type chaining is deferred).
+            let ResolvedType::InProject(td) = &obj_ty.ty else {
+                return None;
+            };
+            let member = ctx.table.find_member(td, node_text(field, ctx.doc.source))?;
+            let type_node = field_type_node(member.node)?;
+            resolve_type_node(type_node, member.source, ctx).map(instance)
         }
         "object_creation_expression" => {
             let ty = recv.child_by_field_name("type")?;
-            let base = base_type_name(ty, doc.source)?;
-            table.get(base).cloned().map(instance)
+            resolve_type_node(ty, ctx.doc.source, ctx).map(instance)
         }
-        "scoped_type_identifier" | "scoped_identifier" => resolve_scoped_path(recv, doc, table),
-        "parenthesized_expression" => {
-            resolve_receiver_depth(recv.named_child(0)?, doc, table, depth + 1)
-        }
+        "scoped_type_identifier" | "scoped_identifier" => resolve_scoped_path(recv, ctx),
+        "parenthesized_expression" => resolve_receiver_depth(recv.named_child(0)?, ctx, depth + 1),
         _ => None,
     }
 }
 
 /// Resolve a simple name at a position: a scope binding gives an instance type;
-/// otherwise a bare type name gives static access.
+/// otherwise a bare type name gives static access (in-project or external).
 pub(crate) fn resolve_name_to_type<'t>(
     name: &str,
     byte: usize,
-    doc: &OpenDoc<'t>,
-    table: &TypeTable<'t>,
+    ctx: &Ctx<'_, 't>,
 ) -> Option<Resolved<'t>> {
-    if let Some(binding) = lookup_binding(doc.tree, doc.source, byte, name, table) {
-        let ty = binding.type_node?;
-        let base = base_type_name(ty, binding.source)?;
-        return Some(instance(table.get(base)?.clone()));
+    if let Some(binding) = lookup_binding(ctx.doc.tree, ctx.doc.source, byte, name, ctx.table) {
+        let type_node = binding.type_node?;
+        return resolve_type_node(type_node, binding.source, ctx).map(instance);
     }
-    table.get(name).map(|td| Resolved {
-        decl: td.clone(),
+    if let Some(td) = ctx.table.get(name) {
+        return Some(Resolved {
+            ty: ResolvedType::InProject(td.clone()),
+            static_only: true,
+        });
+    }
+    let fqn = resolve_simple_to_fqn(name, ctx)?;
+    Some(Resolved {
+        ty: ResolvedType::External(fqn),
         static_only: true,
     })
 }
 
-/// The declared type of a field member, resolved to a [`TypeDecl`]. Methods have
-/// no resolvable result yet (return-type inference is deferred).
-fn member_type_decl<'t>(member: &Member<'t>, table: &TypeTable<'t>) -> Option<TypeDecl<'t>> {
-    if member.kind != MemberKind::Field {
-        return None;
+/// Resolve a declared-type node to a receiver type: in-project if the open docs
+/// declare it, else an external FQN (fully-qualified use, or a simple name
+/// resolved through imports + the symbol source).
+fn resolve_type_node<'t>(
+    type_node: Node<'t>,
+    source: &'t str,
+    ctx: &Ctx<'_, 't>,
+) -> Option<ResolvedType<'t>> {
+    if let Some(fqn) = dotted_type_name(type_node, source) {
+        let simple = fqn.rsplit('.').next().unwrap_or(&fqn);
+        if let Some(td) = ctx.table.get(simple) {
+            return Some(ResolvedType::InProject(td.clone()));
+        }
+        return ctx.symbols.class(&fqn).is_some().then_some(ResolvedType::External(fqn));
     }
-    let ty = field_type_node(member.node)?;
-    let base = base_type_name(ty, member.source)?;
-    table.get(base).cloned()
+    let simple = base_type_name(type_node, source)?;
+    if let Some(td) = ctx.table.get(simple) {
+        return Some(ResolvedType::InProject(td.clone()));
+    }
+    resolve_simple_to_fqn(simple, ctx).map(ResolvedType::External)
+}
+
+/// A supertype simple name → in-project decl or external FQN.
+fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
+    if let Some(td) = ctx.table.get(simple) {
+        return Some(ResolvedType::InProject(td.clone()));
+    }
+    resolve_simple_to_fqn(simple, ctx).map(ResolvedType::External)
+}
+
+/// First import candidate FQN that the symbol source can actually resolve.
+fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
+    ctx.imports
+        .candidates(simple)
+        .into_iter()
+        .find(|fqn| ctx.symbols.class(fqn).is_some())
+}
+
+/// The full dotted name of a fully-qualified type node (`java.util.List`), or
+/// `None` for a simple (unqualified) type.
+fn dotted_type_name(type_node: Node, source: &str) -> Option<String> {
+    match type_node.kind() {
+        "scoped_type_identifier" => {
+            let parts = flatten_scoped(type_node, source);
+            (parts.len() >= 2).then(|| parts.join("."))
+        }
+        "generic_type" => named_children(type_node)
+            .into_iter()
+            .next()
+            .and_then(|n| dotted_type_name(n, source)),
+        "annotated_type" => named_children(type_node)
+            .into_iter()
+            .find_map(|n| dotted_type_name(n, source)),
+        "array_type" => type_node
+            .child_by_field_name("element")
+            .and_then(|e| dotted_type_name(e, source)),
+        _ => None,
+    }
 }
 
 /// The declared-type node of a field/record-component declarator.
@@ -215,21 +290,141 @@ fn field_type_node<'t>(declarator: Node<'t>) -> Option<Node<'t>> {
     declarator.parent()?.child_by_field_name("type")
 }
 
-/// Resolve a dotted path (`a.b.c`) parsed as a scoped identifier: the first
-/// segment is a name in scope, each subsequent segment a field of the prior type.
-fn resolve_scoped_path<'t>(
-    node: Node<'t>,
-    doc: &OpenDoc<'t>,
-    table: &TypeTable<'t>,
+/// Resolve a dotted path (`a.b.c`). Prefer an in-project var.field chain; failing
+/// that, treat the whole dotted name as a fully-qualified external type (static).
+fn resolve_scoped_path<'t>(node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
+    let names = flatten_scoped(node, ctx.doc.source);
+    if let Some(resolved) = resolve_inproject_chain(&names, node.start_byte(), ctx) {
+        return Some(resolved);
+    }
+    let fqn = names.join(".");
+    if ctx.symbols.class(&fqn).is_some() {
+        Some(Resolved {
+            ty: ResolvedType::External(fqn),
+            static_only: true,
+        })
+    } else {
+        None
+    }
+}
+
+fn resolve_inproject_chain<'t>(
+    names: &[&str],
+    first_byte: usize,
+    ctx: &Ctx<'_, 't>,
 ) -> Option<Resolved<'t>> {
-    let names = flatten_scoped(node, doc.source);
     let (first, rest) = names.split_first()?;
-    let mut current = resolve_name_to_type(first, node.start_byte(), doc, table)?;
+    let mut current = resolve_name_to_type(first, first_byte, ctx)?;
     for segment in rest {
-        let member = table.find_member(&current.decl, segment)?;
-        current = instance(member_type_decl(&member, table)?);
+        let ResolvedType::InProject(td) = &current.ty else {
+            return None;
+        };
+        let member = ctx.table.find_member(td, segment)?;
+        let type_node = field_type_node(member.node)?;
+        current = instance(resolve_type_node(type_node, member.source, ctx)?);
     }
     Some(current)
+}
+
+/// A member of a resolved type — declared in an open document or external.
+pub(crate) enum HierMember<'t> {
+    InProject(Member<'t>),
+    External(ExternalMember),
+}
+
+impl HierMember<'_> {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            HierMember::InProject(m) => m.name,
+            HierMember::External(m) => &m.name,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MemberAcc<'t> {
+    out: Vec<HierMember<'t>>,
+    seen: HashSet<String>,
+    visited_node: HashSet<usize>,
+    visited_fqn: HashSet<String>,
+}
+
+/// All members of a resolved type, own and inherited, across the in-project ↔
+/// external boundary. Deduplicated by rendered signature (override hides the
+/// inherited copy; overloads survive); cycle- and depth-guarded.
+pub(crate) fn collect_members<'t>(
+    resolved: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+) -> Vec<HierMember<'t>> {
+    let mut acc = MemberAcc::default();
+    walk_members(&resolved.ty, ctx, resolved.static_only, &mut acc, 0);
+    acc.out
+}
+
+/// The member named `name` on a resolved type or any supertype.
+pub(crate) fn find_member_hier<'t>(
+    resolved: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+    name: &str,
+) -> Option<HierMember<'t>> {
+    collect_members(resolved, ctx)
+        .into_iter()
+        .find(|m| m.name() == name)
+}
+
+fn walk_members<'t>(
+    ty: &ResolvedType<'t>,
+    ctx: &Ctx<'_, 't>,
+    static_only: bool,
+    acc: &mut MemberAcc<'t>,
+    depth: usize,
+) {
+    if depth > MAX_RESOLVE_DEPTH {
+        return;
+    }
+    match ty {
+        ResolvedType::InProject(td) => {
+            if !acc.visited_node.insert(td.node.id()) {
+                return;
+            }
+            for m in td.own_members() {
+                if static_only && !(m.is_static || matches!(m.kind, MemberKind::NestedType(_))) {
+                    continue;
+                }
+                let sig = crate::signature::signature(m.node, m.source)
+                    .unwrap_or_else(|| m.name.to_string());
+                if acc.seen.insert(sig) {
+                    acc.out.push(HierMember::InProject(m));
+                }
+            }
+            for sup in &td.supers {
+                if let Some(sd) = ctx.table.get(sup) {
+                    walk_members(&ResolvedType::InProject(sd.clone()), ctx, static_only, acc, depth + 1);
+                } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
+                    walk_members(&ResolvedType::External(fqn), ctx, static_only, acc, depth + 1);
+                }
+            }
+        }
+        ResolvedType::External(fqn) => {
+            if !acc.visited_fqn.insert(fqn.clone()) {
+                return;
+            }
+            let Some(class) = ctx.symbols.class(fqn) else {
+                return;
+            };
+            for m in class.members {
+                if static_only && !m.is_static {
+                    continue;
+                }
+                if acc.seen.insert(m.signature.clone()) {
+                    acc.out.push(HierMember::External(m));
+                }
+            }
+            for sup in class.supers {
+                walk_members(&ResolvedType::External(sup), ctx, static_only, acc, depth + 1);
+            }
+        }
+    }
 }
 
 fn flatten_scoped<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {

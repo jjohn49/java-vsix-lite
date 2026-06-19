@@ -1,0 +1,43 @@
+//! The seam between pure analysis and bytecode-backed external symbols.
+//!
+//! `jvl-syntax` stays IO-free: it calls [`SymbolSource`] to learn the members and
+//! supertypes of a fully-qualified type it cannot find in the open documents. The
+//! server implements this over `jvl-classpath`; tests pass a mock.
+
+/// A type resolved from outside the open documents (a JDK or dependency class).
+pub struct ExternalClass {
+    /// Superclass + interface FQNs.
+    pub supers: Vec<String>,
+    pub members: Vec<ExternalMember>,
+}
+
+/// One member of an external type, with a pre-rendered (raw) signature.
+pub struct ExternalMember {
+    pub name: String,
+    pub kind: ExternalMemberKind,
+    pub signature: String,
+    pub is_static: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExternalMemberKind {
+    Method,
+    Field,
+}
+
+/// Provides signature-level symbols for fully-qualified type names. Binary names
+/// (nested types use `$`) are expected. Implementations must be cheap/cached;
+/// `jvl-syntax` may call this many times per request.
+pub trait SymbolSource {
+    fn class(&self, fqn: &str) -> Option<ExternalClass>;
+}
+
+/// A [`SymbolSource`] that resolves nothing — used when no JDK is available and
+/// in tests that exercise only in-project resolution.
+pub struct NoSymbols;
+
+impl SymbolSource for NoSymbols {
+    fn class(&self, _fqn: &str) -> Option<ExternalClass> {
+        None
+    }
+}

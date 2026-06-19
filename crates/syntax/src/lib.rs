@@ -27,12 +27,15 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 pub use tree_sitter;
 
 mod completion;
+mod external;
 mod hover;
+mod imports;
 mod model;
 mod resolve;
 mod signature;
 
 pub use completion::completion;
+pub use external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource};
 pub use hover::hover;
 
 /// A snapshot of one open document the analysis can read: its source text and

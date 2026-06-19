@@ -141,3 +141,9 @@ Workspace Trust (no build execution in this slice).
 Transitive + parent-POM/BOM resolution; Gradle execution behind Workspace Trust;
 jimage fallback; generic `Signature` rendering; classpath re-resolution on
 build-file edits; fuzz targets for the ZIP + class readers (M8).
+
+Implementation note (Slice B): external lookups run inside the synchronous
+resolution phase, which holds the documents lock; the first lookup of a class
+does archive IO there (subsequent ones hit the cache). A future refinement is to
+resolve external members after releasing the lock, so a cold lookup never blocks
+other document requests.

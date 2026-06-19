@@ -5,27 +5,54 @@
 use ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use tree_sitter::{Node, Tree};
 
+use crate::external::SymbolSource;
+use crate::imports::Imports;
 use crate::model::{named_children, TypeTable};
-use crate::resolve;
+use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
 use crate::signature::{javadoc, signature};
 use crate::{node_text, LineIndex, OpenDoc};
 
+/// What to render: an in-project declaration node (signature + Javadoc from the
+/// tree), or an external member's pre-rendered signature (no Javadoc — JDK/jar
+/// bytecode carries none).
+enum Target<'t> {
+    InProject(Node<'t>, &'t str),
+    External(String),
+}
+
 /// Build a hover for the identifier under the cursor, or `None` if there is none
 /// or it doesn't resolve to a renderable declaration.
-pub fn hover(docs: &[OpenDoc], current: usize, index: &LineIndex, pos: Position) -> Option<Hover> {
+pub fn hover(
+    docs: &[OpenDoc],
+    current: usize,
+    index: &LineIndex,
+    pos: Position,
+    symbols: &dyn SymbolSource,
+) -> Option<Hover> {
     let doc = docs.get(current)?;
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
+    let imports = Imports::parse(doc.tree, doc.source);
+    let ctx = Ctx {
+        doc,
+        table: &table,
+        imports: &imports,
+        symbols,
+    };
 
     let name_node = identifier_at(doc.tree, cursor)?;
-    let (decl_node, decl_source) = resolve_declaration(name_node, doc, &table)?;
-    let sig = signature(decl_node, decl_source)?;
-
-    let mut value = format!("```java\n{sig}\n```");
-    if let Some(doc_text) = javadoc(decl_node, decl_source) {
-        value.push_str("\n\n");
-        value.push_str(&doc_text);
-    }
+    let value = match resolve_target(name_node, &ctx)? {
+        Target::InProject(node, source) => {
+            let sig = signature(node, source)?;
+            let mut value = format!("```java\n{sig}\n```");
+            if let Some(doc_text) = javadoc(node, source) {
+                value.push_str("\n\n");
+                value.push_str(&doc_text);
+            }
+            value
+        }
+        Target::External(sig) => format!("```java\n{sig}\n```"),
+    };
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -42,44 +69,38 @@ fn identifier_at<'t>(tree: &'t Tree, cursor: usize) -> Option<Node<'t>> {
     matches!(node.kind(), "identifier" | "type_identifier" | "this" | "super").then_some(node)
 }
 
-/// Resolve the identifier node to the declaration to render and the source it
-/// lives in. Handles declaration names, member accesses, calls, and plain
-/// references (locals/params/fields/types).
-fn resolve_declaration<'t>(
-    name_node: Node<'t>,
-    doc: &OpenDoc<'t>,
-    table: &TypeTable<'t>,
-) -> Option<(Node<'t>, &'t str)> {
+/// Resolve the identifier node to what hover should render. Handles declaration
+/// names, member accesses (in-project or external), calls, and plain references.
+fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
     if matches!(name_node.kind(), "this" | "super") {
-        let resolved = resolve::resolve_receiver_type(name_node, doc, table)?;
-        return Some((resolved.decl.node, resolved.decl.source));
+        let resolved = resolve::resolve_receiver_type(name_node, ctx)?;
+        return inproject_target(&resolved);
     }
 
-    let name = node_text(name_node, doc.source);
+    let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
         if is_decl_name(parent, name_node) {
-            return Some((parent, doc.source));
+            return Some(Target::InProject(parent, ctx.doc.source));
         }
         match parent.kind() {
             "field_access" if field_is(parent, "field", name_node) => {
                 let object = parent.child_by_field_name("object")?;
-                let resolved = resolve::resolve_receiver_type(object, doc, table)?;
-                let member = table.find_member(&resolved.decl, name)?;
-                return Some((member.node, member.source));
+                let resolved = resolve::resolve_receiver_type(object, ctx)?;
+                return member_target(&resolved, ctx, name);
             }
             "method_invocation" if field_is(parent, "name", name_node) => {
-                let decl = match parent.child_by_field_name("object") {
-                    Some(object) => {
-                        let resolved = resolve::resolve_receiver_type(object, doc, table)?;
-                        table.find_member(&resolved.decl, name)?
-                    }
-                    None => {
-                        let td = resolve::enclosing_typedecl(name_node, doc.source)?;
-                        table.find_member(&td, name)?
-                    }
+                let resolved = match parent.child_by_field_name("object") {
+                    Some(object) => resolve::resolve_receiver_type(object, ctx)?,
+                    None => Resolved {
+                        ty: ResolvedType::InProject(resolve::enclosing_typedecl(
+                            name_node,
+                            ctx.doc.source,
+                        )?),
+                        static_only: false,
+                    },
                 };
-                return Some((decl.node, decl.source));
+                return member_target(&resolved, ctx, name);
             }
             // Mid-edit `recv.member` (no trailing `;`) parses as a scoped path; if
             // the cursor is on the trailing segment, resolve it as a member of the
@@ -87,22 +108,41 @@ fn resolve_declaration<'t>(
             "scoped_type_identifier" | "scoped_identifier" => {
                 let segments = named_children(parent);
                 if segments.len() >= 2 && segments.last() == Some(&name_node) {
-                    let resolved = resolve::resolve_receiver_type(segments[0], doc, table)?;
-                    let member = table.find_member(&resolved.decl, name)?;
-                    return Some((member.node, member.source));
+                    let resolved = resolve::resolve_receiver_type(segments[0], ctx)?;
+                    return member_target(&resolved, ctx, name);
                 }
             }
             _ => {}
         }
     }
 
-    // Plain reference: a local/param/field, then a type name.
+    // Plain reference: a local/param/field, then an in-project type name.
     if let Some(binding) =
-        resolve::lookup_binding(doc.tree, doc.source, name_node.start_byte(), name, table)
+        resolve::lookup_binding(ctx.doc.tree, ctx.doc.source, name_node.start_byte(), name, ctx.table)
     {
-        return Some((binding.decl_node, binding.source));
+        return Some(Target::InProject(binding.decl_node, binding.source));
     }
-    table.get(name).map(|td| (td.node, td.source))
+    ctx.table
+        .get(name)
+        .map(|td| Target::InProject(td.node, td.source))
+}
+
+fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
+    match &resolved.ty {
+        ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source)),
+        ResolvedType::External(_) => None,
+    }
+}
+
+fn member_target<'t>(
+    resolved: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+    name: &str,
+) -> Option<Target<'t>> {
+    match resolve::find_member_hier(resolved, ctx, name)? {
+        HierMember::InProject(m) => Some(Target::InProject(m.node, m.source)),
+        HierMember::External(m) => Some(Target::External(m.signature)),
+    }
 }
 
 /// Whether `name_node` is the `name` field of a renderable declaration `parent`.
@@ -133,8 +173,33 @@ fn field_is(parent: Node, field: &str, name_node: Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols};
     use crate::{new_parser, parse, PositionEncoding};
     use tree_sitter::Tree;
+
+    /// A `SymbolSource` that resolves exactly one class, for external hover tests.
+    struct OneClass {
+        fqn: &'static str,
+        members: Vec<ExternalMember>,
+    }
+
+    impl SymbolSource for OneClass {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            (fqn == self.fqn).then(|| ExternalClass {
+                supers: Vec::new(),
+                members: self
+                    .members
+                    .iter()
+                    .map(|m| ExternalMember {
+                        name: m.name.clone(),
+                        kind: m.kind,
+                        signature: m.signature.clone(),
+                        is_static: m.is_static,
+                    })
+                    .collect(),
+            })
+        }
+    }
 
     fn tree(src: &str) -> Tree {
         parse(&mut new_parser(), src, None).expect("parse")
@@ -151,7 +216,7 @@ mod tests {
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         // Cursor on the first byte of the identifier the marker begins with.
         let at = src.find(marker).expect("marker present");
-        let h = hover(&docs, 0, &index, index.position(at))?;
+        let h = hover(&docs, 0, &index, index.position(at), &NoSymbols)?;
         match h.contents {
             HoverContents::Markup(m) => Some(m.value),
             _ => None,
@@ -223,7 +288,7 @@ mod tests {
         ];
         let index = LineIndex::new(use_src, PositionEncoding::Utf16);
         let at = use_src.find("tick(").unwrap();
-        let h = hover(&docs, 0, &index, index.position(at)).expect("hover");
+        let h = hover(&docs, 0, &index, index.position(at), &NoSymbols).expect("hover");
         let HoverContents::Markup(m) = h.contents else {
             panic!("markup")
         };
@@ -244,7 +309,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find("Helper.S").unwrap() + "Helper.".len(); // cursor on `S`
-        let h = hover(&docs, 0, &index, index.position(at)).expect("hover on S");
+        let h = hover(&docs, 0, &index, index.position(at), &NoSymbols).expect("hover on S");
         let HoverContents::Markup(m) = h.contents else {
             panic!("markup")
         };
@@ -263,6 +328,32 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find('{').unwrap();
-        assert!(hover(&docs, 0, &index, index.position(at)).is_none());
+        assert!(hover(&docs, 0, &index, index.position(at), &NoSymbols).is_none());
+    }
+
+    #[test]
+    fn hover_on_external_member() {
+        let src = "import java.util.List;\nclass C { void m() { List xs; xs.size(); } }\n";
+        let symbols = OneClass {
+            fqn: "java.util.List",
+            members: vec![ExternalMember {
+                name: "size".to_string(),
+                kind: ExternalMemberKind::Method,
+                signature: "int size()".to_string(),
+                is_static: false,
+            }],
+        };
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find("size(").unwrap(); // cursor on `size`
+        let h = hover(&docs, 0, &index, index.position(at), &symbols).expect("hover");
+        let HoverContents::Markup(m) = h.contents else {
+            panic!("markup")
+        };
+        assert!(m.value.contains("int size()"), "{}", m.value);
     }
 }

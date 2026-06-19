@@ -9,8 +9,10 @@ use ls_types::{
 };
 use tree_sitter::Node;
 
+use crate::external::{ExternalMember, ExternalMemberKind, SymbolSource};
+use crate::imports::Imports;
 use crate::model::{named_children, Member, MemberKind, TypeDecl, TypeKind, TypeTable};
-use crate::resolve::{self, Binding, BindingKind, Resolved};
+use crate::resolve::{self, Binding, BindingKind, Ctx, HierMember, Resolved, ResolvedType};
 use crate::signature::{javadoc, signature};
 use crate::{LineIndex, OpenDoc};
 
@@ -33,67 +35,99 @@ pub fn completion(
     index: &LineIndex,
     pos: Position,
     snippets: bool,
+    symbols: &dyn SymbolSource,
 ) -> Vec<CompletionItem> {
     let Some(doc) = docs.get(current) else {
         return Vec::new();
     };
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
+    let imports = Imports::parse(doc.tree, doc.source);
+    let ctx = Ctx {
+        doc,
+        table: &table,
+        imports: &imports,
+        symbols,
+    };
 
     if let Some(recv) = resolve::member_receiver(doc.tree, doc.source, cursor) {
         // In a member-access position: only members, never scope fallback, so a
         // typed `.` never yields wrong global suggestions.
-        return match resolve::resolve_receiver_type(recv, doc, &table) {
-            Some(resolved) => member_items(&resolved, &table, snippets),
+        return match resolve::resolve_receiver_type(recv, &ctx) {
+            Some(resolved) => member_items(&resolved, &ctx, snippets),
             None => Vec::new(),
         };
     }
 
-    scope_items(doc, cursor, &table, snippets)
+    scope_items(&ctx, cursor, snippets)
 }
 
 fn member_items<'t>(
     resolved: &Resolved<'t>,
-    table: &TypeTable<'t>,
+    ctx: &Ctx<'_, 't>,
     snippets: bool,
 ) -> Vec<CompletionItem> {
-    table
-        .all_members(&resolved.decl, resolved.static_only)
+    resolve::collect_members(resolved, ctx)
         .iter()
-        .map(|m| member_item(m, snippets))
+        .map(|m| hier_item(m, snippets))
         .collect()
 }
 
-fn member_item(member: &Member, snippets: bool) -> CompletionItem {
-    let detail = signature(member.node, member.source);
-    let doc = javadoc(member.node, member.source);
-    let kind = member_kind(member.kind);
+fn hier_item(member: &HierMember, snippets: bool) -> CompletionItem {
+    match member {
+        HierMember::InProject(m) => inproject_item(m, snippets),
+        HierMember::External(m) => external_item(m, snippets),
+    }
+}
+
+fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
     let mut item = CompletionItem {
         label: member.name.to_string(),
-        kind: Some(kind),
-        detail,
-        documentation: doc.map(markdown),
+        kind: Some(member_kind(member.kind)),
+        detail: signature(member.node, member.source),
+        documentation: javadoc(member.node, member.source).map(markdown),
         ..Default::default()
     };
     if member.kind == MemberKind::Method {
-        apply_method_insert(&mut item, member.node, snippets);
+        apply_method_insert(&mut item, method_has_params(member.node), snippets);
     }
     item
 }
 
-/// Decide a method's insert text. With snippet support: `name()` (zero-arg) or a
-/// `name($1)` tab-stop snippet. Without it: `name()` or `name(` (the editor
-/// leaves the cursor after the paren). `$` is escaped because it is legal in Java
-/// identifiers and is snippet-special.
-fn apply_method_insert(item: &mut CompletionItem, method: Node, snippets: bool) {
-    let has_params = method
+fn external_item(member: &ExternalMember, snippets: bool) -> CompletionItem {
+    let kind = match member.kind {
+        ExternalMemberKind::Method => CompletionItemKind::METHOD,
+        ExternalMemberKind::Field => CompletionItemKind::FIELD,
+    };
+    let mut item = CompletionItem {
+        label: member.name.clone(),
+        kind: Some(kind),
+        detail: Some(member.signature.clone()),
+        ..Default::default()
+    };
+    if member.kind == ExternalMemberKind::Method {
+        // A rendered signature ending in `()` takes no parameters.
+        apply_method_insert(&mut item, !member.signature.ends_with("()"), snippets);
+    }
+    item
+}
+
+fn method_has_params(method: Node) -> bool {
+    method
         .child_by_field_name("parameters")
         .map(|p| {
             named_children(p)
                 .iter()
                 .any(|c| matches!(c.kind(), "formal_parameter" | "spread_parameter"))
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+/// Decide a method's insert text. With snippet support: `name()` (zero-arg) or a
+/// `name($1)` tab-stop snippet. Without it: `name()` or `name(` (the editor
+/// leaves the cursor after the paren). `$` is escaped because it is legal in Java
+/// identifiers and is snippet-special.
+fn apply_method_insert(item: &mut CompletionItem, has_params: bool, snippets: bool) {
     if !has_params {
         item.insert_text = Some(format!("{}()", item.label));
     } else if snippets {
@@ -105,12 +139,8 @@ fn apply_method_insert(item: &mut CompletionItem, method: Node, snippets: bool) 
     }
 }
 
-fn scope_items<'t>(
-    doc: &OpenDoc<'t>,
-    cursor: usize,
-    table: &TypeTable<'t>,
-    snippets: bool,
-) -> Vec<CompletionItem> {
+fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<CompletionItem> {
+    let doc = ctx.doc;
     let mut items = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut push = |item: CompletionItem, items: &mut Vec<CompletionItem>| {
@@ -120,23 +150,27 @@ fn scope_items<'t>(
         }
     };
 
-    // Locals, params, for-vars. Fields come from the single all_members() pass
-    // below, so they are excluded here to avoid recomputing the member set.
-    for binding in resolve::collect_bindings(doc.tree, doc.source, cursor, table, false) {
+    // Locals, params, for-vars. Fields come from the member pass below, so they
+    // are excluded here to avoid recomputing the member set.
+    for binding in resolve::collect_bindings(doc.tree, doc.source, cursor, ctx.table, false) {
         push(binding_item(&binding), &mut items);
     }
 
     // The enclosing type's members (fields + methods + nested types), own and
-    // inherited, callable unqualified — one all_members() pass.
+    // inherited (including from external supertypes), callable unqualified.
     let node = resolve::node_at(doc.tree, cursor);
     if let Some(td) = resolve::enclosing_typedecl(node, doc.source) {
-        for member in table.all_members(&td, false) {
-            push(member_item(&member, snippets), &mut items);
+        let resolved = Resolved {
+            ty: ResolvedType::InProject(td),
+            static_only: false,
+        };
+        for member in resolve::collect_members(&resolved, ctx) {
+            push(hier_item(&member, snippets), &mut items);
         }
     }
 
     // In-scope type names (current + open files).
-    for decl in table.iter() {
+    for decl in ctx.table.iter() {
         push(type_item(decl), &mut items);
     }
 
@@ -204,8 +238,40 @@ fn markdown(value: String) -> Documentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external::{ExternalClass, NoSymbols};
     use crate::{new_parser, parse, PositionEncoding};
+    use std::collections::HashMap;
     use tree_sitter::Tree;
+
+    /// A `SymbolSource` backed by a fixture map, for hermetic external-symbol tests.
+    struct MockSymbols(HashMap<String, ExternalClass>);
+
+    impl SymbolSource for MockSymbols {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            self.0.get(fqn).map(|c| ExternalClass {
+                supers: c.supers.clone(),
+                members: c
+                    .members
+                    .iter()
+                    .map(|m| ExternalMember {
+                        name: m.name.clone(),
+                        kind: m.kind,
+                        signature: m.signature.clone(),
+                        is_static: m.is_static,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    fn ext_method(name: &str, signature: &str) -> ExternalMember {
+        ExternalMember {
+            name: name.to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: signature.to_string(),
+            is_static: false,
+        }
+    }
 
     fn tree(src: &str) -> Tree {
         parse(&mut new_parser(), src, None).expect("parse")
@@ -221,7 +287,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at), true)
+        completion(&docs, 0, &index, index.position(at), true, &NoSymbols)
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -351,7 +417,7 @@ mod tests {
         ];
         let index = LineIndex::new(use_src, PositionEncoding::Utf16);
         let at = use_src.find("w.").unwrap() + 2;
-        let items = completion(&docs, 0, &index, index.position(at), true);
+        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
         assert!(has(&items, "spin"), "cross-file: {:?}", labels(&items));
     }
 
@@ -373,7 +439,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at), snippets)
+        completion(&docs, 0, &index, index.position(at), snippets, &NoSymbols)
     }
 
     #[test]
@@ -455,6 +521,104 @@ mod tests {
         }];
         let index = LineIndex::new(&src, PositionEncoding::Utf16);
         let at = src.rfind('.').unwrap() + 1;
-        let _ = completion(&docs, 0, &index, index.position(at), true);
+        let _ = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
+    }
+
+    // --- External (JDK/dependency) symbol resolution, via a mock SymbolSource ---
+
+    fn complete_ext(src: &str, marker: &str, symbols: &dyn SymbolSource) -> Vec<CompletionItem> {
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find(marker).expect("marker present") + marker.len();
+        completion(&docs, 0, &index, index.position(at), true, symbols)
+    }
+
+    fn mock(entries: Vec<(&str, ExternalClass)>) -> MockSymbols {
+        MockSymbols(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    }
+
+    fn ext_class(supers: &[&str], members: Vec<ExternalMember>) -> ExternalClass {
+        ExternalClass {
+            supers: supers.iter().map(|s| s.to_string()).collect(),
+            members,
+        }
+    }
+
+    #[test]
+    fn external_member_completion_via_explicit_import() {
+        let src = "import java.util.List;\nclass C { void m() { List xs; xs.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.List",
+            ext_class(
+                &[],
+                vec![
+                    ext_method("add", "boolean add(Object)"),
+                    ext_method("get", "Object get(int)"),
+                    ext_method("size", "int size()"),
+                ],
+            ),
+        )]);
+        let items = complete_ext(src, "xs.", &symbols);
+        assert!(has(&items, "add"), "{:?}", labels(&items));
+        assert!(has(&items, "get"));
+        assert!(has(&items, "size"));
+        assert_eq!(detail_of(&items, "size"), Some("int size()"));
+    }
+
+    #[test]
+    fn external_completion_via_wildcard_import() {
+        let src = "import java.util.*;\nclass C { void m() { Map xs; xs.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.Map",
+            ext_class(&[], vec![ext_method("put", "Object put(Object, Object)")]),
+        )]);
+        assert!(has(&complete_ext(src, "xs.", &symbols), "put"));
+    }
+
+    #[test]
+    fn external_completion_via_implicit_java_lang() {
+        let src = "class C { void m() { String s; s.x; } }\n";
+        let symbols = mock(vec![(
+            "java.lang.String",
+            ext_class(&[], vec![ext_method("length", "int length()")]),
+        )]);
+        assert!(has(&complete_ext(src, "s.", &symbols), "length"));
+    }
+
+    #[test]
+    fn inproject_extending_external_inherits_members() {
+        let src = "import java.util.ArrayList;\nclass MyList extends ArrayList { void m() { this.x; } }\n";
+        let symbols = mock(vec![
+            (
+                "java.util.ArrayList",
+                ext_class(
+                    &["java.lang.Object"],
+                    vec![ext_method("add", "boolean add(Object)")],
+                ),
+            ),
+            (
+                "java.lang.Object",
+                ext_class(&[], vec![ext_method("toString", "String toString()")]),
+            ),
+        ]);
+        let items = complete_ext(src, "this.", &symbols);
+        assert!(has(&items, "add"), "inherited external: {:?}", labels(&items));
+        assert!(has(&items, "toString"), "via Object: {:?}", labels(&items));
+    }
+
+    #[test]
+    fn external_receiver_without_symbols_is_empty() {
+        let src = "import java.util.List;\nclass C { void m() { List xs; xs.x; } }\n";
+        let items = complete_ext(src, "xs.", &NoSymbols);
+        assert!(items.is_empty(), "{:?}", labels(&items));
     }
 }
