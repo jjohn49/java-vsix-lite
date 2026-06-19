@@ -11,7 +11,27 @@
       "label": "build server",
       "type": "shell",
       "command": "cargo build",
-      "problemMatcher": "$rustc",
+      // Inline rustc matcher so the task doesn't depend on the rust-analyzer
+      // extension contributing "$rustc". Parses cargo/rustc's two-line
+      // "error[...]: msg" / "  --> file:line:col" diagnostic format.
+      "problemMatcher": {
+        "owner": "rust",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": [
+          {
+            "regexp": "^(warning|error)(?:\\[(.*?)\\])?: (.*)$",
+            "severity": 1,
+            "code": 2,
+            "message": 3
+          },
+          {
+            "regexp": "^\\s+-->\\s+(.*?):(\\d+):(\\d+)$",
+            "file": 1,
+            "line": 2,
+            "column": 3
+          }
+        ]
+      },
       "presentation": { "reveal": "silent" }
     },
     {

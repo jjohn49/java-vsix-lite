@@ -5,10 +5,11 @@
 //! binary over stdio and stays thin; all analysis lives here and in the
 //! `jvl-*` crates.
 //!
-//! As of M1 the default tier parses open Java files incrementally with
-//! tree-sitter and provides syntax diagnostics, document symbols,
-//! folding/selection ranges, and semantic tokens. Documents are tracked
-//! open-files-only — there is no workspace indexing.
+//! The default tier parses open Java files incrementally with tree-sitter and
+//! provides syntax diagnostics, document symbols, folding/selection ranges,
+//! semantic tokens, and — over in-file/open-file types — hover and completion.
+//! Documents are tracked open-files-only; there is no workspace or JAR/JDK
+//! indexing (that arrives with the bytecode sub-project).
 //!
 //! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
 //! to stderr via `tracing`.
@@ -129,6 +130,14 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    // `.` requests member completion; identifier/keyword
+                    // completion is requested explicitly (Ctrl-Space) or by the
+                    // editor as the user types.
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..Default::default()
+                }),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -269,6 +278,56 @@ impl LanguageServer for Backend {
             data,
         })))
     }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(current) = docs.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        // Resolution reads the cursor's document plus every other open document
+        // (for cross-file types). All synchronous — no await held.
+        let open = open_docs(&docs, uri.as_str(), current);
+        let index = LineIndex::new(&current.text, self.encoding());
+        Ok(jvl_syntax::hover(&open, 0, &index, position))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let docs = self.documents.lock().await;
+        let Some(current) = docs.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let open = open_docs(&docs, uri.as_str(), current);
+        let index = LineIndex::new(&current.text, self.encoding());
+        let items = jvl_syntax::completion(&open, 0, &index, position);
+        Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+    }
+}
+
+/// Build the open-document slice the analysis reads, with the cursor's document
+/// first (index 0) so it wins simple-name collisions.
+fn open_docs<'a>(
+    docs: &'a HashMap<String, Document>,
+    current_uri: &str,
+    current: &'a Document,
+) -> Vec<jvl_syntax::OpenDoc<'a>> {
+    let mut open = Vec::with_capacity(docs.len());
+    open.push(jvl_syntax::OpenDoc {
+        source: &current.text,
+        tree: &current.tree,
+    });
+    for (uri, doc) in docs.iter() {
+        if uri != current_uri {
+            open.push(jvl_syntax::OpenDoc {
+                source: &doc.text,
+                tree: &doc.tree,
+            });
+        }
+    }
+    open
 }
 
 #[tokio::main]

@@ -1,0 +1,379 @@
+//! Declaration model extracted from parse trees.
+//!
+//! [`TypeTable`] indexes the type declarations across all open documents by
+//! **simple name**; [`TypeDecl`] describes one type and yields its [`Member`]s on
+//! demand. This is the shared substrate the resolver, completion, and hover all
+//! build on. Everything borrows the parse trees (`'t`) and runs synchronously
+//! while the server holds the documents lock — no allocation of source text.
+
+use std::collections::HashMap;
+
+use tree_sitter::Node;
+
+use crate::{node_text, OpenDoc};
+
+/// Collect a node's named children into a `Vec` so callers don't juggle the
+/// tree-sitter cursor borrow.
+pub(crate) fn named_children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+/// Collect a node's children (named and anonymous) into a `Vec`.
+pub(crate) fn children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).collect()
+}
+
+/// Kind of a Java type declaration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TypeKind {
+    Class,
+    Interface,
+    Enum,
+    Record,
+    Annotation,
+}
+
+impl TypeKind {
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            TypeKind::Class => "class",
+            TypeKind::Interface => "interface",
+            TypeKind::Enum => "enum",
+            TypeKind::Record => "record",
+            TypeKind::Annotation => "@interface",
+        }
+    }
+
+    fn from_kind(kind: &str) -> Option<TypeKind> {
+        Some(match kind {
+            "class_declaration" => TypeKind::Class,
+            "interface_declaration" => TypeKind::Interface,
+            "enum_declaration" => TypeKind::Enum,
+            "record_declaration" => TypeKind::Record,
+            "annotation_type_declaration" => TypeKind::Annotation,
+            _ => return None,
+        })
+    }
+
+    /// The named child kind holding this type's members.
+    fn body_kind(self) -> &'static str {
+        match self {
+            TypeKind::Class | TypeKind::Record => "class_body",
+            TypeKind::Interface => "interface_body",
+            TypeKind::Enum => "enum_body",
+            TypeKind::Annotation => "annotation_type_body",
+        }
+    }
+}
+
+/// What sort of member a [`Member`] is (drives the completion item kind).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MemberKind {
+    Method,
+    Field,
+    EnumConstant,
+    NestedType(TypeKind),
+}
+
+/// One member of a type: a method, field, enum constant, or nested type.
+#[derive(Clone, Copy)]
+pub(crate) struct Member<'t> {
+    pub name: &'t str,
+    pub kind: MemberKind,
+    /// The declaration node to render/inspect: `method_declaration`,
+    /// `variable_declarator` (for fields), `enum_constant`, `formal_parameter`
+    /// (record component), or a nested type declaration.
+    pub node: Node<'t>,
+    pub is_static: bool,
+    /// Source text of the document this member came from (members can be
+    /// inherited from a type declared in a different open file).
+    pub source: &'t str,
+}
+
+/// A single type declaration, located in some open document.
+#[derive(Clone)]
+pub(crate) struct TypeDecl<'t> {
+    pub name: &'t str,
+    pub kind: TypeKind,
+    /// Simple names of supertypes (`extends` + `implements`/`permits` excluded).
+    pub supers: Vec<&'t str>,
+    /// The type declaration node.
+    pub node: Node<'t>,
+    pub source: &'t str,
+}
+
+impl<'t> TypeDecl<'t> {
+    /// Build a `TypeDecl` from a type declaration node, or `None` if `node` is
+    /// not a type declaration.
+    pub(crate) fn from_node(node: Node<'t>, source: &'t str) -> Option<TypeDecl<'t>> {
+        let kind = TypeKind::from_kind(node.kind())?;
+        let name = node.child_by_field_name("name").map(|n| node_text(n, source))?;
+        let supers = collect_supers(node, source);
+        Some(TypeDecl {
+            name,
+            kind,
+            supers,
+            node,
+            source,
+        })
+    }
+
+    /// The body node containing this type's members.
+    fn body(&self) -> Option<Node<'t>> {
+        named_children(self.node)
+            .into_iter()
+            .find(|c| c.kind() == self.kind.body_kind())
+    }
+
+    /// This type's directly-declared members (no inheritance).
+    pub(crate) fn own_members(&self) -> Vec<Member<'t>> {
+        let mut out = Vec::new();
+        // Record components behave as fields/accessors.
+        if self.kind == TypeKind::Record {
+            if let Some(params) = self.node.child_by_field_name("parameters") {
+                for p in named_children(params) {
+                    if p.kind() == "formal_parameter" {
+                        if let Some(name) = p.child_by_field_name("name") {
+                            out.push(Member {
+                                name: node_text(name, self.source),
+                                kind: MemberKind::Field,
+                                node: p,
+                                is_static: false,
+                                source: self.source,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(body) = self.body() {
+            collect_body_members(body, self.source, &mut out);
+        }
+        out
+    }
+}
+
+/// Extract supertype simple names from `extends`/`implements` clauses.
+fn collect_supers<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
+    let mut supers = Vec::new();
+    for child in named_children(node) {
+        match child.kind() {
+            // `extends Base` (class) -> superclass(type); `extends A, B` (interface)
+            // -> (extends_interfaces (type_list ...)).
+            "superclass" | "extends_interfaces" | "super_interfaces" => {
+                for ty in named_children(child) {
+                    if ty.kind() == "type_list" {
+                        for t in named_children(ty) {
+                            push_base_name(t, source, &mut supers);
+                        }
+                    } else {
+                        push_base_name(ty, source, &mut supers);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    supers
+}
+
+fn push_base_name<'t>(ty: Node<'t>, source: &'t str, out: &mut Vec<&'t str>) {
+    if let Some(name) = base_type_name(ty, source) {
+        out.push(name);
+    }
+}
+
+/// Walk a type body, pushing each declared member.
+fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Member<'t>>) {
+    for child in named_children(body) {
+        match child.kind() {
+            "field_declaration" => {
+                let is_static = has_modifier(child, source, "static");
+                for declarator in named_children(child) {
+                    if declarator.kind() == "variable_declarator" {
+                        if let Some(name) = declarator.child_by_field_name("name") {
+                            out.push(Member {
+                                name: node_text(name, source),
+                                kind: MemberKind::Field,
+                                node: declarator,
+                                is_static,
+                                source,
+                            });
+                        }
+                    }
+                }
+            }
+            "method_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    out.push(Member {
+                        name: node_text(name, source),
+                        kind: MemberKind::Method,
+                        node: child,
+                        is_static: has_modifier(child, source, "static"),
+                        source,
+                    });
+                }
+            }
+            "enum_constant" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    out.push(Member {
+                        name: node_text(name, source),
+                        kind: MemberKind::EnumConstant,
+                        node: child,
+                        is_static: true,
+                        source,
+                    });
+                }
+            }
+            // Methods/fields inside an enum live under this wrapper.
+            "enum_body_declarations" => collect_body_members(child, source, out),
+            _ => {
+                if let Some(kind) = TypeKind::from_kind(child.kind()) {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        out.push(Member {
+                            name: node_text(name, source),
+                            kind: MemberKind::NestedType(kind),
+                            node: child,
+                            is_static: has_modifier(child, source, "static"),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The `modifiers` child node of a declaration, if any.
+pub(crate) fn modifiers_node<'t>(decl: Node<'t>) -> Option<Node<'t>> {
+    named_children(decl)
+        .into_iter()
+        .find(|c| c.kind() == "modifiers")
+}
+
+/// Whether a declaration carries a given modifier keyword (e.g. `static`).
+pub(crate) fn has_modifier(decl: Node, source: &str, keyword: &str) -> bool {
+    modifiers_node(decl)
+        .map(|m| children(m).iter().any(|c| node_text(*c, source) == keyword))
+        .unwrap_or(false)
+}
+
+/// The base **simple name** of a type node, erasing generics, scopes, and array
+/// dimensions. Returns `None` for primitives, `void`, and `var`.
+pub(crate) fn base_type_name<'t>(ty: Node<'t>, source: &'t str) -> Option<&'t str> {
+    match ty.kind() {
+        "type_identifier" => Some(node_text(ty, source)),
+        // `List<Integer>` -> first child is the (possibly scoped) type name.
+        "generic_type" => named_children(ty)
+            .into_iter()
+            .next()
+            .and_then(|n| base_type_name(n, source)),
+        // `a.b.C` -> last `type_identifier`.
+        "scoped_type_identifier" => named_children(ty)
+            .into_iter()
+            .rev()
+            .find(|n| n.kind() == "type_identifier")
+            .map(|n| node_text(n, source)),
+        "array_type" => ty
+            .child_by_field_name("element")
+            .and_then(|el| base_type_name(el, source)),
+        "annotated_type" => named_children(ty)
+            .into_iter()
+            .find_map(|n| base_type_name(n, source)),
+        _ => None,
+    }
+}
+
+/// Index of every type declaration across the open documents, by simple name.
+pub(crate) struct TypeTable<'t> {
+    by_name: HashMap<&'t str, TypeDecl<'t>>,
+}
+
+impl<'t> TypeTable<'t> {
+    /// Build the table, scanning `docs[current]` first so current-file types win
+    /// simple-name collisions.
+    pub(crate) fn build(docs: &[OpenDoc<'t>], current: usize) -> TypeTable<'t> {
+        let mut by_name = HashMap::new();
+        let order = std::iter::once(current).chain((0..docs.len()).filter(|&i| i != current));
+        for i in order {
+            let Some(doc) = docs.get(i) else { continue };
+            collect_type_decls(doc.tree.root_node(), doc.source, &mut by_name);
+        }
+        TypeTable { by_name }
+    }
+
+    pub(crate) fn get(&self, simple_name: &str) -> Option<&TypeDecl<'t>> {
+        self.by_name.get(simple_name)
+    }
+
+    /// Every indexed type declaration (used for in-scope type-name completion).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &TypeDecl<'t>> {
+        self.by_name.values()
+    }
+
+    /// Member named `name` on `decl` or any in-table supertype (cycle-guarded).
+    pub(crate) fn find_member(&self, decl: &TypeDecl<'t>, name: &str) -> Option<Member<'t>> {
+        self.all_members(decl, false)
+            .into_iter()
+            .find(|m| m.name == name)
+    }
+
+    /// All members of `decl` plus inherited members from in-table supertypes.
+    /// When `static_only`, keeps only static members and nested types. Overrides
+    /// (same rendered signature) collapse to the nearest declaration; overloads
+    /// survive.
+    pub(crate) fn all_members(&self, decl: &TypeDecl<'t>, static_only: bool) -> Vec<Member<'t>> {
+        let mut out = Vec::new();
+        let mut seen_sig = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+        self.collect_inherited(decl, &mut out, &mut seen_sig, &mut visited);
+        if static_only {
+            out.retain(|m| m.is_static || matches!(m.kind, MemberKind::NestedType(_)));
+        }
+        out
+    }
+
+    fn collect_inherited(
+        &self,
+        decl: &TypeDecl<'t>,
+        out: &mut Vec<Member<'t>>,
+        seen_sig: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<*const u8>,
+    ) {
+        // Guard against cyclic `extends` by the type's node id.
+        let id = decl.node.id() as *const u8;
+        if !visited.insert(id) {
+            return;
+        }
+        for m in decl.own_members() {
+            let sig = crate::signature::signature(m.node, m.source)
+                .unwrap_or_else(|| m.name.to_string());
+            if seen_sig.insert(sig) {
+                out.push(m);
+            }
+        }
+        for sup in &decl.supers {
+            if let Some(super_decl) = self.get(sup) {
+                self.collect_inherited(super_decl, out, seen_sig, visited);
+            }
+        }
+    }
+}
+
+/// DFS the tree, registering every type declaration (top-level and nested) under
+/// its simple name; first registration wins.
+fn collect_type_decls<'t>(
+    root: Node<'t>,
+    source: &'t str,
+    by_name: &mut HashMap<&'t str, TypeDecl<'t>>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(decl) = TypeDecl::from_node(node, source) {
+            by_name.entry(decl.name).or_insert(decl);
+        }
+        stack.extend(children(node));
+    }
+}

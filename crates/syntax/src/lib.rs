@@ -2,8 +2,9 @@
 //!
 //! Wraps `tree-sitter-java` for error-tolerant, incremental parsing and turns
 //! the resulting tree into LSP artifacts: syntax diagnostics, document symbols,
-//! folding/selection ranges, and semantic tokens. Everything here operates on a
-//! single open document — no workspace indexing.
+//! folding/selection ranges, and semantic tokens (each over a single document),
+//! plus hover and completion, which additionally resolve types declared in other
+//! open documents (see [`OpenDoc`]). No workspace or JAR/JDK indexing.
 //!
 //! ## Position encoding
 //!
@@ -24,6 +25,23 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 /// Re-exported so the server can name `Tree`/`Parser` without a direct
 /// dependency on a specific tree-sitter version.
 pub use tree_sitter;
+
+mod completion;
+mod hover;
+mod model;
+mod resolve;
+mod signature;
+
+pub use completion::completion;
+pub use hover::hover;
+
+/// A snapshot of one open document the analysis can read: its source text and
+/// the parse tree kept in sync with it. Borrowed for the duration of one request
+/// (resolution runs synchronously while the server holds the documents lock).
+pub struct OpenDoc<'a> {
+    pub source: &'a str,
+    pub tree: &'a Tree,
+}
 
 /// Cap on diagnostics emitted per document — pathological input (thousands of
 /// errors) must not flood the client or the traversal.

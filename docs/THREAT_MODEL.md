@@ -18,7 +18,7 @@
 ## Attack classes and controls
 
 | Class | Control | Status / where verified |
-|---|---|---|
+| --- | --- | --- |
 | **Untrusted build-script execution** | Never run build scripts implicitly. Honor VS Code Workspace Trust; the extension declares `untrustedWorkspaces: limited`. Gradle classpath + "check build" are explicit, consented, one-shot. | Manifest in place (M0). Enforced M6. TS trust tests (M6/M8). |
 | **XXE / XML entity expansion** (malicious `pom.xml`) | Parse with `roxmltree` (no DTD / external-entity resolution) + size/expansion caps. No network resolver. | M4. Malicious-POM corpus in `fixtures/`. |
 | **Zip-slip / path traversal** (malicious JAR) | Read entries by name only; reject `..` and absolute paths; never extract to disk implicitly. | M4. Zip-slip corpus. |
