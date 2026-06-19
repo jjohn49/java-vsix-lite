@@ -2,10 +2,12 @@
 //!
 //! This is the single LSP server the editor talks to (see the implementation
 //! plan's "Process topology"). The TypeScript extension shell launches this
-//! binary over stdio and stays thin. For M0 this is a walking skeleton: it
-//! speaks the LSP lifecycle, tracks open documents, and publishes a placeholder
-//! diagnostic so the end-to-end pipe (editor -> TS client -> Rust server) is
-//! provably wired before any analysis crates are added.
+//! binary over stdio and stays thin; all analysis lives here and in the
+//! `jvl-*` crates.
+//!
+//! As of M1 the default tier parses open Java files with tree-sitter and
+//! publishes syntax diagnostics. Documents are tracked open-files-only — there
+//! is no workspace indexing.
 //!
 //! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
 //! to stderr via `tracing`.
@@ -13,62 +15,113 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
+use jvl_syntax::tree_sitter::{Parser, Tree};
+use jvl_syntax::{LineIndex, PositionEncoding};
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-#[derive(Debug)]
+/// A single open document: its current text and the parse tree kept in sync
+/// with it.
+struct Document {
+    text: String,
+    tree: Tree,
+}
+
 struct Backend {
     client: Client,
-    /// Open-document text, keyed by URI string. Bounded to open files by
-    /// design — the default tier never indexes the whole workspace.
-    documents: Mutex<HashMap<String, String>>,
+    /// Reused across parses; held only for synchronous parse calls, never across
+    /// an `.await`.
+    parser: StdMutex<Parser>,
+    /// Open documents, keyed by URI string. Open-files-only by design — the
+    /// default tier never indexes the whole workspace.
+    documents: Mutex<HashMap<String, Document>>,
+    /// LSP position encoding negotiated during `initialize` (defaults to UTF-16).
+    encoding: OnceLock<PositionEncoding>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
         Self {
             client,
+            parser: StdMutex::new(jvl_syntax::new_parser()),
             documents: Mutex::new(HashMap::new()),
+            encoding: OnceLock::new(),
         }
     }
 
-    /// M0 placeholder analysis: proves diagnostics flow back to the editor.
-    /// Replaced in M1 by tree-sitter syntax diagnostics.
-    async fn publish_placeholder_diagnostics(&self, uri: Uri, text: &str) {
-        let line_count = text.lines().count().max(1) as u32;
-        let diagnostic = Diagnostic {
-            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-            severity: Some(DiagnosticSeverity::HINT),
-            source: Some("java-vsix-lite".to_string()),
-            message: format!(
-                "java-vsix-lite active (default tier). Document tracked: {line_count} line(s)."
-            ),
-            ..Default::default()
+    fn encoding(&self) -> PositionEncoding {
+        self.encoding
+            .get()
+            .copied()
+            .unwrap_or(PositionEncoding::Utf16)
+    }
+
+    /// Parse from scratch. (Incremental reuse via tree-sitter `InputEdit` lands
+    /// in M1e alongside INCREMENTAL sync; with FULL sync, passing a stale tree
+    /// would produce an incorrect parse, so we don't.)
+    fn parse(&self, text: &str) -> Tree {
+        let mut parser = self.parser.lock().expect("parser mutex poisoned");
+        jvl_syntax::parse(&mut parser, text, None).expect("parser yields a tree for in-memory text")
+    }
+
+    /// Reparse a document, store it, and publish its diagnostics.
+    async fn refresh(&self, uri: Uri, text: String) {
+        let tree = self.parse(&text);
+        let diagnostics = {
+            let index = LineIndex::new(&text, self.encoding());
+            jvl_syntax::syntax_diagnostics(&tree, &index)
         };
+        self.documents
+            .lock()
+            .await
+            .insert(uri.as_str().to_string(), Document { text, tree });
         self.client
-            .publish_diagnostics(uri, vec![diagnostic], None)
+            .publish_diagnostics(uri, diagnostics, None)
             .await;
     }
 }
 
+/// Pick UTF-8 if the client advertises support (lets tree-sitter byte offsets
+/// pass through unconverted); otherwise the LSP default, UTF-16.
+fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
+    let supports_utf8 = params
+        .capabilities
+        .general
+        .as_ref()
+        .and_then(|general| general.position_encodings.as_ref())
+        .is_some_and(|encodings| encodings.contains(&PositionEncodingKind::UTF8));
+    if supports_utf8 {
+        PositionEncoding::Utf8
+    } else {
+        PositionEncoding::Utf16
+    }
+}
+
 impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let encoding = negotiate_encoding(&params);
+        let _ = self.encoding.set(encoding);
+        let position_encoding = Some(match encoding {
+            PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
+            PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
+        });
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "java-vsix-lite".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                // M0 uses FULL sync so document tracking is correct without an
-                // edit-application layer. M1 switches to INCREMENTAL and feeds
-                // ranged edits into tree-sitter's `InputEdit` for proportional,
-                // low-compute reparsing.
+                position_encoding,
+                // M1 uses FULL sync; INCREMENTAL + tree-sitter `InputEdit` is M1e.
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -86,27 +139,16 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let text = params.text_document.text;
-        self.documents
-            .lock()
-            .await
-            .insert(uri.as_str().to_string(), text.clone());
-        self.publish_placeholder_diagnostics(uri, &text).await;
+        self.refresh(params.text_document.uri, params.text_document.text)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
         // FULL sync: the final change in the batch carries the entire document.
         let Some(change) = params.content_changes.into_iter().next_back() else {
             return;
         };
-        let text = change.text;
-        self.documents
-            .lock()
-            .await
-            .insert(uri.as_str().to_string(), text.clone());
-        self.publish_placeholder_diagnostics(uri, &text).await;
+        self.refresh(params.text_document.uri, change.text).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -114,6 +156,20 @@ impl LanguageServer for Backend {
         self.documents.lock().await.remove(uri.as_str());
         // Clear diagnostics for the closed file.
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let docs = self.documents.lock().await;
+        let Some(doc) = docs.get(params.text_document.uri.as_str()) else {
+            return Ok(None);
+        };
+        // Built from the cached tree — no reparse. Sync work, no await held.
+        let index = LineIndex::new(&doc.text, self.encoding());
+        let symbols = jvl_syntax::document_symbols(&doc.tree, &doc.text, &index);
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 }
 

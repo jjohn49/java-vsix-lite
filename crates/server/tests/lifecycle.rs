@@ -1,8 +1,10 @@
-//! End-to-end smoke test for the M0 walking skeleton.
+//! End-to-end test driving the real `jvl-server` binary over raw LSP
+//! (JSON-RPC + `Content-Length` framing on stdio).
 //!
-//! Spawns the real `jvl-server` binary and speaks raw LSP (JSON-RPC over stdio
-//! with `Content-Length` framing) through the full lifecycle:
-//! `initialize` -> `initialized` -> `didOpen` -> `shutdown` -> `exit`.
+//! Covers the lifecycle and the M1 default-tier features end to end:
+//! `initialize` (capabilities) -> open invalid Java (syntax diagnostic) ->
+//! change to valid Java (diagnostics clear) -> `documentSymbol` (outline) ->
+//! `shutdown` -> `exit`.
 //!
 //! It drives the server like a real client would — waiting for each response
 //! before sending the next request — because the server handles messages
@@ -83,19 +85,52 @@ fn lifecycle_smoke() {
         "missing FULL sync capability: {init}"
     );
 
-    // 2. initialized + didOpen -> wait for the placeholder diagnostic.
+    // 2. initialized + didOpen of *invalid* Java -> expect a syntax diagnostic.
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
     send(
-        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Sample.java","languageId":"java","version":1,"text":"class Sample {}\n"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Sample.java","languageId":"java","version":1,"text":"class Sample {\n"}}}"#,
     );
     let diag = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
     assert!(
-        diag.contains("default tier"),
-        "unexpected diagnostic: {diag}"
+        diag.contains("Syntax error"),
+        "expected syntax error: {diag}"
     );
     assert!(diag.contains("file:///Sample.java"), "wrong uri: {diag}");
+    assert!(
+        diag.contains("\"severity\":1"),
+        "expected ERROR severity: {diag}"
+    );
 
-    // 3. shutdown -> wait for result, then exit.
+    // 3. didChange to *valid* Java -> diagnostics must clear (reparse on change).
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Sample.java","version":2},"contentChanges":[{"text":"class Sample { int x; }\n"}]}}"#,
+    );
+    let cleared = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        cleared.contains("\"diagnostics\":[]"),
+        "diagnostics should clear after fix: {cleared}"
+    );
+
+    // 4. documentSymbol -> outline with the class and its field.
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///Sample.java"}}}"#,
+    );
+    let outline = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        outline.contains("Sample"),
+        "outline missing class: {outline}"
+    );
+    assert!(
+        outline.contains("\"kind\":5"),
+        "expected CLASS kind: {outline}"
+    );
+    assert!(outline.contains('x'), "outline missing field: {outline}");
+    assert!(
+        outline.contains("\"kind\":8"),
+        "expected FIELD kind: {outline}"
+    );
+
+    // 5. shutdown -> wait for result, then exit.
     send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
     let shutdown = read_until(&mut reader, "\"id\":2", &mut seen);
     assert!(!shutdown.contains("error"), "shutdown errored: {shutdown}");
