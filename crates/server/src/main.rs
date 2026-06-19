@@ -116,7 +116,8 @@ impl Backend {
 }
 
 /// The workspace root as a filesystem path, from the first workspace folder
-/// (falling back to the deprecated `rootUri`), parsed from its `file://` URI.
+/// (falling back to the deprecated `rootUri`). Uses the URI type's own
+/// percent-decoding file-path conversion rather than hand-parsing.
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     let uri = params
         .workspace_folders
@@ -127,9 +128,7 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
             #[allow(deprecated)]
             params.root_uri.clone()
         })?;
-    let raw = uri.as_str();
-    let path = raw.strip_prefix("file://").unwrap_or(raw);
-    Some(PathBuf::from(path.replace("%20", " ")))
+    Some(uri.to_file_path()?.into_owned())
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.

@@ -147,6 +147,7 @@ fn parse_central_directory(cd: &[u8]) -> HashMap<String, Entry> {
         if uncomp_size != ZIP64_SENTINEL
             && local_offset != ZIP64_SENTINEL
             && (uncomp_size as usize) <= MAX_UNCOMPRESSED
+            && (comp_size as usize) <= MAX_UNCOMPRESSED
             && !is_unsafe_name(name)
         {
             entries.insert(
@@ -172,6 +173,13 @@ fn is_unsafe_name(name: &str) -> bool {
 }
 
 fn read_at(file: &mut File, pos: u64, len: usize) -> Option<Vec<u8>> {
+    // Refuse (before allocating) any read that runs past EOF, so an attacker-
+    // controlled size field from the archive can never request more memory than
+    // the file can actually supply — the threat model's "bounded reads".
+    let file_len = file.metadata().ok()?.len();
+    if pos.checked_add(len as u64)? > file_len {
+        return None;
+    }
     file.seek(SeekFrom::Start(pos)).ok()?;
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf).ok()?;

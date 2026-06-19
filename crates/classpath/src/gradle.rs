@@ -13,10 +13,13 @@ const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) fn dependency_jars(root: &Path, gradle_cache: &Path) -> Vec<PathBuf> {
     let mut coords = Vec::new();
     for name in ["build.gradle", "build.gradle.kts", "gradle/libs.versions.toml"] {
-        if let Ok(text) = std::fs::read_to_string(root.join(name)) {
-            if text.len() <= MAX_BUILD_BYTES {
-                scrape_coords(&text, &mut coords);
-            }
+        let path = root.join(name);
+        // Bound the read by file size before reading it into memory.
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) > MAX_BUILD_BYTES as u64 {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            scrape_coords(&text, &mut coords);
         }
     }
     coords.sort();

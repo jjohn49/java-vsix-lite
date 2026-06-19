@@ -10,12 +10,14 @@ const MAX_POM_BYTES: usize = 4 * 1024 * 1024;
 
 /// Jars of a pom's direct dependencies that exist in the local repository.
 pub(crate) fn dependency_jars(root: &Path, m2_repo: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(root.join("pom.xml")) else {
-        return Vec::new();
-    };
-    if text.len() > MAX_POM_BYTES {
+    let pom = root.join("pom.xml");
+    // Bound the read by file size before pulling the whole file into memory.
+    if std::fs::metadata(&pom).map(|m| m.len()).unwrap_or(u64::MAX) > MAX_POM_BYTES as u64 {
         return Vec::new();
     }
+    let Ok(text) = std::fs::read_to_string(&pom) else {
+        return Vec::new();
+    };
     parse_dependencies(&text)
         .into_iter()
         .filter_map(|(g, a, v)| {
