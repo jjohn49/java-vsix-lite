@@ -80,6 +80,11 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "java" }],
     outputChannelName: "java-vsix-lite",
+    initializationOptions: {
+      unresolvedMemberDiagnostics: vscode.workspace
+        .getConfiguration("java-vsix-lite")
+        .get<boolean>("diagnostics.unresolvedMembers", false),
+    },
   };
 
   client = new LanguageClient(

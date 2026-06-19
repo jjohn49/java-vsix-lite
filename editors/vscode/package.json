@@ -41,6 +41,11 @@
           "enum": ["off", "messages", "verbose"],
           "default": "off",
           "description": "Trace the JSON-RPC traffic between VS Code and the language server (for debugging)."
+        },
+        "java-vsix-lite.diagnostics.unresolvedMembers": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics). Off by default."
         }
       }
     },

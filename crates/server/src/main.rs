@@ -53,6 +53,8 @@ struct Backend {
     classpath: OnceLock<jvl_classpath::Classpath>,
     /// Workspace root (from `initialize`), used to discover project dependencies.
     workspace_root: OnceLock<Option<PathBuf>>,
+    /// Whether to emit unresolved-member diagnostics (opt-in; default off).
+    unresolved_member_diagnostics: OnceLock<bool>,
 }
 
 impl Backend {
@@ -65,6 +67,7 @@ impl Backend {
             snippet_support: OnceLock::new(),
             classpath: OnceLock::new(),
             workspace_root: OnceLock::new(),
+            unresolved_member_diagnostics: OnceLock::new(),
         }
     }
 
@@ -95,20 +98,31 @@ impl Backend {
         jvl_syntax::parse(&mut parser, text, old).expect("parser yields a tree for in-memory text")
     }
 
-    fn diagnostics_for(&self, text: &str, tree: &Tree) -> Vec<Diagnostic> {
-        let index = LineIndex::new(text, self.encoding());
-        jvl_syntax::syntax_diagnostics(tree, &index)
+    /// Syntax diagnostics for a document already stored under `uri`, plus
+    /// unresolved-member diagnostics when that opt-in setting is enabled.
+    fn compute_diagnostics(&self, docs: &HashMap<String, Document>, uri: &str) -> Vec<Diagnostic> {
+        let Some(doc) = docs.get(uri) else {
+            return Vec::new();
+        };
+        let index = LineIndex::new(&doc.text, self.encoding());
+        let mut diagnostics = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
+        if self.unresolved_member_diagnostics.get().copied() == Some(true) {
+            let open = open_docs(docs, uri, doc);
+            let symbols = ClasspathSymbols(self.classpath());
+            diagnostics.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
+        }
+        diagnostics
     }
 
     /// Parse a freshly opened (or fully replaced) document from scratch, store
     /// it, and publish its diagnostics.
     async fn open_document(&self, uri: Uri, text: String) {
         let tree = self.parse(&text, None);
-        let diagnostics = self.diagnostics_for(&text, &tree);
-        self.documents
-            .lock()
-            .await
-            .insert(uri.as_str().to_string(), Document { text, tree });
+        let diagnostics = {
+            let mut docs = self.documents.lock().await;
+            docs.insert(uri.as_str().to_string(), Document { text, tree });
+            self.compute_diagnostics(&docs, uri.as_str())
+        };
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
@@ -129,6 +143,16 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
             params.root_uri.clone()
         })?;
     Some(uri.to_file_path()?.into_owned())
+}
+
+/// The opt-in `unresolvedMemberDiagnostics` flag from `initializationOptions`.
+fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.get("unresolvedMemberDiagnostics"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.
@@ -165,6 +189,9 @@ impl LanguageServer for Backend {
         let _ = self.encoding.set(encoding);
         let _ = self.snippet_support.set(supports_snippets(&params));
         let _ = self.workspace_root.set(workspace_root(&params));
+        let _ = self
+            .unresolved_member_diagnostics
+            .set(unresolved_member_diagnostics_opt(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
@@ -236,37 +263,39 @@ impl LanguageServer for Backend {
         // reparse, then drop the lock before the async publish.
         let diagnostics = {
             let mut docs = self.documents.lock().await;
-            let Some(doc) = docs.get_mut(uri.as_str()) else {
-                return; // change for a document we never opened
-            };
+            {
+                let Some(doc) = docs.get_mut(uri.as_str()) else {
+                    return; // change for a document we never opened
+                };
 
-            let mut from_scratch = false;
-            for change in params.content_changes {
-                match change.range {
-                    Some(range) => {
-                        let applied = jvl_syntax::apply_content_change(
-                            &doc.text,
-                            encoding,
-                            range,
-                            &change.text,
-                        );
-                        // A full replacement earlier in the batch invalidated the
-                        // tree; skip incremental edits and reparse from scratch.
-                        if !from_scratch {
-                            doc.tree.edit(&applied.input_edit);
+                let mut from_scratch = false;
+                for change in params.content_changes {
+                    match change.range {
+                        Some(range) => {
+                            let applied = jvl_syntax::apply_content_change(
+                                &doc.text,
+                                encoding,
+                                range,
+                                &change.text,
+                            );
+                            // A full replacement earlier in the batch invalidated
+                            // the tree; skip incremental edits and reparse fresh.
+                            if !from_scratch {
+                                doc.tree.edit(&applied.input_edit);
+                            }
+                            doc.text = applied.new_text;
                         }
-                        doc.text = applied.new_text;
-                    }
-                    None => {
-                        doc.text = change.text;
-                        from_scratch = true;
+                        None => {
+                            doc.text = change.text;
+                            from_scratch = true;
+                        }
                     }
                 }
-            }
 
-            let old = (!from_scratch).then_some(&doc.tree);
-            doc.tree = self.parse(&doc.text, old);
-            self.diagnostics_for(&doc.text, &doc.tree)
+                let old = (!from_scratch).then_some(&doc.tree);
+                doc.tree = self.parse(&doc.text, old);
+            }
+            self.compute_diagnostics(&docs, uri.as_str())
         };
 
         self.client

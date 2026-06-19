@@ -507,6 +507,107 @@ fn flatten_scoped<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
     out
 }
 
+/// Collect every member name of a resolved type (own + inherited, any kind),
+/// and whether the **entire** supertype hierarchy was resolvable. Used by
+/// unresolved-member diagnostics, which must stay silent unless the answer is
+/// complete (an unknown supertype could declare the member). `java.lang.Object`
+/// members are always included, since they are callable on any reference type.
+pub(crate) fn member_names(resolved: &Resolved<'_>, ctx: &Ctx<'_, '_>) -> (HashSet<String>, bool) {
+    let mut names = HashSet::new();
+    let mut complete = true;
+    let mut visited_node = HashSet::new();
+    let mut visited_fqn = HashSet::new();
+    diag_walk(
+        &resolved.ty,
+        ctx,
+        &mut names,
+        &mut complete,
+        &mut visited_node,
+        &mut visited_fqn,
+        0,
+    );
+    match ctx.symbols.class("java.lang.Object") {
+        Some(object) => names.extend(object.members.into_iter().map(|m| m.name)),
+        None => complete = false, // can't confirm Object's members → never flag
+    }
+    (names, complete)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diag_walk(
+    ty: &ResolvedType<'_>,
+    ctx: &Ctx<'_, '_>,
+    names: &mut HashSet<String>,
+    complete: &mut bool,
+    visited_node: &mut HashSet<usize>,
+    visited_fqn: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_RESOLVE_DEPTH {
+        *complete = false;
+        return;
+    }
+    match ty {
+        ResolvedType::InProject(td) => {
+            if !visited_node.insert(td.node.id()) {
+                return;
+            }
+            for m in td.own_members() {
+                names.insert(m.name.to_string());
+            }
+            for sup in &td.supers {
+                if let Some(sd) = ctx.table.get(sup) {
+                    diag_walk(
+                        &ResolvedType::InProject(sd.clone()),
+                        ctx,
+                        names,
+                        complete,
+                        visited_node,
+                        visited_fqn,
+                        depth + 1,
+                    );
+                } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
+                    diag_walk(
+                        &ResolvedType::External { fqn, args: Vec::new() },
+                        ctx,
+                        names,
+                        complete,
+                        visited_node,
+                        visited_fqn,
+                        depth + 1,
+                    );
+                } else {
+                    *complete = false; // unknown supertype — give up flagging
+                }
+            }
+        }
+        ResolvedType::External { fqn, .. } => {
+            if !visited_fqn.insert(fqn.clone()) {
+                return;
+            }
+            match ctx.symbols.class(fqn) {
+                Some(class) => {
+                    for m in &class.members {
+                        names.insert(m.name.clone());
+                    }
+                    for sup in class.supers {
+                        diag_walk(
+                            &ResolvedType::External { fqn: sup, args: Vec::new() },
+                            ctx,
+                            names,
+                            complete,
+                            visited_node,
+                            visited_fqn,
+                            depth + 1,
+                        );
+                    }
+                }
+                None => *complete = false,
+            }
+        }
+    }
+}
+
 /// The signature to show for an external member: its generic template
 /// substituted with the use-site type arguments when present, otherwise the
 /// erased signature.
