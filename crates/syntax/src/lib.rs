@@ -19,7 +19,7 @@ use ls_types::{
     Diagnostic, DiagnosticSeverity, DocumentSymbol, FoldingRange, FoldingRangeKind, Position,
     Range, SelectionRange, SymbolKind,
 };
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 /// Re-exported so the server can name `Tree`/`Parser` without a direct
 /// dependency on a specific tree-sitter version.
@@ -375,6 +375,71 @@ fn push_fold(node: Node, kind: Option<FoldingRangeKind>, ranges: &mut Vec<Foldin
     }
 }
 
+/// The result of applying one LSP incremental content change: the new document
+/// text and the [`InputEdit`] to feed the previous tree (via [`Tree::edit`])
+/// before an incremental reparse.
+pub struct AppliedEdit {
+    pub new_text: String,
+    pub input_edit: InputEdit,
+}
+
+/// Apply a single ranged content change to `text`, producing the new text and
+/// the matching tree-sitter [`InputEdit`].
+///
+/// tree-sitter [`Point`] columns are **byte** offsets within a line (encoding
+/// independent), so positions are converted through the byte domain. An
+/// inverted or out-of-range range is clamped rather than panicking.
+pub fn apply_content_change(
+    text: &str,
+    encoding: PositionEncoding,
+    range: Range,
+    replacement: &str,
+) -> AppliedEdit {
+    let index = LineIndex::new(text, encoding);
+    let start_byte = index.offset(range.start);
+    let old_end_byte = index.offset(range.end).max(start_byte);
+
+    let line_start = |byte: usize| text[..byte].rfind('\n').map_or(0, |nl| nl + 1);
+    let start_position = Point {
+        row: range.start.line as usize,
+        column: start_byte - line_start(start_byte),
+    };
+    let old_end_position = Point {
+        row: range.end.line as usize,
+        column: old_end_byte - line_start(old_end_byte),
+    };
+
+    let mut new_text =
+        String::with_capacity(text.len() - (old_end_byte - start_byte) + replacement.len());
+    new_text.push_str(&text[..start_byte]);
+    new_text.push_str(replacement);
+    new_text.push_str(&text[old_end_byte..]);
+
+    let new_end_byte = start_byte + replacement.len();
+    let new_end_position = match replacement.rfind('\n') {
+        None => Point {
+            row: start_position.row,
+            column: start_position.column + replacement.len(),
+        },
+        Some(last_nl) => Point {
+            row: start_position.row + replacement.matches('\n').count(),
+            column: replacement.len() - last_nl - 1,
+        },
+    };
+
+    AppliedEdit {
+        new_text,
+        input_edit: InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position,
+        },
+    }
+}
+
 /// For each requested position, return the chain of enclosing syntax ranges
 /// (innermost first, each pointing to its larger parent up to the file root) —
 /// the data backing editor "expand/shrink selection".
@@ -566,6 +631,57 @@ mod tests {
             .find(|f| f.kind == Some(FoldingRangeKind::Imports))
             .expect("import fold");
         assert_eq!((imports.start_line, imports.end_line), (0, 2));
+    }
+
+    /// Apply a change spanning the first occurrence of `find` and assert the
+    /// incrementally-reparsed tree is identical to a from-scratch parse.
+    fn assert_incremental_matches_full(
+        original: &str,
+        find: &str,
+        replacement: &str,
+        expected: &str,
+    ) {
+        let mut parser = new_parser();
+        let tree = parse(&mut parser, original, None).unwrap();
+        let index = LineIndex::new(original, PositionEncoding::Utf16);
+        let at = original.find(find).unwrap();
+        let range = Range {
+            start: index.position(at),
+            end: index.position(at + find.len()),
+        };
+        let applied = apply_content_change(original, PositionEncoding::Utf16, range, replacement);
+        assert_eq!(applied.new_text, expected);
+
+        let mut edited = tree.clone();
+        edited.edit(&applied.input_edit);
+        let incremental = parse(&mut parser, &applied.new_text, Some(&edited)).unwrap();
+        let full = parse(&mut parser, &applied.new_text, None).unwrap();
+        assert_eq!(
+            incremental.root_node().to_sexp(),
+            full.root_node().to_sexp(),
+            "incremental reparse diverged from full reparse"
+        );
+    }
+
+    #[test]
+    fn incremental_same_line_edit_matches_full_reparse() {
+        assert_incremental_matches_full(
+            "class A { int x = 1; }\n",
+            "1",
+            "42",
+            "class A { int x = 42; }\n",
+        );
+    }
+
+    #[test]
+    fn incremental_multiline_insert_matches_full_reparse() {
+        // Insert a new method (with newlines) after the opening brace.
+        assert_incremental_matches_full(
+            "class A {}\n",
+            "{}",
+            "{\n  void m() {}\n}",
+            "class A {\n  void m() {}\n}\n",
+        );
     }
 
     #[test]

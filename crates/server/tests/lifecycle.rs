@@ -3,7 +3,8 @@
 //!
 //! Covers the lifecycle and the M1 default-tier features end to end:
 //! `initialize` (capabilities) -> open invalid Java (syntax diagnostic) ->
-//! change to valid Java (diagnostics clear) -> `documentSymbol` (outline) ->
+//! full-replace to valid (diagnostics clear) -> INCREMENTAL ranged edits
+//! (delete `;` -> error, re-insert -> clear) -> `documentSymbol` (outline) ->
 //! `shutdown` -> `exit`.
 //!
 //! It drives the server like a real client would — waiting for each response
@@ -81,8 +82,8 @@ fn lifecycle_smoke() {
         "missing serverInfo: {init}"
     );
     assert!(
-        init.contains("\"textDocumentSync\":1") || init.contains("\"change\":1"),
-        "missing FULL sync capability: {init}"
+        init.contains("\"textDocumentSync\":2") || init.contains("\"change\":2"),
+        "missing INCREMENTAL sync capability: {init}"
     );
 
     // 2. initialized + didOpen of *invalid* Java -> expect a syntax diagnostic.
@@ -111,7 +112,27 @@ fn lifecycle_smoke() {
         "diagnostics should clear after fix: {cleared}"
     );
 
-    // 4. documentSymbol -> outline with the class and its field.
+    // 4. INCREMENTAL ranged edit: delete the `;` (col 20) -> missing-semicolon.
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Sample.java","version":3},"contentChanges":[{"range":{"start":{"line":0,"character":20},"end":{"line":0,"character":21}},"text":""}]}}"#,
+    );
+    let broke = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        broke.contains("Syntax error") && broke.contains("\"severity\":1"),
+        "ranged delete should reintroduce a syntax error: {broke}"
+    );
+
+    // 5. INCREMENTAL ranged edit: re-insert the `;` -> diagnostics clear again.
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Sample.java","version":4},"contentChanges":[{"range":{"start":{"line":0,"character":20},"end":{"line":0,"character":20}},"text":";"}]}}"#,
+    );
+    let refixed = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        refixed.contains("\"diagnostics\":[]"),
+        "ranged insert should clear diagnostics: {refixed}"
+    );
+
+    // 6. documentSymbol -> outline with the class and its field.
     send(
         r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///Sample.java"}}}"#,
     );
@@ -130,7 +151,7 @@ fn lifecycle_smoke() {
         "expected FIELD kind: {outline}"
     );
 
-    // 5. shutdown -> wait for result, then exit.
+    // 7. shutdown -> wait for result, then exit.
     send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
     let shutdown = read_until(&mut reader, "\"id\":2", &mut seen);
     assert!(!shutdown.contains("error"), "shutdown errored: {shutdown}");

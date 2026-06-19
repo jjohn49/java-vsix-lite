@@ -5,9 +5,10 @@
 //! binary over stdio and stays thin; all analysis lives here and in the
 //! `jvl-*` crates.
 //!
-//! As of M1 the default tier parses open Java files with tree-sitter and
-//! publishes syntax diagnostics. Documents are tracked open-files-only — there
-//! is no workspace indexing.
+//! As of M1 the default tier parses open Java files incrementally with
+//! tree-sitter and provides syntax diagnostics, document symbols, and
+//! folding/selection ranges. Documents are tracked open-files-only — there is
+//! no workspace indexing.
 //!
 //! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
 //! to stderr via `tracing`.
@@ -60,21 +61,23 @@ impl Backend {
             .unwrap_or(PositionEncoding::Utf16)
     }
 
-    /// Parse from scratch. (Incremental reuse via tree-sitter `InputEdit` lands
-    /// in M1e alongside INCREMENTAL sync; with FULL sync, passing a stale tree
-    /// would produce an incorrect parse, so we don't.)
-    fn parse(&self, text: &str) -> Tree {
+    /// Parse `text`, reusing `old` for an incremental reparse when the caller has
+    /// already applied the corresponding `InputEdit`s to it.
+    fn parse(&self, text: &str, old: Option<&Tree>) -> Tree {
         let mut parser = self.parser.lock().expect("parser mutex poisoned");
-        jvl_syntax::parse(&mut parser, text, None).expect("parser yields a tree for in-memory text")
+        jvl_syntax::parse(&mut parser, text, old).expect("parser yields a tree for in-memory text")
     }
 
-    /// Reparse a document, store it, and publish its diagnostics.
-    async fn refresh(&self, uri: Uri, text: String) {
-        let tree = self.parse(&text);
-        let diagnostics = {
-            let index = LineIndex::new(&text, self.encoding());
-            jvl_syntax::syntax_diagnostics(&tree, &index)
-        };
+    fn diagnostics_for(&self, text: &str, tree: &Tree) -> Vec<Diagnostic> {
+        let index = LineIndex::new(text, self.encoding());
+        jvl_syntax::syntax_diagnostics(tree, &index)
+    }
+
+    /// Parse a freshly opened (or fully replaced) document from scratch, store
+    /// it, and publish its diagnostics.
+    async fn open_document(&self, uri: Uri, text: String) {
+        let tree = self.parse(&text, None);
+        let diagnostics = self.diagnostics_for(&text, &tree);
         self.documents
             .lock()
             .await
@@ -117,9 +120,11 @@ impl LanguageServer for Backend {
             }),
             capabilities: ServerCapabilities {
                 position_encoding,
-                // M1 uses FULL sync; INCREMENTAL + tree-sitter `InputEdit` is M1e.
+                // INCREMENTAL: ranged edits are applied to the cached tree via
+                // tree-sitter `InputEdit`, so reparsing is proportional to the
+                // edit, not the file size.
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -141,16 +146,54 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.refresh(params.text_document.uri, params.text_document.text)
+        self.open_document(params.text_document.uri, params.text_document.text)
             .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // FULL sync: the final change in the batch carries the entire document.
-        let Some(change) = params.content_changes.into_iter().next_back() else {
-            return;
+        let uri = params.text_document.uri;
+        let encoding = self.encoding();
+
+        // Apply edits to the cached text + tree under the lock (all synchronous),
+        // reparse, then drop the lock before the async publish.
+        let diagnostics = {
+            let mut docs = self.documents.lock().await;
+            let Some(doc) = docs.get_mut(uri.as_str()) else {
+                return; // change for a document we never opened
+            };
+
+            let mut from_scratch = false;
+            for change in params.content_changes {
+                match change.range {
+                    Some(range) => {
+                        let applied = jvl_syntax::apply_content_change(
+                            &doc.text,
+                            encoding,
+                            range,
+                            &change.text,
+                        );
+                        // A full replacement earlier in the batch invalidated the
+                        // tree; skip incremental edits and reparse from scratch.
+                        if !from_scratch {
+                            doc.tree.edit(&applied.input_edit);
+                        }
+                        doc.text = applied.new_text;
+                    }
+                    None => {
+                        doc.text = change.text;
+                        from_scratch = true;
+                    }
+                }
+            }
+
+            let old = (!from_scratch).then_some(&doc.tree);
+            doc.tree = self.parse(&doc.text, old);
+            self.diagnostics_for(&doc.text, &doc.tree)
         };
-        self.refresh(params.text_document.uri, change.text).await;
+
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
