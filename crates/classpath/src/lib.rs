@@ -226,11 +226,24 @@ impl Classpath {
     }
 }
 
-/// The `<name>-sources.jar` sibling of a dependency jar, if it exists.
+/// The `<name>-sources.jar` for a dependency jar, if present: same directory
+/// (Maven layout), else a sibling directory under the version dir (Gradle keeps
+/// the sources jar in its own hash directory).
 fn sources_jar_path(jar: &Path) -> Option<PathBuf> {
     let stem = jar.file_stem()?.to_str()?;
-    let sources = jar.with_file_name(format!("{stem}-sources.jar"));
-    sources.is_file().then_some(sources)
+    let name = format!("{stem}-sources.jar");
+
+    let same_dir = jar.with_file_name(&name);
+    if same_dir.is_file() {
+        return Some(same_dir);
+    }
+
+    let version_dir = jar.parent()?.parent()?;
+    std::fs::read_dir(version_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(&name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// The user's home directory, for locating `~/.m2` and `~/.gradle`.

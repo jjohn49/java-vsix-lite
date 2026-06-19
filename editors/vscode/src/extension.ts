@@ -83,7 +83,7 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     initializationOptions: {
       unresolvedMemberDiagnostics: vscode.workspace
         .getConfiguration("java-vsix-lite")
-        .get<boolean>("diagnostics.unresolvedMembers", false),
+        .get<boolean>("diagnostics.unresolvedMembers", true),
     },
   };
 

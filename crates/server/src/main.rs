@@ -53,6 +53,9 @@ struct Backend {
     classpath: OnceLock<jvl_classpath::Classpath>,
     /// Workspace root (from `initialize`), used to discover project dependencies.
     workspace_root: OnceLock<Option<PathBuf>>,
+    /// Fallback project root derived from the first opened document (so deps
+    /// resolve even when a lone file is opened with no workspace folder).
+    project_root_hint: OnceLock<Option<PathBuf>>,
     /// Whether to emit unresolved-member diagnostics (opt-in; default off).
     unresolved_member_diagnostics: OnceLock<bool>,
 }
@@ -67,6 +70,7 @@ impl Backend {
             snippet_support: OnceLock::new(),
             classpath: OnceLock::new(),
             workspace_root: OnceLock::new(),
+            project_root_hint: OnceLock::new(),
             unresolved_member_diagnostics: OnceLock::new(),
         }
     }
@@ -83,11 +87,16 @@ impl Backend {
     }
 
     /// The imported-type symbol source, built on first use from the user's JDK
-    /// plus the workspace's declared dependencies.
+    /// plus the project's declared dependencies. The project root is the
+    /// workspace folder, or (if none) one derived from the first opened file.
     fn classpath(&self) -> &jvl_classpath::Classpath {
         self.classpath.get_or_init(|| {
-            let root = self.workspace_root.get().and_then(|r| r.as_deref());
-            jvl_classpath::Classpath::from_jdk_and_project(root)
+            let root = self
+                .workspace_root
+                .get()
+                .and_then(|r| r.clone())
+                .or_else(|| self.project_root_hint.get().and_then(|r| r.clone()));
+            jvl_classpath::Classpath::from_jdk_and_project(root.as_deref())
         })
     }
 
@@ -143,6 +152,21 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
             params.root_uri.clone()
         })?;
     Some(uri.to_file_path()?.into_owned())
+}
+
+/// Walk up from a document's path to the nearest ancestor containing a Maven or
+/// Gradle build file, used as the project root when no workspace folder is set.
+fn derive_project_root(uri: &Uri) -> Option<PathBuf> {
+    const MARKERS: [&str; 4] = ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"];
+    let path = uri.to_file_path()?;
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if MARKERS.iter().any(|m| d.join(m).is_file()) {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// The opt-in `unresolvedMemberDiagnostics` flag from `initializationOptions`.
@@ -251,6 +275,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        // Derive a fallback project root from the first file, in case no
+        // workspace folder was provided. Done before open_document so the
+        // classpath (built lazily there for diagnostics) can see it.
+        if self.workspace_root.get().and_then(|r| r.as_ref()).is_none() {
+            let _ = self
+                .project_root_hint
+                .set(derive_project_root(&params.text_document.uri));
+        }
         self.open_document(params.text_document.uri, params.text_document.text)
             .await;
     }
