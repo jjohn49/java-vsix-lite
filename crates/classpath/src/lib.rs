@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 mod class_info;
+mod generics;
 mod gradle;
 mod jdk;
 mod maven;
@@ -24,21 +25,28 @@ mod zip;
 use zip::ZipArchive;
 
 /// A type read from bytecode: its fully-qualified name, its direct supertypes
-/// (superclass + interfaces, as FQNs), and its visible members.
+/// (superclass + interfaces, as FQNs), its formal type parameters, and its
+/// visible members.
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub fqn: String,
     pub supers: Vec<String>,
+    /// Formal type-parameter names, e.g. `["E"]` for `ArrayList<E>`.
+    pub type_params: Vec<String>,
     pub members: Vec<Member>,
 }
 
-/// One member of a class: a method or field, with a rendered (raw) signature.
+/// One member of a class: a method or field.
 #[derive(Debug, Clone)]
 pub struct Member {
     pub name: String,
     pub kind: MemberKind,
-    /// Readable signature, e.g. `boolean add(Object)` or `int size`.
+    /// Raw (generics-erased) signature, e.g. `boolean add(Object)` or `int size`.
+    /// Stable across declarations, so it doubles as a dedup key.
     pub signature: String,
+    /// Generic signature with `{i}` placeholders for the class's type parameters,
+    /// e.g. `boolean add({0})`. `None` when the member uses no type variables.
+    pub template: Option<String>,
     pub is_static: bool,
 }
 
@@ -241,5 +249,20 @@ mod tests {
         let cp = Classpath::empty();
         assert!(cp.is_empty());
         assert!(cp.class("java.util.List").is_none());
+    }
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+    #[test]
+    fn arraylist_add_get_have_generic_templates() {
+        let cp = Classpath::from_jdk();
+        if cp.is_empty() { return; }
+        let al = cp.class("java.util.ArrayList").unwrap();
+        assert_eq!(al.type_params, vec!["E".to_string()]);
+        let t = |n: &str| al.members.iter().find(|m| m.name==n).and_then(|m| m.template.clone());
+        assert_eq!(t("add").as_deref(), Some("boolean add({0})"), "all add templates: {:?}", al.members.iter().filter(|m|m.name=="add").map(|m|(&m.signature,&m.template)).collect::<Vec<_>>());
+        assert_eq!(t("get").as_deref(), Some("{0} get(int)"));
     }
 }

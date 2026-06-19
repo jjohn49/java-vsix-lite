@@ -250,6 +250,7 @@ mod tests {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             self.0.get(fqn).map(|c| ExternalClass {
                 supers: c.supers.clone(),
+                type_params: c.type_params.clone(),
                 members: c
                     .members
                     .iter()
@@ -257,6 +258,7 @@ mod tests {
                         name: m.name.clone(),
                         kind: m.kind,
                         signature: m.signature.clone(),
+                        template: m.template.clone(),
                         is_static: m.is_static,
                     })
                     .collect(),
@@ -269,6 +271,18 @@ mod tests {
             name: name.to_string(),
             kind: ExternalMemberKind::Method,
             signature: signature.to_string(),
+            template: None,
+            is_static: false,
+        }
+    }
+
+    /// A method member carrying a generic template (e.g. `boolean add({0})`).
+    fn ext_generic_method(name: &str, erased: &str, template: &str) -> ExternalMember {
+        ExternalMember {
+            name: name.to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: erased.to_string(),
+            template: Some(template.to_string()),
             is_static: false,
         }
     }
@@ -549,6 +563,19 @@ mod tests {
     fn ext_class(supers: &[&str], members: Vec<ExternalMember>) -> ExternalClass {
         ExternalClass {
             supers: supers.iter().map(|s| s.to_string()).collect(),
+            type_params: Vec::new(),
+            members,
+        }
+    }
+
+    fn ext_generic_class(
+        type_params: &[&str],
+        supers: &[&str],
+        members: Vec<ExternalMember>,
+    ) -> ExternalClass {
+        ExternalClass {
+            supers: supers.iter().map(|s| s.to_string()).collect(),
+            type_params: type_params.iter().map(|s| s.to_string()).collect(),
             members,
         }
     }
@@ -620,5 +647,41 @@ mod tests {
         let src = "import java.util.List;\nclass C { void m() { List xs; xs.x; } }\n";
         let items = complete_ext(src, "xs.", &NoSymbols);
         assert!(items.is_empty(), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn generic_type_args_substituted_in_member_signatures() {
+        let src = "import java.util.ArrayList;\n\
+                   class C { void m() { ArrayList<String> xs; xs.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.ArrayList",
+            ext_generic_class(
+                &["E"],
+                &[],
+                vec![
+                    ext_generic_method("add", "boolean add(Object)", "boolean add({0})"),
+                    ext_generic_method("get", "Object get(int)", "{0} get(int)"),
+                ],
+            ),
+        )]);
+        let items = complete_ext(src, "xs.", &symbols);
+        assert_eq!(detail_of(&items, "add"), Some("boolean add(String)"));
+        assert_eq!(detail_of(&items, "get"), Some("String get(int)"));
+    }
+
+    #[test]
+    fn raw_type_without_args_keeps_erased_signature() {
+        let src = "import java.util.ArrayList;\n\
+                   class C { void m() { ArrayList xs; xs.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.ArrayList",
+            ext_generic_class(
+                &["E"],
+                &[],
+                vec![ext_generic_method("add", "boolean add(Object)", "boolean add({0})")],
+            ),
+        )]);
+        // No type args at the use site -> erased signature.
+        assert_eq!(detail_of(&complete_ext(src, "xs.", &symbols), "add"), Some("boolean add(Object)"));
     }
 }

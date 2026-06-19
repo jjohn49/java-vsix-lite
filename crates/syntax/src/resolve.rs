@@ -47,10 +47,11 @@ pub(crate) enum BindingKind {
 }
 
 /// A receiver type: either declared in an open document or an external
-/// (JDK/dependency) type named by its FQN.
+/// (JDK/dependency) type named by its FQN, with any type arguments from the use
+/// site (e.g. `["String"]` for `ArrayList<String>`).
 pub(crate) enum ResolvedType<'t> {
     InProject(TypeDecl<'t>),
-    External(String),
+    External { fqn: String, args: Vec<String> },
 }
 
 /// A resolved receiver type plus whether the access is static (the receiver was
@@ -217,7 +218,10 @@ pub(crate) fn resolve_name_to_type<'t>(
     }
     let fqn = resolve_simple_to_fqn(name, ctx)?;
     Some(Resolved {
-        ty: ResolvedType::External(fqn),
+        ty: ResolvedType::External {
+            fqn,
+            args: Vec::new(),
+        },
         static_only: true,
     })
 }
@@ -230,26 +234,57 @@ fn resolve_type_node<'t>(
     source: &'t str,
     ctx: &Ctx<'_, 't>,
 ) -> Option<ResolvedType<'t>> {
+    let args = extract_type_args(type_node, source);
     if let Some(fqn) = dotted_type_name(type_node, source) {
         let simple = fqn.rsplit('.').next().unwrap_or(&fqn);
         if let Some(td) = ctx.table.get(simple) {
             return Some(ResolvedType::InProject(td.clone()));
         }
-        return ctx.symbols.class(&fqn).is_some().then_some(ResolvedType::External(fqn));
+        return ctx
+            .symbols
+            .class(&fqn)
+            .is_some()
+            .then_some(ResolvedType::External { fqn, args });
     }
     let simple = base_type_name(type_node, source)?;
     if let Some(td) = ctx.table.get(simple) {
         return Some(ResolvedType::InProject(td.clone()));
     }
-    resolve_simple_to_fqn(simple, ctx).map(ResolvedType::External)
+    let fqn = resolve_simple_to_fqn(simple, ctx)?;
+    Some(ResolvedType::External { fqn, args })
 }
 
-/// A supertype simple name → in-project decl or external FQN.
+/// Type arguments of a declared type (`ArrayList<String>` → `["String"]`),
+/// erased to simple names; wildcards render as `?`. Empty for raw/non-generic.
+fn extract_type_args(type_node: Node, source: &str) -> Vec<String> {
+    if type_node.kind() != "generic_type" {
+        return Vec::new();
+    }
+    let Some(targs) = named_children(type_node)
+        .into_iter()
+        .find(|c| c.kind() == "type_arguments")
+    else {
+        return Vec::new();
+    };
+    named_children(targs)
+        .into_iter()
+        .filter(|a| a.kind() != "annotation" && a.kind() != "marker_annotation")
+        .map(|arg| match arg.kind() {
+            "wildcard" => "?".to_string(),
+            _ => base_type_name(arg, source)
+                .map(str::to_string)
+                .unwrap_or_else(|| "?".to_string()),
+        })
+        .collect()
+}
+
+/// A supertype simple name → in-project decl or external FQN (type args of a
+/// parameterized super are not tracked yet — members render erased).
 fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
     if let Some(td) = ctx.table.get(simple) {
         return Some(ResolvedType::InProject(td.clone()));
     }
-    resolve_simple_to_fqn(simple, ctx).map(ResolvedType::External)
+    resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External { fqn, args: Vec::new() })
 }
 
 /// First import candidate FQN that the symbol source can actually resolve.
@@ -300,7 +335,10 @@ fn resolve_scoped_path<'t>(node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Resolved
     let fqn = names.join(".");
     if ctx.symbols.class(&fqn).is_some() {
         Some(Resolved {
-            ty: ResolvedType::External(fqn),
+            ty: ResolvedType::External {
+                fqn,
+                args: Vec::new(),
+            },
             static_only: true,
         })
     } else {
@@ -401,11 +439,20 @@ fn walk_members<'t>(
                 if let Some(sd) = ctx.table.get(sup) {
                     walk_members(&ResolvedType::InProject(sd.clone()), ctx, static_only, acc, depth + 1);
                 } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
-                    walk_members(&ResolvedType::External(fqn), ctx, static_only, acc, depth + 1);
+                    walk_members(
+                        &ResolvedType::External {
+                            fqn,
+                            args: Vec::new(),
+                        },
+                        ctx,
+                        static_only,
+                        acc,
+                        depth + 1,
+                    );
                 }
             }
         }
-        ResolvedType::External(fqn) => {
+        ResolvedType::External { fqn, args } => {
             if !acc.visited_fqn.insert(fqn.clone()) {
                 return;
             }
@@ -416,12 +463,26 @@ fn walk_members<'t>(
                 if static_only && !m.is_static {
                     continue;
                 }
+                // Dedup on the erased signature (stable across declarations);
+                // display the generic signature substituted with the use-site
+                // type arguments (e.g. `add({0})` + `[String]` → `add(String)`).
                 if acc.seen.insert(m.signature.clone()) {
-                    acc.out.push(HierMember::External(m));
+                    let signature = display_signature(&m, args, &class.type_params);
+                    acc.out.push(HierMember::External(ExternalMember { signature, ..m }));
                 }
             }
+            // Supertype members render erased (parameterized-super args untracked).
             for sup in class.supers {
-                walk_members(&ResolvedType::External(sup), ctx, static_only, acc, depth + 1);
+                walk_members(
+                    &ResolvedType::External {
+                        fqn: sup,
+                        args: Vec::new(),
+                    },
+                    ctx,
+                    static_only,
+                    acc,
+                    depth + 1,
+                );
             }
         }
     }
@@ -443,6 +504,31 @@ fn flatten_scoped<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
     }
     let mut out = Vec::new();
     rec(node, source, &mut out, 0);
+    out
+}
+
+/// The signature to show for an external member: its generic template
+/// substituted with the use-site type arguments when present, otherwise the
+/// erased signature.
+fn display_signature(member: &ExternalMember, args: &[String], type_params: &[String]) -> String {
+    match &member.template {
+        Some(template) if !args.is_empty() => substitute_template(template, args, type_params),
+        _ => member.signature.clone(),
+    }
+}
+
+/// Replace `{i}` placeholders with the i-th type argument (falling back to the
+/// type-parameter name, then `?`).
+fn substitute_template(template: &str, args: &[String], type_params: &[String]) -> String {
+    let mut out = template.to_string();
+    for i in 0..type_params.len().max(args.len()) {
+        let replacement = args
+            .get(i)
+            .or_else(|| type_params.get(i))
+            .map(String::as_str)
+            .unwrap_or("?");
+        out = out.replace(&format!("{{{i}}}"), replacement);
+    }
     out
 }
 

@@ -375,6 +375,7 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
         let info = self.0.class(fqn)?;
         Some(jvl_syntax::ExternalClass {
             supers: info.supers.clone(),
+            type_params: info.type_params.clone(),
             members: info
                 .members
                 .iter()
@@ -385,6 +386,7 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
                         jvl_classpath::MemberKind::Field => jvl_syntax::ExternalMemberKind::Field,
                     },
                     signature: m.signature.clone(),
+                    template: m.template.clone(),
                     is_static: m.is_static,
                 })
                 .collect(),

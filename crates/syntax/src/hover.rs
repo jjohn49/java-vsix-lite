@@ -130,7 +130,7 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     match &resolved.ty {
         ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source)),
-        ResolvedType::External(_) => None,
+        ResolvedType::External { .. } => None,
     }
 }
 
@@ -187,6 +187,7 @@ mod tests {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             (fqn == self.fqn).then(|| ExternalClass {
                 supers: Vec::new(),
+                type_params: Vec::new(),
                 members: self
                     .members
                     .iter()
@@ -194,6 +195,7 @@ mod tests {
                         name: m.name.clone(),
                         kind: m.kind,
                         signature: m.signature.clone(),
+                        template: m.template.clone(),
                         is_static: m.is_static,
                     })
                     .collect(),
@@ -340,6 +342,7 @@ mod tests {
                 name: "size".to_string(),
                 kind: ExternalMemberKind::Method,
                 signature: "int size()".to_string(),
+                template: None,
                 is_static: false,
             }],
         };

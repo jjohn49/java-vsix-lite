@@ -8,14 +8,21 @@
 pub struct ExternalClass {
     /// Superclass + interface FQNs.
     pub supers: Vec<String>,
+    /// Formal type-parameter names, e.g. `["E"]` for `ArrayList<E>`.
+    pub type_params: Vec<String>,
     pub members: Vec<ExternalMember>,
 }
 
-/// One member of an external type, with a pre-rendered (raw) signature.
+/// One member of an external type.
 pub struct ExternalMember {
     pub name: String,
     pub kind: ExternalMemberKind,
+    /// Raw (generics-erased) signature — also the cross-declaration dedup key.
     pub signature: String,
+    /// Generic signature with `{i}` placeholders for the declaring class's type
+    /// parameters (e.g. `boolean add({0})`), substituted with a use site's type
+    /// arguments. `None` when the member uses no type variables.
+    pub template: Option<String>,
     pub is_static: bool,
 }
 

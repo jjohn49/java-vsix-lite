@@ -1,10 +1,11 @@
 //! Turn `.class` bytes into an owned [`ClassInfo`] via `cafebabe`, rendering
 //! readable (raw, generics-erased) member signatures from JVM descriptors.
 
+use cafebabe::attributes::{AttributeData, AttributeInfo};
 use cafebabe::descriptors::{ClassName, FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor};
 use cafebabe::{parse_class_with_options, FieldAccessFlags, MethodAccessFlags, ParseOptions};
 
-use crate::{ClassInfo, Member, MemberKind};
+use crate::{generics, ClassInfo, Member, MemberKind};
 
 /// Parse a class file into our owned model. Returns `None` on any parse error
 /// (malformed/truncated input is skipped, never panicked on).
@@ -23,13 +24,22 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         supers.push(fqn_of(iface));
     }
 
+    // Formal type parameters of the class, e.g. ["E"] for ArrayList<E>.
+    let type_params = signature_attr(&class.attributes)
+        .map(generics::class_type_params)
+        .unwrap_or_default();
+
     let mut members = Vec::new();
     for field in &class.fields {
         if !field_visible(field.access_flags) {
             continue;
         }
+        let template = signature_attr(&field.attributes)
+            .and_then(|sig| generics::field_template(sig, &type_params))
+            .map(|ty| format!("{ty} {}", field.name));
         members.push(Member {
             signature: format!("{} {}", render_field(&field.descriptor), field.name),
+            template,
             name: field.name.to_string(),
             kind: MemberKind::Field,
             is_static: field.access_flags.contains(FieldAccessFlags::STATIC),
@@ -40,8 +50,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         if method.name.starts_with('<') || !method_visible(method.access_flags) {
             continue;
         }
+        let template = signature_attr(&method.attributes)
+            .and_then(|sig| generics::method_template(sig, &type_params))
+            .map(|(ret, params)| format!("{ret} {}({})", method.name, params.join(", ")));
         members.push(Member {
             signature: render_method(&method.name, &method.descriptor),
+            template,
             name: method.name.to_string(),
             kind: MemberKind::Method,
             is_static: method.access_flags.contains(MethodAccessFlags::STATIC),
@@ -51,7 +65,16 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
     Some(ClassInfo {
         fqn,
         supers,
+        type_params,
         members,
+    })
+}
+
+/// The `Signature` (generic) attribute string from an attribute list, if present.
+fn signature_attr<'a>(attributes: &'a [AttributeInfo]) -> Option<&'a str> {
+    attributes.iter().find_map(|a| match &a.data {
+        AttributeData::Signature(sig) => Some(sig.as_ref()),
+        _ => None,
     })
 }
 
