@@ -6,9 +6,9 @@
 //! `jvl-*` crates.
 //!
 //! As of M1 the default tier parses open Java files incrementally with
-//! tree-sitter and provides syntax diagnostics, document symbols, and
-//! folding/selection ranges. Documents are tracked open-files-only — there is
-//! no workspace indexing.
+//! tree-sitter and provides syntax diagnostics, document symbols,
+//! folding/selection ranges, and semantic tokens. Documents are tracked
+//! open-files-only — there is no workspace indexing.
 //!
 //! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
 //! to stderr via `tracing`.
@@ -129,6 +129,19 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: jvl_syntax::semantic_token_types(),
+                                token_modifiers: vec![],
+                            },
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: Some(false),
+                            ..Default::default()
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -239,6 +252,22 @@ impl LanguageServer for Backend {
             &index,
             &params.positions,
         )))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let docs = self.documents.lock().await;
+        let Some(doc) = docs.get(params.text_document.uri.as_str()) else {
+            return Ok(None);
+        };
+        let index = LineIndex::new(&doc.text, self.encoding());
+        let data = jvl_syntax::semantic_tokens(&doc.tree, &index);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 }
 

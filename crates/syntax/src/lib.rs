@@ -2,8 +2,8 @@
 //!
 //! Wraps `tree-sitter-java` for error-tolerant, incremental parsing and turns
 //! the resulting tree into LSP artifacts: syntax diagnostics, document symbols,
-//! and folding/selection ranges. Everything here operates on a single open
-//! document — no workspace indexing.
+//! folding/selection ranges, and semantic tokens. Everything here operates on a
+//! single open document — no workspace indexing.
 //!
 //! ## Position encoding
 //!
@@ -17,7 +17,7 @@
 
 use ls_types::{
     Diagnostic, DiagnosticSeverity, DocumentSymbol, FoldingRange, FoldingRangeKind, Position,
-    Range, SelectionRange, SymbolKind,
+    Range, SelectionRange, SemanticToken, SemanticTokenType, SymbolKind,
 };
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
@@ -479,6 +479,135 @@ fn selection_range_at(tree: &Tree, index: &LineIndex, position: Position) -> Sel
     current.expect("ancestor chain is never empty")
 }
 
+// Semantic token type indices. These MUST stay in sync with the order of
+// [`semantic_token_types`], which the server passes to the client as the legend.
+const TT_TYPE: u32 = 0;
+const TT_METHOD: u32 = 1;
+const TT_PARAMETER: u32 = 2;
+const TT_PROPERTY: u32 = 3;
+const TT_VARIABLE: u32 = 4;
+const TT_ENUM_MEMBER: u32 = 5;
+const TT_DECORATOR: u32 = 6;
+
+/// The semantic-token legend, in index order. Deliberately a focused set: the
+/// cases the built-in TextMate grammar cannot reliably tell apart (type vs
+/// method vs parameter vs field). Keywords/strings/numbers/comments are left to
+/// TextMate, so semantic highlighting *enhances* rather than replaces it.
+pub fn semantic_token_types() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::TYPE,
+        SemanticTokenType::METHOD,
+        SemanticTokenType::PARAMETER,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::VARIABLE,
+        SemanticTokenType::ENUM_MEMBER,
+        SemanticTokenType::DECORATOR,
+    ]
+}
+
+struct RawToken {
+    line: u32,
+    start: u32,
+    len: u32,
+    token_type: u32,
+}
+
+/// Produce LSP semantic tokens (delta-encoded) for the whole document, in the
+/// negotiated position encoding. Single-pass over the tree; emits only the
+/// high-value identifier roles in the legend above.
+pub fn semantic_tokens(tree: &Tree, index: &LineIndex) -> Vec<SemanticToken> {
+    let mut raw: Vec<RawToken> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => emit_named(node, "name", TT_TYPE, index, &mut raw),
+            "type_identifier" => emit(node, TT_TYPE, index, &mut raw),
+            "method_declaration" | "method_invocation" => {
+                emit_named(node, "name", TT_METHOD, index, &mut raw)
+            }
+            "formal_parameter" | "spread_parameter" | "catch_formal_parameter" => {
+                emit_named(node, "name", TT_PARAMETER, index, &mut raw)
+            }
+            "variable_declarator" => {
+                let is_field = node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "field_declaration");
+                let token_type = if is_field { TT_PROPERTY } else { TT_VARIABLE };
+                emit_named(node, "name", token_type, index, &mut raw);
+            }
+            "field_access" => emit_named(node, "field", TT_PROPERTY, index, &mut raw),
+            "enum_constant" => emit_named(node, "name", TT_ENUM_MEMBER, index, &mut raw),
+            "marker_annotation" | "annotation" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    if name.kind() == "identifier" {
+                        emit(name, TT_DECORATOR, index, &mut raw);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+
+    raw.sort_by_key(|t| (t.line, t.start));
+    delta_encode(&raw)
+}
+
+fn emit_named(
+    node: Node,
+    field: &str,
+    token_type: u32,
+    index: &LineIndex,
+    out: &mut Vec<RawToken>,
+) {
+    if let Some(name) = node.child_by_field_name(field) {
+        emit(name, token_type, index, out);
+    }
+}
+
+fn emit(node: Node, token_type: u32, index: &LineIndex, out: &mut Vec<RawToken>) {
+    let start = index.position(node.start_byte());
+    let end = index.position(node.end_byte());
+    // Semantic tokens may not span lines; our identifier tokens never do.
+    if end.line != start.line || end.character <= start.character {
+        return;
+    }
+    out.push(RawToken {
+        line: start.line,
+        start: start.character,
+        len: end.character - start.character,
+        token_type,
+    });
+}
+
+fn delta_encode(tokens: &[RawToken]) -> Vec<SemanticToken> {
+    let mut data = Vec::with_capacity(tokens.len());
+    let (mut prev_line, mut prev_start) = (0u32, 0u32);
+    for token in tokens {
+        let delta_line = token.line - prev_line;
+        let delta_start = if delta_line == 0 {
+            token.start - prev_start
+        } else {
+            token.start
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.len,
+            token_type: token.token_type,
+            token_modifiers_bitset: 0,
+        });
+        prev_line = token.line;
+        prev_start = token.start;
+    }
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +829,47 @@ mod tests {
         let outer = inner.parent.as_ref().expect("has an enclosing range");
         assert!(outer.range.start.character <= inner.range.start.character);
         assert!(outer.range.end.character >= inner.range.end.character);
+    }
+
+    /// Decode delta-encoded semantic tokens back to absolute (char, len, type)
+    /// on a single line (so char == byte for ASCII).
+    fn decode_line0(data: &[SemanticToken]) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        let mut ch = 0u32;
+        for t in data {
+            assert_eq!(t.delta_line, 0, "test source is single-line");
+            ch += t.delta_start;
+            out.push((ch, t.length, t.token_type));
+        }
+        out
+    }
+
+    #[test]
+    fn semantic_tokens_classify_identifier_roles() {
+        let src = "class A { MyType field; void m(int p) {} }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let decoded = decode_line0(&semantic_tokens(&tree, &index));
+        // Map the highlighted text -> token type.
+        let labeled: Vec<(&str, u32)> = decoded
+            .iter()
+            .map(|&(ch, len, tt)| (&src[ch as usize..(ch + len) as usize], tt))
+            .collect();
+        assert!(labeled.contains(&("A", TT_TYPE)), "class name: {labeled:?}");
+        assert!(
+            labeled.contains(&("MyType", TT_TYPE)),
+            "type use: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("field", TT_PROPERTY)),
+            "field: {labeled:?}"
+        );
+        assert!(labeled.contains(&("m", TT_METHOD)), "method: {labeled:?}");
+        assert!(labeled.contains(&("p", TT_PARAMETER)), "param: {labeled:?}");
+        // `int` is a primitive (left to TextMate), not emitted as a type token.
+        assert!(
+            !labeled.contains(&("int", TT_TYPE)),
+            "primitive: {labeled:?}"
+        );
     }
 }

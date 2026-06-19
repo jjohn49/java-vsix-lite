@@ -151,7 +151,17 @@ fn lifecycle_smoke() {
         "expected FIELD kind: {outline}"
     );
 
-    // 7. shutdown -> wait for result, then exit.
+    // 7. semanticTokens/full -> non-empty token data for `Sample` and `x`.
+    send(
+        r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"file:///Sample.java"}}}"#,
+    );
+    let tokens = read_until(&mut reader, "\"id\":4", &mut seen);
+    assert!(
+        tokens.contains("\"data\":[") && !tokens.contains("\"data\":[]"),
+        "expected non-empty semantic tokens: {tokens}"
+    );
+
+    // 8. shutdown -> wait for result, then exit.
     send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
     let shutdown = read_until(&mut reader, "\"id\":2", &mut seen);
     assert!(!shutdown.contains("error"), "shutdown errored: {shutdown}");
