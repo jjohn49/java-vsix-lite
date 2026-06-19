@@ -1,0 +1,26 @@
+# Node / VS Code extension build
+node_modules/
+out/
+dist/
+*.vsix
+.vscode-test/
+coverage/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Java build artifacts
+target/
+build/
+bin/
+*.class
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
