@@ -73,7 +73,7 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     debug: {
       command: serverPath,
       transport: TransportKind.stdio,
-      options: { env: { ...process.env, JVL_LOG: "debug" } },
+      options: { env: { ...process.env, JVL_LOG: "jvl_server=debug,warn" } },
     },
   };
 

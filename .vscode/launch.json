@@ -15,7 +15,7 @@
       "preLaunchTask": "build",
       "env": {
         "JVL_SERVER_PATH": "${workspaceFolder}/target/debug/jvl-server",
-        "JVL_LOG": "debug"
+        "JVL_LOG": "jvl_server=debug,warn"
       }
     }
   ]

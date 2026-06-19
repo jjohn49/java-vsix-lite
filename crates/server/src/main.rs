@@ -328,7 +328,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let index = LineIndex::new(&doc.text, self.encoding());
-        let data = jvl_syntax::semantic_tokens(&doc.tree, &index);
+        let data = jvl_syntax::semantic_tokens(&doc.tree, &doc.text, &index);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -417,12 +417,17 @@ fn open_docs<'a>(
 
 #[tokio::main]
 async fn main() {
-    // Logs go to stderr; stdout is the LSP transport.
+    // Logs go to stderr; stdout is the LSP transport. ANSI is disabled because
+    // the editor's output panel renders raw escape codes as a jumble; the noisy
+    // module-path target is dropped; and the default filter mutes the LSP
+    // framework's debug chatter (e.g. spurious cancel-request notices).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("JVL_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tower_lsp_server=warn")),
         )
         .init();
 

@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use ls_types::{
     Diagnostic, DiagnosticSeverity, DocumentSymbol, FoldingRange, FoldingRangeKind, Position,
     Range, SelectionRange, SemanticToken, SemanticTokenType, SymbolKind,
@@ -509,11 +511,13 @@ const TT_PROPERTY: u32 = 3;
 const TT_VARIABLE: u32 = 4;
 const TT_ENUM_MEMBER: u32 = 5;
 const TT_DECORATOR: u32 = 6;
+const TT_NAMESPACE: u32 = 7;
 
 /// The semantic-token legend, in index order. Deliberately a focused set: the
 /// cases the built-in TextMate grammar cannot reliably tell apart (type vs
-/// method vs parameter vs field). Keywords/strings/numbers/comments are left to
-/// TextMate, so semantic highlighting *enhances* rather than replaces it.
+/// method vs parameter vs field vs package). Keywords/strings/numbers/comments
+/// are left to TextMate, so semantic highlighting *enhances* rather than
+/// replaces it.
 pub fn semantic_token_types() -> Vec<SemanticTokenType> {
     vec![
         SemanticTokenType::TYPE,
@@ -523,6 +527,7 @@ pub fn semantic_token_types() -> Vec<SemanticTokenType> {
         SemanticTokenType::VARIABLE,
         SemanticTokenType::ENUM_MEMBER,
         SemanticTokenType::DECORATOR,
+        SemanticTokenType::NAMESPACE,
     ]
 }
 
@@ -534,9 +539,12 @@ struct RawToken {
 }
 
 /// Produce LSP semantic tokens (delta-encoded) for the whole document, in the
-/// negotiated position encoding. Single-pass over the tree; emits only the
-/// high-value identifier roles in the legend above.
-pub fn semantic_tokens(tree: &Tree, index: &LineIndex) -> Vec<SemanticToken> {
+/// negotiated position encoding. Declarations are classified directly; plain
+/// identifier *usages* are classified by matching the file's declared
+/// variable/parameter/field names (so references — not just declarations — get
+/// highlighted), and package/import path segments get namespace tokens.
+pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<SemanticToken> {
+    let roles = declared_roles(tree, source);
     let mut raw: Vec<RawToken> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -553,6 +561,7 @@ pub fn semantic_tokens(tree: &Tree, index: &LineIndex) -> Vec<SemanticToken> {
             "formal_parameter" | "spread_parameter" | "catch_formal_parameter" => {
                 emit_named(node, "name", TT_PARAMETER, index, &mut raw)
             }
+            "enhanced_for_statement" => emit_named(node, "name", TT_VARIABLE, index, &mut raw),
             "variable_declarator" => {
                 let is_field = node
                     .parent()
@@ -569,6 +578,17 @@ pub fn semantic_tokens(tree: &Tree, index: &LineIndex) -> Vec<SemanticToken> {
                     }
                 }
             }
+            "package_declaration" => emit_namespace_path(node, false, index, &mut raw),
+            "import_declaration" => emit_namespace_path(node, true, index, &mut raw),
+            // A plain identifier *usage* (not a declaration name handled above):
+            // classify it from the file's declared names so references are lit.
+            "identifier" => {
+                if !is_classified_elsewhere(node) {
+                    if let Some(&token_type) = roles.get(node_text(node, source)) {
+                        emit(node, token_type, index, &mut raw);
+                    }
+                }
+            }
             _ => {}
         }
         let mut cursor = node.walk();
@@ -576,7 +596,110 @@ pub fn semantic_tokens(tree: &Tree, index: &LineIndex) -> Vec<SemanticToken> {
     }
 
     raw.sort_by_key(|t| (t.line, t.start));
+    raw.dedup_by_key(|t| (t.line, t.start));
     delta_encode(&raw)
+}
+
+/// Map each declared variable/parameter/field name to its token type, so plain
+/// identifier usages can be classified by name. Lexical and scope-insensitive
+/// (a name maps to one role) — approximate but cheap, and good enough for
+/// highlighting references.
+fn declared_roles<'t>(tree: &'t Tree, source: &'t str) -> HashMap<&'t str, u32> {
+    let mut roles = HashMap::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "variable_declarator" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let is_field = node
+                        .parent()
+                        .is_some_and(|p| p.kind() == "field_declaration");
+                    roles.insert(
+                        node_text(name, source),
+                        if is_field { TT_PROPERTY } else { TT_VARIABLE },
+                    );
+                }
+            }
+            "formal_parameter" | "catch_formal_parameter" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    roles.insert(node_text(name, source), TT_PARAMETER);
+                }
+            }
+            "enhanced_for_statement" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    roles.insert(node_text(name, source), TT_VARIABLE);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    roles
+}
+
+/// Whether an `identifier` is already classified by a declaration/access rule
+/// above, so the usage pass must not re-emit or misclassify it.
+fn is_classified_elsewhere(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "variable_declarator"
+        | "formal_parameter"
+        | "spread_parameter"
+        | "catch_formal_parameter"
+        | "enhanced_for_statement"
+        | "method_declaration"
+        | "constructor_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration"
+        | "enum_constant"
+        | "method_invocation"
+        | "marker_annotation"
+        | "annotation" => parent.child_by_field_name("name") == Some(node),
+        "field_access" => parent.child_by_field_name("field") == Some(node),
+        _ => false,
+    }
+}
+
+/// Emit namespace tokens for the dotted segments of a `package`/`import` path.
+/// For an import, the final segment is the imported type (unless it is a `*`
+/// wildcard), so it gets a type token instead.
+fn emit_namespace_path(node: Node, is_import: bool, index: &LineIndex, out: &mut Vec<RawToken>) {
+    let mut ids = Vec::new();
+    collect_identifiers(node, &mut ids);
+    let wildcard = is_import && has_child_kind(node, "asterisk");
+    let last = ids.len().saturating_sub(1);
+    for (i, id) in ids.iter().enumerate() {
+        let token_type = if is_import && !wildcard && i == last {
+            TT_TYPE
+        } else {
+            TT_NAMESPACE
+        };
+        emit(*id, token_type, index, out);
+    }
+}
+
+fn collect_identifiers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    if node.kind() == "identifier" {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(child, out);
+    }
+}
+
+fn has_child_kind(node: Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    // Bind to a local so the borrowing iterator drops before the return.
+    let found = node.children(&mut cursor).any(|c| c.kind() == kind);
+    found
 }
 
 fn emit_named(
@@ -870,7 +993,7 @@ mod tests {
         let src = "class A { MyType field; void m(int p) {} }\n";
         let tree = parse_str(src);
         let index = LineIndex::new(src, PositionEncoding::Utf16);
-        let decoded = decode_line0(&semantic_tokens(&tree, &index));
+        let decoded = decode_line0(&semantic_tokens(&tree, src, &index));
         // Map the highlighted text -> token type.
         let labeled: Vec<(&str, u32)> = decoded
             .iter()
@@ -892,5 +1015,38 @@ mod tests {
             !labeled.contains(&("int", TT_TYPE)),
             "primitive: {labeled:?}"
         );
+    }
+
+    #[test]
+    fn semantic_tokens_highlight_usages_and_packages() {
+        // A param usage, a field usage, and an import path on one line each.
+        let src = "package com.demo;\nclass A { int field; void m(int p) { field = p; } }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let data = semantic_tokens(&tree, src, &index);
+
+        // Decode to (line, char, len, type) and label by source slice.
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let (mut line, mut ch) = (0u32, 0u32);
+        let mut labeled: Vec<(&str, u32)> = Vec::new();
+        for t in &data {
+            if t.delta_line != 0 {
+                line += t.delta_line;
+                ch = t.delta_start;
+            } else {
+                ch += t.delta_start;
+            }
+            let start = line_starts[line as usize] + ch as usize;
+            labeled.push((&src[start..start + t.length as usize], t.token_type));
+        }
+
+        // Package segments are namespaces; the `p` param and `field` are lit at
+        // their *usage* sites in `field = p;`, not just their declarations.
+        assert!(labeled.contains(&("com", TT_NAMESPACE)), "package: {labeled:?}");
+        assert!(labeled.contains(&("demo", TT_NAMESPACE)), "package: {labeled:?}");
+        assert!(labeled.contains(&("p", TT_PARAMETER)), "param usage: {labeled:?}");
+        assert!(labeled.contains(&("field", TT_PROPERTY)), "field usage: {labeled:?}");
     }
 }
