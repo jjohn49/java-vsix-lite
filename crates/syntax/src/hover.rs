@@ -5,7 +5,7 @@
 use ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use tree_sitter::{Node, Tree};
 
-use crate::model::TypeTable;
+use crate::model::{named_children, TypeTable};
 use crate::resolve;
 use crate::signature::{javadoc, signature};
 use crate::{node_text, LineIndex, OpenDoc};
@@ -80,6 +80,17 @@ fn resolve_declaration<'t>(
                     }
                 };
                 return Some((decl.node, decl.source));
+            }
+            // Mid-edit `recv.member` (no trailing `;`) parses as a scoped path; if
+            // the cursor is on the trailing segment, resolve it as a member of the
+            // prefix's type.
+            "scoped_type_identifier" | "scoped_identifier" => {
+                let segments = named_children(parent);
+                if segments.len() >= 2 && segments.last() == Some(&name_node) {
+                    let resolved = resolve::resolve_receiver_type(segments[0], doc, table)?;
+                    let member = table.find_member(&resolved.decl, name)?;
+                    return Some((member.node, member.source));
+                }
             }
             _ => {}
         }
@@ -218,6 +229,27 @@ mod tests {
         };
         assert!(m.value.contains("int tick()"), "{}", m.value);
         assert!(m.value.contains("ticks"), "{}", m.value);
+    }
+
+    #[test]
+    fn hover_on_unterminated_scoped_member() {
+        // `Helper.S` with no trailing `;` parses as a scoped_type_identifier;
+        // hover on the trailing segment must still resolve the member.
+        let src = "class Helper { /** the constant */ static int S = 1; }\n\
+                   class C { void m() { Helper.S } }\n";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find("Helper.S").unwrap() + "Helper.".len(); // cursor on `S`
+        let h = hover(&docs, 0, &index, index.position(at)).expect("hover on S");
+        let HoverContents::Markup(m) = h.contents else {
+            panic!("markup")
+        };
+        assert!(m.value.contains("static int S"), "{}", m.value);
+        assert!(m.value.contains("the constant"), "{}", m.value);
     }
 
     #[test]

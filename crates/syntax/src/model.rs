@@ -6,11 +6,15 @@
 //! build on. Everything borrows the parse trees (`'t`) and runs synchronously
 //! while the server holds the documents lock — no allocation of source text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
 use crate::{node_text, OpenDoc};
+
+/// Depth cap for inheritance walks — far beyond any real `extends`/`implements`
+/// chain, but bounds stack use on pathological (e.g. cyclic-after-edit) input.
+const MAX_SUPER_DEPTH: usize = 64;
 
 /// Collect a node's named children into a `Vec` so callers don't juggle the
 /// tree-sitter cursor borrow.
@@ -189,8 +193,11 @@ fn push_base_name<'t>(ty: Node<'t>, source: &'t str, out: &mut Vec<&'t str>) {
 fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Member<'t>>) {
     for child in named_children(body) {
         match child.kind() {
-            "field_declaration" => {
-                let is_static = has_modifier(child, source, "static");
+            // `constant_declaration` is how `interface`/`@interface` bodies hold
+            // fields; such constants are implicitly `static`.
+            "field_declaration" | "constant_declaration" => {
+                let is_static =
+                    child.kind() == "constant_declaration" || has_modifier(child, source, "static");
                 for declarator in named_children(child) {
                     if declarator.kind() == "variable_declarator" {
                         if let Some(name) = declarator.child_by_field_name("name") {
@@ -205,7 +212,9 @@ fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Membe
                     }
                 }
             }
-            "method_declaration" => {
+            // Methods, and annotation elements (`int value();`), which are
+            // method-shaped (type + name, no parameters).
+            "method_declaration" | "annotation_type_element_declaration" => {
                 if let Some(name) = child.child_by_field_name("name") {
                     out.push(Member {
                         name: node_text(name, source),
@@ -313,11 +322,35 @@ impl<'t> TypeTable<'t> {
         self.by_name.values()
     }
 
-    /// Member named `name` on `decl` or any in-table supertype (cycle-guarded).
+    /// Member named `name` on `decl` or any in-table supertype. Nearest-first, so
+    /// an override wins over the inherited copy; stops at the first match without
+    /// rendering signatures. Cycle- and depth-guarded.
     pub(crate) fn find_member(&self, decl: &TypeDecl<'t>, name: &str) -> Option<Member<'t>> {
-        self.all_members(decl, false)
-            .into_iter()
-            .find(|m| m.name == name)
+        let mut visited = HashSet::new();
+        self.find_member_rec(decl, name, &mut visited, 0)
+    }
+
+    fn find_member_rec(
+        &self,
+        decl: &TypeDecl<'t>,
+        name: &str,
+        visited: &mut HashSet<usize>,
+        depth: usize,
+    ) -> Option<Member<'t>> {
+        if depth > MAX_SUPER_DEPTH || !visited.insert(decl.node.id()) {
+            return None;
+        }
+        if let Some(m) = decl.own_members().into_iter().find(|m| m.name == name) {
+            return Some(m);
+        }
+        for sup in &decl.supers {
+            if let Some(super_decl) = self.get(sup) {
+                if let Some(m) = self.find_member_rec(super_decl, name, visited, depth + 1) {
+                    return Some(m);
+                }
+            }
+        }
+        None
     }
 
     /// All members of `decl` plus inherited members from in-table supertypes.
@@ -326,9 +359,9 @@ impl<'t> TypeTable<'t> {
     /// survive.
     pub(crate) fn all_members(&self, decl: &TypeDecl<'t>, static_only: bool) -> Vec<Member<'t>> {
         let mut out = Vec::new();
-        let mut seen_sig = std::collections::HashSet::new();
-        let mut visited = std::collections::HashSet::new();
-        self.collect_inherited(decl, &mut out, &mut seen_sig, &mut visited);
+        let mut seen_sig = HashSet::new();
+        let mut visited = HashSet::new();
+        self.collect_inherited(decl, &mut out, &mut seen_sig, &mut visited, 0);
         if static_only {
             out.retain(|m| m.is_static || matches!(m.kind, MemberKind::NestedType(_)));
         }
@@ -339,12 +372,12 @@ impl<'t> TypeTable<'t> {
         &self,
         decl: &TypeDecl<'t>,
         out: &mut Vec<Member<'t>>,
-        seen_sig: &mut std::collections::HashSet<String>,
-        visited: &mut std::collections::HashSet<*const u8>,
+        seen_sig: &mut HashSet<String>,
+        visited: &mut HashSet<usize>,
+        depth: usize,
     ) {
-        // Guard against cyclic `extends` by the type's node id.
-        let id = decl.node.id() as *const u8;
-        if !visited.insert(id) {
+        // Guard against cyclic `extends` (by node id) and pathological depth.
+        if depth > MAX_SUPER_DEPTH || !visited.insert(decl.node.id()) {
             return;
         }
         for m in decl.own_members() {
@@ -356,7 +389,7 @@ impl<'t> TypeTable<'t> {
         }
         for sup in &decl.supers {
             if let Some(super_decl) = self.get(sup) {
-                self.collect_inherited(super_decl, out, seen_sig, visited);
+                self.collect_inherited(super_decl, out, seen_sig, visited, depth + 1);
             }
         }
     }

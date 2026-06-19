@@ -8,6 +8,11 @@ use tree_sitter::{Node, Tree};
 use crate::model::{base_type_name, named_children, Member, MemberKind, TypeDecl, TypeTable};
 use crate::{node_text, OpenDoc};
 
+/// Depth cap for receiver/path resolution — real receiver chains are a handful
+/// deep; this bounds stack use on pathological nesting without affecting any
+/// legitimate code.
+const MAX_RESOLVE_DEPTH: usize = 64;
+
 /// A binding visible at the cursor (local, parameter, for-variable, or field).
 #[derive(Clone)]
 pub(crate) struct Binding<'t> {
@@ -127,6 +132,18 @@ pub(crate) fn resolve_receiver_type<'t>(
     doc: &OpenDoc<'t>,
     table: &TypeTable<'t>,
 ) -> Option<Resolved<'t>> {
+    resolve_receiver_depth(recv, doc, table, 0)
+}
+
+fn resolve_receiver_depth<'t>(
+    recv: Node<'t>,
+    doc: &OpenDoc<'t>,
+    table: &TypeTable<'t>,
+    depth: usize,
+) -> Option<Resolved<'t>> {
+    if depth > MAX_RESOLVE_DEPTH {
+        return None;
+    }
     match recv.kind() {
         "this" => enclosing_typedecl(recv, doc.source).map(instance),
         "super" => {
@@ -134,11 +151,16 @@ pub(crate) fn resolve_receiver_type<'t>(
             let sup = td.supers.first()?;
             table.get(sup).cloned().map(instance)
         }
-        "identifier" => resolve_name_to_type(node_text(recv, doc.source), recv.start_byte(), doc, table),
+        // `type_identifier` is how tree-sitter parses a bare name in the common
+        // mid-edit shape `recv.partial` (an ERROR / scoped_type_identifier), so
+        // it must resolve like `identifier` — instance var or static type name.
+        "identifier" | "type_identifier" => {
+            resolve_name_to_type(node_text(recv, doc.source), recv.start_byte(), doc, table)
+        }
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
             let field = recv.child_by_field_name("field")?;
-            let obj_ty = resolve_receiver_type(obj, doc, table)?;
+            let obj_ty = resolve_receiver_depth(obj, doc, table, depth + 1)?;
             let member = table.find_member(&obj_ty.decl, node_text(field, doc.source))?;
             member_type_decl(&member, table).map(instance)
         }
@@ -149,7 +171,7 @@ pub(crate) fn resolve_receiver_type<'t>(
         }
         "scoped_type_identifier" | "scoped_identifier" => resolve_scoped_path(recv, doc, table),
         "parenthesized_expression" => {
-            resolve_receiver_type(recv.named_child(0)?, doc, table)
+            resolve_receiver_depth(recv.named_child(0)?, doc, table, depth + 1)
         }
         _ => None,
     }
@@ -211,28 +233,34 @@ fn resolve_scoped_path<'t>(
 }
 
 fn flatten_scoped<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
-    fn rec<'t>(n: Node<'t>, source: &'t str, out: &mut Vec<&'t str>) {
+    fn rec<'t>(n: Node<'t>, source: &'t str, out: &mut Vec<&'t str>, depth: usize) {
+        if depth > MAX_RESOLVE_DEPTH || out.len() > MAX_RESOLVE_DEPTH {
+            return;
+        }
         match n.kind() {
             "type_identifier" | "identifier" => out.push(node_text(n, source)),
             _ => {
                 for c in named_children(n) {
-                    rec(c, source, out);
+                    rec(c, source, out, depth + 1);
                 }
             }
         }
     }
     let mut out = Vec::new();
-    rec(node, source, &mut out);
+    rec(node, source, &mut out, 0);
     out
 }
 
 /// All bindings visible at `cursor`, innermost first (so a name lookup finds the
-/// shadowing declaration).
+/// shadowing declaration). `include_fields` adds the enclosing type's fields
+/// (own + inherited); callers that already enumerate members separately pass
+/// `false` to avoid recomputing them.
 pub(crate) fn collect_bindings<'t>(
     tree: &'t Tree,
     source: &'t str,
     cursor: usize,
     table: &TypeTable<'t>,
+    include_fields: bool,
 ) -> Vec<Binding<'t>> {
     let mut out = Vec::new();
     let mut node = Some(node_at(tree, cursor));
@@ -278,9 +306,11 @@ pub(crate) fn collect_bindings<'t>(
         }
         node = n.parent();
     }
-    if let Some(type_node) = enclosing_type {
-        if let Some(td) = TypeDecl::from_node(type_node, source) {
-            push_fields(&td, table, &mut out);
+    if include_fields {
+        if let Some(type_node) = enclosing_type {
+            if let Some(td) = TypeDecl::from_node(type_node, source) {
+                push_fields(&td, table, &mut out);
+            }
         }
     }
     out
@@ -310,16 +340,34 @@ fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
     match params.kind() {
         "formal_parameters" => {
             for p in named_children(params) {
-                if matches!(p.kind(), "formal_parameter" | "spread_parameter") {
-                    if let Some(name) = p.child_by_field_name("name") {
-                        out.push(Binding {
-                            name: node_text(name, source),
-                            kind: BindingKind::Param,
-                            type_node: p.child_by_field_name("type"),
-                            decl_node: p,
-                            source,
-                        });
+                match p.kind() {
+                    "formal_parameter" => {
+                        if let Some(name) = p.child_by_field_name("name") {
+                            out.push(Binding {
+                                name: node_text(name, source),
+                                kind: BindingKind::Param,
+                                type_node: p.child_by_field_name("type"),
+                                decl_node: p,
+                                source,
+                            });
+                        }
                     }
+                    // Varargs: name + type live off the field accessors.
+                    "spread_parameter" => {
+                        if let Some(name) = crate::signature::spread_param_name(p) {
+                            let type_node = named_children(p)
+                                .into_iter()
+                                .find(|c| !matches!(c.kind(), "modifiers" | "variable_declarator"));
+                            out.push(Binding {
+                                name: node_text(name, source),
+                                kind: BindingKind::Param,
+                                type_node,
+                                decl_node: p,
+                                source,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -369,7 +417,7 @@ pub(crate) fn lookup_binding<'t>(
     name: &str,
     table: &TypeTable<'t>,
 ) -> Option<Binding<'t>> {
-    collect_bindings(tree, source, byte, table)
+    collect_bindings(tree, source, byte, table, true)
         .into_iter()
         .find(|b| b.name == name)
 }

@@ -43,6 +43,9 @@ struct Backend {
     documents: Mutex<HashMap<String, Document>>,
     /// LSP position encoding negotiated during `initialize` (defaults to UTF-16).
     encoding: OnceLock<PositionEncoding>,
+    /// Whether the client supports snippet completion (`$1` tab stops). Defaults
+    /// to `false` until negotiated during `initialize`.
+    snippet_support: OnceLock<bool>,
 }
 
 impl Backend {
@@ -52,6 +55,7 @@ impl Backend {
             parser: StdMutex::new(jvl_syntax::new_parser()),
             documents: Mutex::new(HashMap::new()),
             encoding: OnceLock::new(),
+            snippet_support: OnceLock::new(),
         }
     }
 
@@ -60,6 +64,10 @@ impl Backend {
             .get()
             .copied()
             .unwrap_or(PositionEncoding::Utf16)
+    }
+
+    fn snippet_support(&self) -> bool {
+        self.snippet_support.get().copied().unwrap_or(false)
     }
 
     /// Parse `text`, reusing `old` for an incremental reparse when the caller has
@@ -89,6 +97,18 @@ impl Backend {
     }
 }
 
+/// Whether the client supports snippet (`$1` tab-stop) completion inserts.
+fn supports_snippets(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|ci| ci.snippet_support)
+        .unwrap_or(false)
+}
+
 /// Pick UTF-8 if the client advertises support (lets tree-sitter byte offsets
 /// pass through unconverted); otherwise the LSP default, UTF-16.
 fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
@@ -109,6 +129,7 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let encoding = negotiate_encoding(&params);
         let _ = self.encoding.set(encoding);
+        let _ = self.snippet_support.set(supports_snippets(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
@@ -302,7 +323,7 @@ impl LanguageServer for Backend {
         };
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let items = jvl_syntax::completion(&open, 0, &index, position);
+        let items = jvl_syntax::completion(&open, 0, &index, position, self.snippet_support());
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
 }

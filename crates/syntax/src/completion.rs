@@ -25,12 +25,14 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Produce completion items for the cursor position. After a resolvable `.` this
-/// is member completion; otherwise in-scope identifiers + keywords.
+/// is member completion; otherwise in-scope identifiers + keywords. `snippets`
+/// reflects the client's `completionItem.snippetSupport` capability.
 pub fn completion(
     docs: &[OpenDoc],
     current: usize,
     index: &LineIndex,
     pos: Position,
+    snippets: bool,
 ) -> Vec<CompletionItem> {
     let Some(doc) = docs.get(current) else {
         return Vec::new();
@@ -42,23 +44,27 @@ pub fn completion(
         // In a member-access position: only members, never scope fallback, so a
         // typed `.` never yields wrong global suggestions.
         return match resolve::resolve_receiver_type(recv, doc, &table) {
-            Some(resolved) => member_items(&resolved, &table),
+            Some(resolved) => member_items(&resolved, &table, snippets),
             None => Vec::new(),
         };
     }
 
-    scope_items(doc, cursor, &table)
+    scope_items(doc, cursor, &table, snippets)
 }
 
-fn member_items<'t>(resolved: &Resolved<'t>, table: &TypeTable<'t>) -> Vec<CompletionItem> {
+fn member_items<'t>(
+    resolved: &Resolved<'t>,
+    table: &TypeTable<'t>,
+    snippets: bool,
+) -> Vec<CompletionItem> {
     table
         .all_members(&resolved.decl, resolved.static_only)
         .iter()
-        .map(member_item)
+        .map(|m| member_item(m, snippets))
         .collect()
 }
 
-fn member_item(member: &Member) -> CompletionItem {
+fn member_item(member: &Member, snippets: bool) -> CompletionItem {
     let detail = signature(member.node, member.source);
     let doc = javadoc(member.node, member.source);
     let kind = member_kind(member.kind);
@@ -70,14 +76,16 @@ fn member_item(member: &Member) -> CompletionItem {
         ..Default::default()
     };
     if member.kind == MemberKind::Method {
-        apply_method_insert(&mut item, member.node);
+        apply_method_insert(&mut item, member.node, snippets);
     }
     item
 }
 
-/// Methods insert `name()` (zero-arg) or a `name($1)` snippet so the cursor lands
-/// between the parentheses.
-fn apply_method_insert(item: &mut CompletionItem, method: Node) {
+/// Decide a method's insert text. With snippet support: `name()` (zero-arg) or a
+/// `name($1)` tab-stop snippet. Without it: `name()` or `name(` (the editor
+/// leaves the cursor after the paren). `$` is escaped because it is legal in Java
+/// identifiers and is snippet-special.
+fn apply_method_insert(item: &mut CompletionItem, method: Node, snippets: bool) {
     let has_params = method
         .child_by_field_name("parameters")
         .map(|p| {
@@ -86,15 +94,23 @@ fn apply_method_insert(item: &mut CompletionItem, method: Node) {
                 .any(|c| matches!(c.kind(), "formal_parameter" | "spread_parameter"))
         })
         .unwrap_or(false);
-    if has_params {
-        item.insert_text = Some(format!("{}($1)", item.label));
+    if !has_params {
+        item.insert_text = Some(format!("{}()", item.label));
+    } else if snippets {
+        let label = item.label.replace('$', "\\$");
+        item.insert_text = Some(format!("{label}($1)"));
         item.insert_text_format = Some(InsertTextFormat::SNIPPET);
     } else {
-        item.insert_text = Some(format!("{}()", item.label));
+        item.insert_text = Some(format!("{}(", item.label));
     }
 }
 
-fn scope_items<'t>(doc: &OpenDoc<'t>, cursor: usize, table: &TypeTable<'t>) -> Vec<CompletionItem> {
+fn scope_items<'t>(
+    doc: &OpenDoc<'t>,
+    cursor: usize,
+    table: &TypeTable<'t>,
+    snippets: bool,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut push = |item: CompletionItem, items: &mut Vec<CompletionItem>| {
@@ -104,18 +120,18 @@ fn scope_items<'t>(doc: &OpenDoc<'t>, cursor: usize, table: &TypeTable<'t>) -> V
         }
     };
 
-    // Locals, params, for-vars, and enclosing-type fields (own + inherited).
-    for binding in resolve::collect_bindings(doc.tree, doc.source, cursor, table) {
+    // Locals, params, for-vars. Fields come from the single all_members() pass
+    // below, so they are excluded here to avoid recomputing the member set.
+    for binding in resolve::collect_bindings(doc.tree, doc.source, cursor, table, false) {
         push(binding_item(&binding), &mut items);
     }
 
-    // Methods + nested types callable unqualified from the enclosing type.
+    // The enclosing type's members (fields + methods + nested types), own and
+    // inherited, callable unqualified — one all_members() pass.
     let node = resolve::node_at(doc.tree, cursor);
     if let Some(td) = resolve::enclosing_typedecl(node, doc.source) {
         for member in table.all_members(&td, false) {
-            if matches!(member.kind, MemberKind::Method | MemberKind::NestedType(_)) {
-                push(member_item(&member), &mut items);
-            }
+            push(member_item(&member, snippets), &mut items);
         }
     }
 
@@ -205,7 +221,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at))
+        completion(&docs, 0, &index, index.position(at), true)
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -335,7 +351,7 @@ mod tests {
         ];
         let index = LineIndex::new(use_src, PositionEncoding::Utf16);
         let at = use_src.find("w.").unwrap() + 2;
-        let items = completion(&docs, 0, &index, index.position(at));
+        let items = completion(&docs, 0, &index, index.position(at), true);
         assert!(has(&items, "spin"), "cross-file: {:?}", labels(&items));
     }
 
@@ -345,5 +361,100 @@ mod tests {
         let _ = complete("class C { void m() { x. } }\n", "x.");
         let _ = complete("class C { void m() { . } }\n", ".");
         let _ = complete("", "");
+    }
+
+    // --- Regression tests for the adversarial review findings ---
+
+    fn complete_snip(src: &str, marker: &str, snippets: bool) -> Vec<CompletionItem> {
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find(marker).expect("marker present") + marker.len();
+        completion(&docs, 0, &index, index.position(at), snippets)
+    }
+
+    #[test]
+    fn member_completion_while_typing_partial_unterminated() {
+        // The dominant live case: partial member, no trailing `;`. tree-sitter
+        // parses `b.wi` as a scoped_type_identifier of type_identifier segments.
+        let src = "class Box { int width; int height; }\n\
+                   class C { void m() { Box b; b.wi } }\n";
+        let items = complete(src, "b.wi");
+        assert!(has(&items, "width"), "{:?}", labels(&items));
+        assert!(has(&items, "height"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn static_type_receiver_shows_static_members_only() {
+        let src = "class Helper { static int S = 1; static void sm() {} int inst; }\n\
+                   class C { void m() { Helper.s } }\n";
+        let items = complete(src, "Helper.s");
+        assert!(has(&items, "S"), "static field: {:?}", labels(&items));
+        assert!(has(&items, "sm"), "static method: {:?}", labels(&items));
+        assert!(!has(&items, "inst"), "instance member excluded: {:?}", labels(&items));
+    }
+
+    #[test]
+    fn interface_constants_are_inherited_members() {
+        let src = "interface Sized { int MAX = 10; int size(); }\n\
+                   class C implements Sized { void m() { this.x; } }\n";
+        let items = complete(src, "this.");
+        assert!(has(&items, "MAX"), "interface constant: {:?}", labels(&items));
+        assert!(has(&items, "size"), "interface method: {:?}", labels(&items));
+    }
+
+    #[test]
+    fn varargs_parameter_is_in_scope_with_correct_signature() {
+        let src = "class C { void m(int... xs) { ZZZ } }\n";
+        let items = complete(src, "ZZZ");
+        assert!(has(&items, "xs"), "varargs binding: {:?}", labels(&items));
+        assert_eq!(detail_of(&items, "xs"), Some("int... xs"));
+    }
+
+    #[test]
+    fn method_insert_falls_back_to_plaintext_without_snippet_support() {
+        let src = "class Box { int f(int n) { return 0; } }\n\
+                   class C { void m() { Box b; b.x; } }\n";
+        let with = complete_snip(src, "b.", true);
+        let without = complete_snip(src, "b.", false);
+        let f_with = with.iter().find(|i| i.label == "f").unwrap();
+        let f_without = without.iter().find(|i| i.label == "f").unwrap();
+        assert_eq!(f_with.insert_text.as_deref(), Some("f($1)"));
+        assert_eq!(f_with.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert_eq!(f_without.insert_text.as_deref(), Some("f("));
+        assert_eq!(f_without.insert_text_format, None);
+    }
+
+    #[test]
+    fn dollar_in_method_name_is_escaped_in_snippet() {
+        // `$` is a legal Java identifier char and is snippet-special.
+        let src = "class Box { int a$b(int n) { return 0; } }\n\
+                   class C { void m() { Box b; b.x; } }\n";
+        let items = complete(src, "b.");
+        let m = items.iter().find(|i| i.label == "a$b").unwrap();
+        assert_eq!(m.insert_text.as_deref(), Some("a\\$b($1)"));
+    }
+
+    #[test]
+    fn deeply_nested_receiver_does_not_overflow_the_stack() {
+        // Without a depth bound this recurses ~5000 deep and aborts the process.
+        let depth = 5000;
+        let src = format!(
+            "class C {{ void m() {{ {}a{}. }} }}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        // Cursor right after the final dot; must return (gracefully empty) not crash.
+        let tree = tree(&src);
+        let docs = [OpenDoc {
+            source: &src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(&src, PositionEncoding::Utf16);
+        let at = src.rfind('.').unwrap() + 1;
+        let _ = completion(&docs, 0, &index, index.position(at), true);
     }
 }

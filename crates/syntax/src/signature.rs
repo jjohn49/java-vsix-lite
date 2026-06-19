@@ -12,7 +12,9 @@ use crate::node_text;
 /// not a kind we render.
 pub(crate) fn signature(node: Node, source: &str) -> Option<String> {
     match node.kind() {
-        "method_declaration" => Some(method_signature(node, source)),
+        "method_declaration" | "annotation_type_element_declaration" => {
+            Some(method_signature(node, source))
+        }
         "constructor_declaration" => Some(constructor_signature(node, source)),
         "variable_declarator" => Some(field_signature(node, source)),
         "formal_parameter" | "spread_parameter" | "catch_formal_parameter" => {
@@ -87,6 +89,20 @@ fn field_signature(declarator: Node, source: &str) -> String {
 }
 
 fn param_signature(node: Node, source: &str) -> String {
+    // A varargs parameter is `(spread_parameter <type> (variable_declarator
+    // name:(identifier)))` — the type is a positional child and the name lives on
+    // the nested declarator, not on `name`/`type` fields.
+    if node.kind() == "spread_parameter" {
+        let ty = named_children(node)
+            .into_iter()
+            .find(|c| !matches!(c.kind(), "modifiers" | "variable_declarator"))
+            .map(|n| collapse_ws(node_text(n, source)))
+            .unwrap_or_default();
+        let name = spread_param_name(node)
+            .map(|n| node_text(n, source))
+            .unwrap_or("");
+        return format!("{ty}... {name}").trim().to_string();
+    }
     let ty = node
         .child_by_field_name("type")
         .map(|n| collapse_ws(node_text(n, source)))
@@ -95,8 +111,15 @@ fn param_signature(node: Node, source: &str) -> String {
         .child_by_field_name("name")
         .map(|n| node_text(n, source))
         .unwrap_or("");
-    let spread = if node.kind() == "spread_parameter" { "..." } else { "" };
-    format!("{ty}{spread} {name}").trim().to_string()
+    format!("{ty} {name}").trim().to_string()
+}
+
+/// The name identifier of a `spread_parameter` (on its nested declarator).
+pub(crate) fn spread_param_name(node: Node) -> Option<Node> {
+    named_children(node)
+        .into_iter()
+        .find(|c| c.kind() == "variable_declarator")
+        .and_then(|d| d.child_by_field_name("name"))
 }
 
 fn for_var_signature(node: Node, source: &str) -> String {
