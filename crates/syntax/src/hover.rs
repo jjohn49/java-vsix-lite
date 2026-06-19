@@ -17,7 +17,8 @@ use crate::{node_text, LineIndex, OpenDoc};
 /// bytecode carries none).
 enum Target<'t> {
     InProject(Node<'t>, &'t str),
-    External(String),
+    /// A pre-rendered external signature plus optional Javadoc.
+    External(String, Option<String>),
 }
 
 /// Build a hover for the identifier under the cursor, or `None` if there is none
@@ -51,7 +52,14 @@ pub fn hover(
             }
             value
         }
-        Target::External(sig) => format!("```java\n{sig}\n```"),
+        Target::External(sig, doc) => {
+            let mut value = format!("```java\n{sig}\n```");
+            if let Some(doc_text) = doc {
+                value.push_str("\n\n");
+                value.push_str(&doc_text);
+            }
+            value
+        }
     };
 
     Some(Hover {
@@ -141,7 +149,14 @@ fn member_target<'t>(
 ) -> Option<Target<'t>> {
     match resolve::find_member_hier(resolved, ctx, name)? {
         HierMember::InProject(m) => Some(Target::InProject(m.node, m.source)),
-        HierMember::External(m) => Some(Target::External(m.signature)),
+        HierMember::External(m) => {
+            // Javadoc only when the receiver itself is external (we have its FQN).
+            let doc = match &resolved.ty {
+                ResolvedType::External { fqn, .. } => ctx.symbols.doc(fqn, Some(name)),
+                ResolvedType::InProject(_) => None,
+            };
+            Some(Target::External(m.signature, doc))
+        }
     }
 }
 

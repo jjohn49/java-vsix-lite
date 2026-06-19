@@ -37,6 +37,12 @@ pub enum ExternalMemberKind {
 /// `jvl-syntax` may call this many times per request.
 pub trait SymbolSource {
     fn class(&self, fqn: &str) -> Option<ExternalClass>;
+
+    /// Javadoc for a fully-qualified type (`member` = `None`) or its named
+    /// member, recovered from source archives. Defaults to none.
+    fn doc(&self, _fqn: &str, _member: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// A [`SymbolSource`] that resolves nothing — used when no JDK is available and

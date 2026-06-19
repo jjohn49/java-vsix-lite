@@ -392,6 +392,37 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
                 .collect(),
         })
     }
+
+    /// Find a member's Javadoc by walking the type and its supertypes' sources
+    /// (a member may be declared in a supertype), first match wins.
+    fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+        let mut stack = vec![fqn.to_string()];
+        let mut visited = std::collections::HashSet::new();
+        let mut budget = 64;
+        while let Some(current) = stack.pop() {
+            if budget == 0 || !visited.insert(current.clone()) {
+                continue;
+            }
+            budget -= 1;
+            if let Some(src) = self.0.source(&current) {
+                let simple = current
+                    .rsplit('.')
+                    .next()
+                    .and_then(|s| s.rsplit('$').next())
+                    .unwrap_or(&current);
+                if let Some(doc) = jvl_syntax::javadoc_in_source(&src, simple, member) {
+                    return Some(doc);
+                }
+            }
+            // Members can be inherited; type Javadoc lives only in its own source.
+            if member.is_some() {
+                if let Some(info) = self.0.class(&current) {
+                    stack.extend(info.supers.iter().cloned());
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Build the open-document slice the analysis reads, with the cursor's document

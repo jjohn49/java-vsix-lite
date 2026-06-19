@@ -63,11 +63,22 @@ struct Archive {
     prefix: &'static str,
 }
 
+/// A source archive (the JDK's `src.zip` or a dependency `-sources.jar`) used to
+/// recover Javadoc. `suffix_match` is set for src.zip, whose entries are
+/// module-prefixed (`java.base/java/util/List.java`).
+struct SourceArchive {
+    zip: ZipArchive,
+    suffix_match: bool,
+}
+
 /// An ordered set of archives (JDK jmods + dependency jars) answering
 /// "what are the members of fully-qualified type `X`?", with a result cache.
+/// Parallel source archives provide Javadoc.
 pub struct Classpath {
     archives: Vec<Archive>,
+    sources: Vec<SourceArchive>,
     cache: RwLock<HashMap<String, Option<Arc<ClassInfo>>>>,
+    source_cache: RwLock<HashMap<String, Option<Arc<String>>>>,
 }
 
 impl Classpath {
@@ -76,11 +87,14 @@ impl Classpath {
     pub fn empty() -> Classpath {
         Classpath {
             archives: Vec::new(),
+            sources: Vec::new(),
             cache: RwLock::new(HashMap::new()),
+            source_cache: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Build a classpath from the best available JDK's jmods. Empty if none.
+    /// Build a classpath from the best available JDK's jmods (and its `src.zip`
+    /// for Javadoc). Empty if none.
     pub fn from_jdk() -> Classpath {
         let mut cp = Classpath::empty();
         if let Some(home) = jdk::best_jdk() {
@@ -92,6 +106,13 @@ impl Classpath {
                         prefix: "classes/",
                     });
                 }
+            }
+            // src.zip holds the JDK source (module-prefixed) for Javadoc.
+            if let Some(zip) = ZipArchive::open(&home.join("lib/src.zip"), 0) {
+                cp.sources.push(SourceArchive {
+                    zip,
+                    suffix_match: true,
+                });
             }
         }
         cp
@@ -113,10 +134,19 @@ impl Classpath {
         cp
     }
 
-    /// Add a dependency jar to the classpath (no-op if it can't be opened).
+    /// Add a dependency jar to the classpath (no-op if it can't be opened). Its
+    /// sibling `-sources.jar`, if present, is registered for Javadoc.
     pub fn add_jar(&mut self, path: &Path) {
         if let Some(zip) = ZipArchive::open(path, 0) {
             self.archives.push(Archive { zip, prefix: "" });
+        }
+        if let Some(sources) = sources_jar_path(path) {
+            if let Some(zip) = ZipArchive::open(&sources, 0) {
+                self.sources.push(SourceArchive {
+                    zip,
+                    suffix_match: false,
+                });
+            }
         }
     }
 
@@ -154,6 +184,53 @@ impl Classpath {
         }
         None
     }
+
+    /// The `.java` source for a fully-qualified type from a source archive, if
+    /// available (for Javadoc). Cached, including misses.
+    pub fn source(&self, fqn: &str) -> Option<Arc<String>> {
+        if let Some(hit) = self.source_cache.read().expect("source cache").get(fqn) {
+            return hit.clone();
+        }
+        let result = self.load_source(fqn).map(Arc::new);
+        self.source_cache
+            .write()
+            .expect("source cache")
+            .insert(fqn.to_string(), result.clone());
+        result
+    }
+
+    fn load_source(&self, fqn: &str) -> Option<String> {
+        // Nested types live in their outer class's source file.
+        let path = fqn.replace('.', "/");
+        let path = path.split('$').next().unwrap_or(&path);
+        let suffix = format!("/{path}.java");
+        let direct = format!("{path}.java");
+        for source in &self.sources {
+            let name = if source.suffix_match {
+                match source.zip.find_suffix(&suffix) {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else {
+                direct.clone()
+            };
+            if source.zip.contains(&name) {
+                if let Some(bytes) = source.zip.read(&name) {
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The `<name>-sources.jar` sibling of a dependency jar, if it exists.
+fn sources_jar_path(jar: &Path) -> Option<PathBuf> {
+    let stem = jar.file_stem()?.to_str()?;
+    let sources = jar.with_file_name(format!("{stem}-sources.jar"));
+    sources.is_file().then_some(sources)
 }
 
 /// The user's home directory, for locating `~/.m2` and `~/.gradle`.

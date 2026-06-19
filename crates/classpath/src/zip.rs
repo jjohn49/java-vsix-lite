@@ -71,6 +71,12 @@ impl ZipArchive {
         self.entries.contains_key(name)
     }
 
+    /// The first entry whose name ends with `suffix` — used to find a
+    /// module-prefixed source file (`java.base/java/util/List.java`) in src.zip.
+    pub(crate) fn find_suffix(&self, suffix: &str) -> Option<String> {
+        self.entries.keys().find(|k| k.ends_with(suffix)).cloned()
+    }
+
     /// Read and decompress one entry by exact name, enforcing the size cap.
     pub(crate) fn read(&self, name: &str) -> Option<Vec<u8>> {
         let entry = self.entries.get(name)?;
