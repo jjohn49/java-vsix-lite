@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Open the repository root in VS Code and press F5. This builds the Rust
+      // server + the extension bundle, then launches an Extension Development
+      // Host with JVL_SERVER_PATH pointed at the freshly built debug binary.
+      // Open any .java file in the new window to see diagnostics, outline,
+      // folding, and expand-selection.
+      "name": "Run Extension (java-vsix-lite)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/editors/vscode"],
+      "outFiles": ["${workspaceFolder}/editors/vscode/dist/**/*.js"],
+      "preLaunchTask": "build",
+      "env": {
+        "JVL_SERVER_PATH": "${workspaceFolder}/target/debug/jvl-server",
+        "JVL_LOG": "debug"
+      }
+    }
+  ]
+}

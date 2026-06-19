@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "dependsOn": ["build server", "build extension"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "build server",
+      "type": "shell",
+      "command": "cargo build",
+      "problemMatcher": "$rustc",
+      "presentation": { "reveal": "silent" }
+    },
+    {
+      // `npm install` is idempotent and fast once node_modules exists; it keeps
+      // the first F5 turnkey without a separate setup step.
+      "label": "build extension",
+      "type": "shell",
+      "command": "npm install && npm run build",
+      "options": { "cwd": "${workspaceFolder}/editors/vscode" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent" }
+    }
+  ]
+}
