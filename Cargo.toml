@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/server"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/john-h-johnston4/java-vsix-lite"
+publish = false
+
+# Pinned, shared dependency versions live here so every crate in the workspace
+# resolves identically. Exact versions are filled in by `cargo add` (committed
+# Cargo.lock is the supply-chain source of truth).
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Keep release builds lean: this is an editor sidecar, not a throughput engine.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+panic = "abort"

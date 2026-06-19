@@ -1,0 +1,75 @@
+{
+  "name": "java-vsix-lite",
+  "displayName": "java-vsix-lite",
+  "description": "Minimal, low-compute Java language support for VS Code (pure-Rust default tier; optional opt-in javac tier).",
+  "version": "0.0.0",
+  "publisher": "java-vsix-lite",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/john-h-johnston4/java-vsix-lite"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:java"
+  ],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code. The optional javac tier and build commands stay disabled until the workspace is trusted."
+    }
+  },
+  "contributes": {
+    "configuration": {
+      "title": "java-vsix-lite",
+      "properties": {
+        "java-vsix-lite.server.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Absolute path to the `jvl-server` binary. Leave empty to use the bundled binary. The `JVL_SERVER_PATH` environment variable overrides this."
+        },
+        "java-vsix-lite.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace the JSON-RPC traffic between VS Code and the language server (for debugging)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "java-vsix-lite.restartServer",
+        "title": "Restart Language Server",
+        "category": "java-vsix-lite"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build -- --minify",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run build -- --sourcemap --watch",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "node ./out/test/runTest.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: read-only by default.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tests must not touch the network (supply-chain / least-privilege invariant).
+  # cargo is already offline after the explicit fetch step below.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked --offline
+
+  cargo-deny:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  extension:
+    name: VS Code extension (types, lint, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install (locked)
+        run: npm ci
+      - name: Audit
+        run: npm audit --audit-level=moderate
+      - name: Type-check
+        run: npm run check-types
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build

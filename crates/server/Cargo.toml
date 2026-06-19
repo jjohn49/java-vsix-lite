@@ -1,0 +1,21 @@
+[package]
+name = "jvl-server"
+description = "java-vsix-lite language server (pure-Rust default tier + optional Java-tier supervisor)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jvl-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tower-lsp-server = "0.23.0"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# tower-lsp-server is added via `cargo add` so the exact version is recorded here
+# and in Cargo.lock.
