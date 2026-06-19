@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 use jvl_syntax::tree_sitter::{Parser, Tree};
@@ -50,6 +51,8 @@ struct Backend {
     /// on first use so the JDK's jmods aren't scanned until completion/hover needs
     /// them.
     classpath: OnceLock<jvl_classpath::Classpath>,
+    /// Workspace root (from `initialize`), used to discover project dependencies.
+    workspace_root: OnceLock<Option<PathBuf>>,
 }
 
 impl Backend {
@@ -61,6 +64,7 @@ impl Backend {
             encoding: OnceLock::new(),
             snippet_support: OnceLock::new(),
             classpath: OnceLock::new(),
+            workspace_root: OnceLock::new(),
         }
     }
 
@@ -75,9 +79,13 @@ impl Backend {
         self.snippet_support.get().copied().unwrap_or(false)
     }
 
-    /// The imported-type symbol source, built from the user's JDK on first use.
+    /// The imported-type symbol source, built on first use from the user's JDK
+    /// plus the workspace's declared dependencies.
     fn classpath(&self) -> &jvl_classpath::Classpath {
-        self.classpath.get_or_init(jvl_classpath::Classpath::from_jdk)
+        self.classpath.get_or_init(|| {
+            let root = self.workspace_root.get().and_then(|r| r.as_deref());
+            jvl_classpath::Classpath::from_jdk_and_project(root)
+        })
     }
 
     /// Parse `text`, reusing `old` for an incremental reparse when the caller has
@@ -105,6 +113,23 @@ impl Backend {
             .publish_diagnostics(uri, diagnostics, None)
             .await;
     }
+}
+
+/// The workspace root as a filesystem path, from the first workspace folder
+/// (falling back to the deprecated `rootUri`), parsed from its `file://` URI.
+fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
+    let uri = params
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .map(|folder| folder.uri.clone())
+        .or_else(|| {
+            #[allow(deprecated)]
+            params.root_uri.clone()
+        })?;
+    let raw = uri.as_str();
+    let path = raw.strip_prefix("file://").unwrap_or(raw);
+    Some(PathBuf::from(path.replace("%20", " ")))
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.
@@ -140,6 +165,7 @@ impl LanguageServer for Backend {
         let encoding = negotiate_encoding(&params);
         let _ = self.encoding.set(encoding);
         let _ = self.snippet_support.set(supports_snippets(&params));
+        let _ = self.workspace_root.set(workspace_root(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,

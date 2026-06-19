@@ -12,11 +12,13 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 mod class_info;
+mod gradle;
 mod jdk;
+mod maven;
 mod zip;
 
 use zip::ZipArchive;
@@ -87,6 +89,22 @@ impl Classpath {
         cp
     }
 
+    /// The JDK classpath plus a project's **direct, declared** dependency jars,
+    /// discovered statically (Maven `pom.xml`; Gradle build files +
+    /// `libs.versions.toml`) from `root`. No build tool is executed.
+    pub fn from_jdk_and_project(root: Option<&Path>) -> Classpath {
+        let mut cp = Classpath::from_jdk();
+        if let (Some(root), Some(home)) = (root, home_dir()) {
+            for jar in maven::dependency_jars(root, &home.join(".m2/repository")) {
+                cp.add_jar(&jar);
+            }
+            for jar in gradle::dependency_jars(root, &home.join(".gradle/caches")) {
+                cp.add_jar(&jar);
+            }
+        }
+        cp
+    }
+
     /// Add a dependency jar to the classpath (no-op if it can't be opened).
     pub fn add_jar(&mut self, path: &Path) {
         if let Some(zip) = ZipArchive::open(path, 0) {
@@ -128,6 +146,11 @@ impl Classpath {
         }
         None
     }
+}
+
+/// The user's home directory, for locating `~/.m2` and `~/.gradle`.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]

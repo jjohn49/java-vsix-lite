@@ -11,5 +11,6 @@ publish.workspace = true
 [dependencies]
 cafebabe = "0.9.0"
 miniz_oxide = "0.9.1"
+roxmltree = "0.21.1"
 # cafebabe (pure-Rust class-file parser) + miniz_oxide (pure-Rust DEFLATE) are
 # added via `cargo add` so exact versions are pinned in Cargo.lock.
