@@ -27,6 +27,12 @@
     }
   },
   "contributes": {
+    "languages": [
+      {
+        "id": "java",
+        "configuration": "./language-configuration.json"
+      }
+    ],
     "configuration": {
       "title": "java-vsix-lite",
       "properties": {
@@ -38,7 +44,11 @@
         },
         "java-vsix-lite.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "description": "Trace the JSON-RPC traffic between VS Code and the language server (for debugging)."
         },
@@ -65,16 +75,15 @@
     "lint": "eslint src",
     "test": "node ./out/test/runTest.js"
   },
-  "dependencies": {
-    "vscode-languageclient": "^9.0.1"
-  },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.84.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.25.0",
     "eslint": "^8.56.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vscode-languageclient": "^9.0.1"
   }
 }
