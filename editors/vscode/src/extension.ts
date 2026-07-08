@@ -6,9 +6,10 @@
 // commands. All parsing/lint/IntelliSense (and, later, supervision of the
 // optional javac tier) lives inside the Rust server.
 
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import * as util from "util";
 import * as vscode from "vscode";
 import {
   LanguageClient,
@@ -58,21 +59,29 @@ function resolveServerPath(context: vscode.ExtensionContext): string | undefined
   return fs.existsSync(bundled) ? bundled : undefined;
 }
 
+const execFileAsync = util.promisify(execFile);
+
 // Version handshake: runs the server binary with `--version` and warns (via
 // the LSP output channel, non-fatally) if it disagrees with the extension's
 // own version. Catches a stale bundled binary left over from a partial
 // update; never blocks startup — a spawn failure or an older binary that
 // doesn't understand `--version` is swallowed as a warning too.
-function checkVersionHandshake(
+//
+// Runs asynchronously and is fire-and-forget from the caller's perspective:
+// a hung or misbehaving binary must not stall activation (the previous
+// execFileSync-based implementation could block the entire shared extension
+// host for up to its 5s timeout).
+async function checkVersionHandshake(
   serverPath: string,
   extensionVersion: string,
   outputChannel: vscode.OutputChannel,
-): void {
+): Promise<void> {
   try {
-    const serverVersion = execFileSync(serverPath, ["--version"], {
+    const { stdout } = await execFileAsync(serverPath, ["--version"], {
       encoding: "utf8",
       timeout: 5000,
-    }).trim();
+    });
+    const serverVersion = stdout.trim();
     if (serverVersion.length > 0 && serverVersion !== extensionVersion) {
       outputChannel.appendLine(
         `[java-vsix-lite] warning: bundled server version (${serverVersion}) does not match extension version (${extensionVersion}); consider reinstalling the extension.`,
@@ -122,7 +131,9 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     clientOptions,
   );
 
-  checkVersionHandshake(
+  // Fire-and-forget: activation must not wait on this (see
+  // checkVersionHandshake's doc comment).
+  void checkVersionHandshake(
     serverPath,
     context.extension.packageJSON.version as string,
     client.outputChannel,
