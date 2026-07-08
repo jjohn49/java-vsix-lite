@@ -54,8 +54,8 @@
         },
         "java-vsix-lite.diagnostics.unresolvedMembers": {
           "type": "boolean",
-          "default": false,
-          "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics). Off by default."
+          "default": true,
+          "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics). On by default; disable if you hit a false positive on a hierarchy the resolver can't fully see."
         }
       }
     },
