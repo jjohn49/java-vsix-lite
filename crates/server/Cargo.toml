@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 jvl-classpath = { version = "0.0.0", path = "../classpath" }
 jvl-syntax = { version = "0.0.0", path = "../syntax" }
+serde = { version = "1.0.228", features = ["derive"] }
 tokio.workspace = true
 tower-lsp-server = "0.23.0"
 tracing.workspace = true

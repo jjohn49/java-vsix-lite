@@ -17,15 +17,36 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::ops::Range as StdRange;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::SystemTime;
 
 use jvl_syntax::tree_sitter::{Parser, Tree};
-use jvl_syntax::{LineIndex, PositionEncoding};
+use jvl_syntax::{Definition, LineIndex, PositionEncoding};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+
+/// Bound on the step-(c) parse-on-demand cache (an unopened project source
+/// file referenced by an open one) and the step-(d) external stub/source
+/// cache: cleared wholesale past this many entries rather than tracking LRU —
+/// both paths are rare enough (cold, one-off lookups) that eviction pressure
+/// is low and a simple bound is not worth extra bookkeeping.
+const EXTERNAL_CACHE_CAP: usize = 32;
+const PROJECT_FILE_CACHE_CAP: usize = 32;
+
+/// A single project source file parsed on demand for ladder step (c),
+/// invalidated by `mtime` so an on-disk edit is picked up without an explicit
+/// notification (the server never watches files).
+struct CachedProjectFile {
+    mtime: SystemTime,
+    text: Arc<String>,
+    tree: Tree,
+}
 
 /// A single open document: its current text and the parse tree kept in sync
 /// with it.
@@ -58,6 +79,15 @@ struct Backend {
     project_root_hint: OnceLock<Option<PathBuf>>,
     /// Whether to emit unresolved-member diagnostics (opt-in; default off).
     unresolved_member_diagnostics: OnceLock<bool>,
+    /// Ladder step (c): a single unopened project source file, parsed on
+    /// demand and cached by path (see [`CachedProjectFile`]). Never held
+    /// across an `.await`.
+    project_file_cache: StdMutex<HashMap<PathBuf, CachedProjectFile>>,
+    /// Ladder step (d): a JDK/dependency type's source (or, absent that, a
+    /// signature-only stub rendered from `ClassInfo`) — the text served
+    /// through the `jvl-src:` virtual document scheme. Keyed by FQN. Never
+    /// held across an `.await`.
+    external_stub_cache: StdMutex<HashMap<String, Arc<String>>>,
 }
 
 impl Backend {
@@ -72,6 +102,8 @@ impl Backend {
             workspace_root: OnceLock::new(),
             project_root_hint: OnceLock::new(),
             unresolved_member_diagnostics: OnceLock::new(),
+            project_file_cache: StdMutex::new(HashMap::new()),
+            external_stub_cache: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -91,13 +123,182 @@ impl Backend {
     /// workspace folder, or (if none) one derived from the first opened file.
     fn classpath(&self) -> &jvl_classpath::Classpath {
         self.classpath.get_or_init(|| {
-            let root = self
-                .workspace_root
-                .get()
-                .and_then(|r| r.clone())
-                .or_else(|| self.project_root_hint.get().and_then(|r| r.clone()));
-            jvl_classpath::Classpath::from_jdk_and_project(root.as_deref())
+            jvl_classpath::Classpath::from_jdk_and_project(self.project_root().as_deref())
         })
+    }
+
+    /// The workspace folder, or (if none) the root derived from the first
+    /// opened file — used both for classpath discovery and (here) as the base
+    /// for ladder step (c)'s conventional source-root candidates.
+    fn project_root(&self) -> Option<PathBuf> {
+        self.workspace_root
+            .get()
+            .and_then(|r| r.clone())
+            .or_else(|| self.project_root_hint.get().and_then(|r| r.clone()))
+    }
+
+    /// Candidate source roots for ladder step (c): the conventional
+    /// `src/main/java` and `src/test/java` under the project root, plus one
+    /// inferred from each open document's own path and `package` declaration
+    /// (`file = root/a/b/C.java` + `package a.b;` ⇒ `root`). No directory
+    /// walking — every root here is either a fixed convention or derived from
+    /// data already in memory (open documents' parsed trees).
+    fn source_roots(&self, docs: &HashMap<String, Document>, project_root: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![
+            project_root.join("src/main/java"),
+            project_root.join("src/test/java"),
+        ];
+        for (uri, doc) in docs {
+            if let Some(root) = infer_source_root(uri, &doc.tree, &doc.text) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        roots
+    }
+
+    /// Candidate file paths for an FQN under every discovered source root
+    /// (ladder step (c)). `None` (rather than an empty list) when no project
+    /// root is known at all, or when `fqn` isn't safe to turn into a path
+    /// (guards against a crafted `package`/`import` escaping the root).
+    fn candidate_paths(&self, docs: &HashMap<String, Document>, fqn: &str) -> Vec<PathBuf> {
+        if !is_safe_fqn(fqn) {
+            return Vec::new();
+        }
+        let Some(root) = self.project_root() else {
+            return Vec::new();
+        };
+        let rel = format!("{}.java", fqn.replace('.', "/"));
+        self.source_roots(docs, &root)
+            .into_iter()
+            .map(|source_root| source_root.join(&rel))
+            .collect()
+    }
+
+    /// Parse (or reuse a cached parse of) a single project source file for
+    /// ladder step (c). At most one file is read per candidate tried, and the
+    /// caller (`resolve_location`) stops at the first hit — no directory
+    /// walking or indexing.
+    fn locate_in_project_file(
+        &self,
+        path: &Path,
+        simple_name: &str,
+    ) -> Option<(StdRange<usize>, Arc<String>)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let mtime = metadata.modified().ok()?;
+
+        let mut cache = self
+            .project_file_cache
+            .lock()
+            .expect("project file cache poisoned");
+        let fresh = cache.get(path).is_some_and(|c| c.mtime == mtime);
+        if !fresh {
+            let text = std::fs::read_to_string(path).ok()?;
+            let tree = self.parse(&text, None);
+            if cache.len() >= PROJECT_FILE_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedProjectFile {
+                    mtime,
+                    text: Arc::new(text),
+                    tree,
+                },
+            );
+        }
+        let cached = cache.get(path)?;
+        let range = jvl_syntax::locate_type_in_source(&cached.tree, &cached.text, simple_name)?;
+        Some((range, Arc::clone(&cached.text)))
+    }
+
+    /// The source text to serve for an external (JDK/dependency) FQN: real
+    /// source when the classpath's sibling source archive has it, else a
+    /// signature-only stub synthesized from `ClassInfo`. Stub text is cached
+    /// per FQN (real source is already cached inside `Classpath` itself).
+    fn external_source_text(&self, fqn: &str) -> Option<Arc<String>> {
+        if let Some(src) = self.classpath().source(fqn) {
+            return Some(src);
+        }
+        self.stub_text(fqn)
+    }
+
+    fn stub_text(&self, fqn: &str) -> Option<Arc<String>> {
+        if let Some(hit) = self
+            .external_stub_cache
+            .lock()
+            .expect("external stub cache poisoned")
+            .get(fqn)
+        {
+            return Some(Arc::clone(hit));
+        }
+        let info = self.classpath().class(fqn)?;
+        let text = Arc::new(render_stub(&info));
+        let mut cache = self
+            .external_stub_cache
+            .lock()
+            .expect("external stub cache poisoned");
+        if cache.len() >= EXTERNAL_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(fqn.to_string(), Arc::clone(&text));
+        Some(text)
+    }
+
+    /// Resolve a `jvl_syntax::Definition` into an LSP `Location`, dispatching
+    /// on which ladder step produced it. `docs`/`uris` are the same
+    /// documents-lock-held snapshot the `jvl_syntax::definition`/
+    /// `type_definition` call was made against.
+    fn resolve_location(
+        &self,
+        def: Definition,
+        docs: &HashMap<String, Document>,
+        uris: &[&str],
+    ) -> Option<Location> {
+        match def {
+            Definition::InOpenDoc {
+                doc, name_range, ..
+            } => {
+                let uri_str = *uris.get(doc)?;
+                let target = docs.get(uri_str)?;
+                let index = LineIndex::new(&target.text, self.encoding());
+                Some(Location {
+                    uri: uri_str.parse().ok()?,
+                    range: byte_range_to_lsp(&index, name_range),
+                })
+            }
+            Definition::ProjectType { simple_name, fqn } => {
+                let fqn = fqn?;
+                for path in self.candidate_paths(docs, &fqn) {
+                    if let Some((range, text)) = self.locate_in_project_file(&path, &simple_name) {
+                        let index = LineIndex::new(&text, self.encoding());
+                        return Some(Location {
+                            uri: Uri::from_file_path(&path)?,
+                            range: byte_range_to_lsp(&index, range),
+                        });
+                    }
+                }
+                None
+            }
+            Definition::External { fqn, member } => {
+                let text = self.external_source_text(&fqn)?;
+                let simple = simple_name(&fqn);
+                let byte_range = jvl_syntax::locate_in_source(&text, simple, member.as_deref());
+                let index = LineIndex::new(&text, self.encoding());
+                let range = match byte_range {
+                    Some(r) => byte_range_to_lsp(&index, r),
+                    // The member/type couldn't be located inside the source or
+                    // stub (e.g. an overload set quirk) — still point *somewhere*
+                    // inside the virtual document rather than failing outright.
+                    None => Range::default(),
+                };
+                Some(Location {
+                    uri: jvl_src_uri(&fqn)?,
+                    range,
+                })
+            }
+        }
     }
 
     /// Parse `text`, reusing `old` for an incremental reparse when the caller has
@@ -174,6 +375,105 @@ fn derive_project_root(uri: &Uri) -> Option<PathBuf> {
     None
 }
 
+/// Infer a document's source root from its own file path and its `package`
+/// declaration: if the path's parent directories match the package's dotted
+/// segments (walking outward from the file), the root is whatever remains
+/// above them (`root/a/b/C.java` + `package a.b;` ⇒ `root`). `None` for a
+/// non-`file:` URI, a document with no package declaration, or one whose path
+/// doesn't actually match its package (nothing to infer).
+fn infer_source_root(uri: &str, tree: &Tree, source: &str) -> Option<PathBuf> {
+    let uri: Uri = uri.parse().ok()?;
+    let path = uri.to_file_path()?.into_owned();
+    let package = extract_package(tree, source)?;
+    let mut dir = path.parent();
+    for segment in package.split('.').rev() {
+        let d = dir?;
+        if d.file_name().and_then(|n| n.to_str()) != Some(segment) {
+            return None;
+        }
+        dir = d.parent();
+    }
+    dir.map(Path::to_path_buf)
+}
+
+/// The dotted path of a document's `package` declaration, read directly off
+/// its already-parsed tree (no extra parsing).
+fn extract_package(tree: &Tree, source: &str) -> Option<String> {
+    let mut cursor = tree.root_node().walk();
+    let decl = tree
+        .root_node()
+        .children(&mut cursor)
+        .find(|c| c.kind() == "package_declaration")?;
+    let text = decl.utf8_text(source.as_bytes()).ok()?;
+    let path: String = text
+        .trim()
+        .strip_prefix("package")?
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Whether every dotted segment of a fully-qualified name is a safe, single
+/// path component — guards ladder step (c)'s file lookup against a crafted
+/// `package`/`import` declaration escaping the inferred source root (e.g. a
+/// `..` segment) when building a candidate path.
+fn is_safe_fqn(fqn: &str) -> bool {
+    !fqn.is_empty()
+        && fqn
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['/', '\\']))
+}
+
+/// `java.util.Map$Entry` -> `Entry`: the simple name the virtual-document
+/// tree-sitter lookup (`jvl_syntax::locate_in_source`) searches for.
+fn simple_name(fqn: &str) -> &str {
+    fqn.rsplit(['.', '$']).next().unwrap_or(fqn)
+}
+
+/// The `jvl-src:` virtual-document URI for an external (JDK/dependency) FQN.
+fn jvl_src_uri(fqn: &str) -> Option<Uri> {
+    format!("jvl-src:/{fqn}.java").parse().ok()
+}
+
+/// The FQN encoded in a `jvl-src:` virtual-document URI (the inverse of
+/// [`jvl_src_uri`]), as sent by the extension's `jvl/externalSource` request.
+fn fqn_from_jvl_src_uri(uri: &str) -> Option<String> {
+    uri.strip_prefix("jvl-src:/")?
+        .strip_suffix(".java")
+        .map(str::to_string)
+}
+
+/// Render a signature-only stub `.java`-shaped text from bytecode-derived
+/// `ClassInfo` — used when no `-sources.jar`/`src.zip` entry exists for an
+/// external type. Reuses the member signatures `jvl-classpath` already
+/// rendered (via its own signature/generics helpers) rather than re-deriving
+/// them; declarations have no bodies, which is ordinary Java syntax
+/// (abstract methods, interface methods) and parses fine.
+fn render_stub(info: &jvl_classpath::ClassInfo) -> String {
+    let mut out = format!(
+        "// Signature-only stub for {} (no sources available)\nclass {} {{\n",
+        info.fqn,
+        simple_name(&info.fqn)
+    );
+    for member in &info.members {
+        out.push_str("    ");
+        out.push_str(&member.signature);
+        out.push_str(";\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Convert a byte range (from `jvl-syntax`) into an LSP `Range` via `index`.
+fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Range {
+    Range {
+        start: index.position(range.start),
+        end: index.position(range.end),
+    }
+}
+
 /// The opt-in `unresolvedMemberDiagnostics` flag from `initializationOptions`.
 fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
     params
@@ -243,6 +543,8 @@ impl LanguageServer for Backend {
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     // `.` requests member completion; identifier/keyword
                     // completion is requested explicitly (Ctrl-Space) or by the
@@ -430,6 +732,64 @@ impl LanguageServer for Backend {
             jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
+            return Ok(None);
+        };
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        let def = jvl_syntax::definition(&open, 0, &index, position, &symbols);
+        let location = def.and_then(|def| self.resolve_location(def, &docs, &uris));
+        Ok(location.map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: GotoTypeDefinitionParams,
+    ) -> Result<Option<GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
+            return Ok(None);
+        };
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        let def = jvl_syntax::type_definition(&open, 0, &index, position, &symbols);
+        let location = def.and_then(|def| self.resolve_location(def, &docs, &uris));
+        Ok(location.map(GotoDefinitionResponse::Scalar))
+    }
+}
+
+/// The `jvl/externalSource` custom request: the extension's virtual-document
+/// content provider for the `jvl-src:` scheme calls this to fetch the text a
+/// `Definition::External` `Location` points into (real source when available,
+/// else a signature-only stub — see `Backend::external_source_text`).
+#[derive(Debug, Deserialize)]
+struct ExternalSourceParams {
+    uri: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalSourceResult {
+    text: String,
+}
+
+impl Backend {
+    async fn external_source(&self, params: ExternalSourceParams) -> Result<ExternalSourceResult> {
+        let text = fqn_from_jvl_src_uri(&params.uri)
+            .and_then(|fqn| self.external_source_text(&fqn))
+            .map(|t| (*t).clone())
+            .unwrap_or_default();
+        Ok(ExternalSourceResult { text })
+    }
 }
 
 /// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
@@ -514,6 +874,35 @@ fn open_docs<'a>(
     open
 }
 
+/// Like [`open_docs`], but also returns a parallel vector of URIs (index-for-
+/// index with the `OpenDoc`s) — needed by goto-definition/type-definition to
+/// build a `Location` in whichever open document a cross-file symbol resolves
+/// into (`Definition::InOpenDoc { doc, .. }` names an index into this same
+/// slice). `None` if `current_uri` isn't an open document.
+fn open_docs_and_uris<'a>(
+    docs: &'a HashMap<String, Document>,
+    current_uri: &str,
+) -> Option<(Vec<jvl_syntax::OpenDoc<'a>>, Vec<&'a str>)> {
+    let (current_key, current_doc) = docs.get_key_value(current_uri)?;
+    let mut open = Vec::with_capacity(docs.len());
+    let mut uris = Vec::with_capacity(docs.len());
+    open.push(jvl_syntax::OpenDoc {
+        source: &current_doc.text,
+        tree: &current_doc.tree,
+    });
+    uris.push(current_key.as_str());
+    for (uri, doc) in docs.iter() {
+        if uri != current_key {
+            open.push(jvl_syntax::OpenDoc {
+                source: &doc.text,
+                tree: &doc.tree,
+            });
+            uris.push(uri.as_str());
+        }
+    }
+    Some((open, uris))
+}
+
 /// `jvl-server --version` prints the crate version and exits, with no LSP
 /// startup. This lets the extension shell do a lightweight version handshake
 /// (comparing the bundled server's version against its own) before spawning
@@ -549,6 +938,8 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method("jvl/externalSource", Backend::external_source)
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }

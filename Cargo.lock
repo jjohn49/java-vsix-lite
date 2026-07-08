@@ -241,6 +241,7 @@ version = "0.0.0"
 dependencies = [
  "jvl-classpath",
  "jvl-syntax",
+ "serde",
  "tokio",
  "tower-lsp-server",
  "tracing",

@@ -22,6 +22,23 @@ import {
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
 
+// Read-only virtual documents for external (JDK/dependency) goto-definition
+// targets: the server resolves these to `jvl-src:/<fqn>.java` `Location`s;
+// this provider fetches their content on demand via the `jvl/externalSource`
+// custom request (real source when available, else a signature-only stub —
+// the server decides which).
+class ExternalSourceProvider implements vscode.TextDocumentContentProvider {
+  async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
+    if (!client) {
+      return "";
+    }
+    const result = await client.sendRequest<{ text: string }>("jvl/externalSource", {
+      uri: uri.toString(),
+    });
+    return result.text;
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
   statusBar.text = "$(loading~spin) Java Lite";
@@ -33,6 +50,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("java-vsix-lite.restartServer", async () => {
       await restart(context);
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("jvl-src", new ExternalSourceProvider()),
   );
 
   await start(context);
