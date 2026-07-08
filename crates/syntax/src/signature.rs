@@ -204,30 +204,63 @@ pub(crate) fn param_labels(node: Node, source: &str) -> Vec<String> {
 }
 
 /// A method/constructor declaration's rendered label plus each parameter's
-/// `[start, end)` byte offsets within that label, for LSP signature help's
-/// per-parameter highlight. `None` if `node` isn't a signature-renderable
-/// declaration (see [`signature`]).
+/// `[start, end)` **byte** offsets within that label (the caller converts to
+/// whatever code units the wire protocol wants — LSP signature help uses
+/// UTF-16), for the per-parameter highlight. `None` if `node` isn't a
+/// signature-renderable declaration (see [`signature`]).
 ///
-/// Offsets are found by searching the label for each parameter's own
-/// rendering, in order, starting from just past the previous match — so a
-/// parameter list with repeated types/names (`(int a, int a)`, or a name that
-/// recurs in a later parameter's type) still lines up left-to-right instead of
-/// all collapsing onto the first occurrence.
+/// Offsets are found by searching for each parameter's own rendering, in
+/// order, starting from just past the previous match — so a parameter list
+/// with repeated types/names (`(int a, int a)`) still lines up left-to-right
+/// instead of all collapsing onto the first occurrence. The search is
+/// anchored inside the label's parameter-list parentheses
+/// ([`param_list_span`]), so a parameter whose rendering also occurs in the
+/// return-type + method-name prefix (`String name(String name)`) can't match
+/// the prefix at byte 0.
 pub(crate) fn signature_with_param_offsets(
     node: Node,
     source: &str,
 ) -> Option<(String, Vec<[u32; 2]>)> {
     let label = signature(node, source)?;
+    let params = param_labels(node, source);
+    if params.is_empty() {
+        return Some((label, Vec::new()));
+    }
+    let (open, close) = param_list_span(&label)?;
     let mut offsets = Vec::new();
-    let mut search_from = 0usize;
-    for param in param_labels(node, source) {
-        let idx = label[search_from..].find(param.as_str())?;
+    let mut search_from = open + 1;
+    for param in params {
+        let idx = label[search_from..close].find(param.as_str())?;
         let start = search_from + idx;
         let end = start + param.len();
         offsets.push([start as u32, end as u32]);
         search_from = end;
     }
     Some((label, offsets))
+}
+
+/// Byte indices of the parameter list's `(` and its matching `)` in a
+/// rendered signature label — the first `(` (nothing parenthesized precedes
+/// the parameter list in any rendering this module produces), closed at
+/// depth 0 so a nested paren inside the list can't end the span early.
+/// Shared with signature help's external-signature parsing.
+pub(crate) fn param_list_span(label: &str) -> Option<(usize, usize)> {
+    let bytes = label.as_bytes();
+    let open = bytes.iter().position(|&b| b == b'(')?;
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn throws_clause(node: Node, source: &str) -> Option<String> {
@@ -370,6 +403,24 @@ mod tests {
     fn no_arg_method_signature() {
         let s = sig("class C { void run() {} }", "method_declaration");
         assert_eq!(s, "void run()");
+    }
+
+    /// Regression: when a parameter's rendering (`String name`) also occurs as
+    /// the return-type + method-name prefix of the label
+    /// (`String name(String name)`), the offsets must anchor inside the
+    /// parameter list's parentheses — not match the prefix at byte 0.
+    #[test]
+    fn param_offsets_skip_matching_prefix_outside_parens() {
+        let src = "class C { String name(String name) { return name; } }";
+        let tree = tree(src);
+        let node = find_kind(tree.root_node(), "method_declaration").unwrap();
+        let (label, offsets) = signature_with_param_offsets(node, src).expect("offsets");
+        assert_eq!(label, "String name(String name)");
+        assert_eq!(
+            offsets,
+            vec![[12, 23]],
+            "must point at the parameter, not the prefix"
+        );
     }
 
     #[test]

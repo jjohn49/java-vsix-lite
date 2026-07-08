@@ -180,6 +180,12 @@ fn constructor_overloads<'t>(
     Some(signatures)
 }
 
+/// Assemble a `SignatureInformation` from a rendered label, the parameters'
+/// **byte** offsets within it, and optional Javadoc. LSP 3.17 specifies
+/// signature-label offsets in UTF-16 code units — always, independent of the
+/// negotiated `positionEncoding`, which governs `Position`s only — so the
+/// byte offsets both producers compute are converted here, at the single
+/// point where they cross onto the wire type.
 fn build_signature(
     label: String,
     offsets: Vec<[u32; 2]>,
@@ -189,7 +195,10 @@ fn build_signature(
         offsets
             .into_iter()
             .map(|o| ParameterInformation {
-                label: ParameterLabel::LabelOffsets(o),
+                label: ParameterLabel::LabelOffsets([
+                    utf16_offset(&label, o[0]),
+                    utf16_offset(&label, o[1]),
+                ]),
                 documentation: None,
             })
             .collect()
@@ -202,33 +211,24 @@ fn build_signature(
     }
 }
 
-/// Parameter label offsets parsed out of a rendered external-member
-/// signature string — no parse-tree node backs an external member, only the
-/// display string `SymbolSource` returned, so offsets are recovered by
-/// splitting the parenthesized parameter list on top-level commas (depth
-/// tracked over `()[]<>` so a generic argument's own comma, e.g.
-/// `Map<String, Integer> m`, doesn't split).
+/// UTF-16 code units preceding byte offset `byte` in `s` (a single-line
+/// label, so no line/column bookkeeping — unlike `LineIndex`, which converts
+/// whole-document `Position`s). `byte` always falls on a char boundary here
+/// (both producers derive offsets from substring extents).
+fn utf16_offset(s: &str, byte: u32) -> u32 {
+    s.get(..byte as usize)
+        .map_or(byte, |prefix| prefix.encode_utf16().count() as u32)
+}
+
+/// Parameter label **byte** offsets (converted to UTF-16 code units in
+/// [`build_signature`]) parsed out of a rendered external-member signature
+/// string — no parse-tree node backs an external member, only the display
+/// string `SymbolSource` returned, so offsets are recovered by splitting the
+/// parenthesized parameter list on top-level commas (depth tracked over
+/// `()[]<>` so a generic argument's own comma, e.g. `Map<String, Integer> m`,
+/// doesn't split).
 fn external_param_offsets(label: &str) -> Vec<[u32; 2]> {
-    let bytes = label.as_bytes();
-    let Some(open) = bytes.iter().position(|&b| b == b'(') else {
-        return Vec::new();
-    };
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, &b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(close) = close else {
+    let Some((open, close)) = signature::param_list_span(label) else {
         return Vec::new();
     };
     let inner = &label[open + 1..close];
@@ -390,6 +390,55 @@ mod tests {
         assert_eq!(help.signatures.len(), 1, "{help:?}");
         assert!(help.signatures[0].label.contains("Foo(int a, int b)"));
         assert_eq!(help.active_parameter, Some(0));
+    }
+
+    /// LSP 3.17 specifies signature-label offsets in UTF-16 code units
+    /// (regardless of the negotiated position encoding, which governs
+    /// `Position`s only). `π` is 2 bytes in UTF-8 but 1 UTF-16 code unit, so
+    /// the second parameter's offsets must land 1 short of its byte offsets.
+    #[test]
+    fn param_offsets_are_utf16_code_units() {
+        let src = "class C {\n\
+                   void f(int \u{3c0}, int b) {}\n\
+                   void m() { f(1, 2); }\n\
+                   }\n";
+        let at = src.find("1,").unwrap();
+        let help = help_at(src, at, &NoSymbols).expect("signature help");
+        assert_eq!(help.signatures.len(), 1, "{help:?}");
+        // Label: `void f(int π, int b)` — bytes [7,13)/[15,20), UTF-16 [7,12)/[14,19).
+        let params = help.signatures[0].parameters.as_ref().expect("params");
+        let offsets: Vec<_> = params
+            .iter()
+            .map(|p| match p.label {
+                ParameterLabel::LabelOffsets(o) => o,
+                ref other => panic!("expected offsets, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(offsets, vec![[7, 12], [14, 19]]);
+    }
+
+    /// Same requirement on the external path: offsets recovered from a
+    /// rendered signature string must also be UTF-16 code units.
+    #[test]
+    fn external_param_offsets_are_utf16_code_units() {
+        let src = "import test.Widget;\n\
+                   class C { void m(Widget w) { w.plot(1, 2); } }\n";
+        let symbols = OneClass {
+            fqn: "test.Widget",
+            members: vec![("plot", "void plot(int \u{3c0}, int b)")],
+        };
+        let at = src.find("plot(").unwrap() + "plot(".len();
+        let help = help_at(src, at, &symbols).expect("signature help");
+        let params = help.signatures[0].parameters.as_ref().expect("params");
+        let offsets: Vec<_> = params
+            .iter()
+            .map(|p| match p.label {
+                ParameterLabel::LabelOffsets(o) => o,
+                ref other => panic!("expected offsets, got {other:?}"),
+            })
+            .collect();
+        // Label: `void plot(int π, int b)` — bytes [10,16)/[18,23), UTF-16 [10,15)/[17,22).
+        assert_eq!(offsets, vec![[10, 15], [17, 22]]);
     }
 
     #[test]
