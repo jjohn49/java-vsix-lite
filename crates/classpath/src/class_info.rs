@@ -342,6 +342,27 @@ mod tests {
     }
 
     #[test]
+    fn method_type_param_shadowing_class_param_renders_by_name() {
+        // class Box<T> { <T> T foo(T x) } — legal Java: the method's own T
+        // shadows the class's T, so the rendered template must show the
+        // literal `T` everywhere, never the class's {0} placeholder.
+        let bytes = build(
+            "test/Box",
+            Some("<T:Ljava/lang/Object;>Ljava/lang/Object;"),
+            &[],
+            &[method_sig(
+                "foo",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                "<T:Ljava/lang/Object;>(TT;)TT;",
+            )],
+        );
+        let info = parse(&bytes).expect("parses");
+        assert_eq!(info.type_params, vec!["T".to_string()]);
+        let foo = info.members.iter().find(|m| m.name == "foo").unwrap();
+        assert_eq!(foo.template.as_deref(), Some("<T> T foo(T)"));
+    }
+
+    #[test]
     fn method_type_params_rendered_in_signature_text() {
         // static <T> T foo(Class<T> c) — method-level type param, no class
         // type params at all.

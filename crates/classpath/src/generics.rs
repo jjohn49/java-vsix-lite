@@ -29,7 +29,13 @@ pub(crate) fn method_template(
     class_params: &[String],
 ) -> Option<(Vec<String>, String, Vec<String>)> {
     let mut p = SigParser::new(sig.as_bytes(), class_params);
-    let method_type_params = p.type_params(); // rendered by name, not substituted
+    // The method's own formal type parameters render by name, not substituted;
+    // they also SHADOW same-named class type params (legal Java: `class Box<T>
+    // { <T> T foo(T x) }`) — inside this method's signature, `T` means the
+    // method's `T` and must render by name, never as the class's `{i}`
+    // placeholder.
+    let method_type_params = p.type_params();
+    p.shadow = method_type_params.clone();
     p.expect(b'(')?;
     let mut params = Vec::new();
     while p.peek()? != b')' {
@@ -87,6 +93,11 @@ struct SigParser<'a> {
     s: &'a [u8],
     pos: usize,
     params: &'a [String],
+    /// Type-parameter names that SHADOW `params` (a method's own formal type
+    /// parameters while rendering that method's signature): a variable
+    /// reference matching one of these renders by name, never as a class
+    /// `{i}` placeholder.
+    shadow: Vec<String>,
     /// Current nested-type recursion depth (bumped/unwound around
     /// [`SigParser::type_render`]) — see [`MAX_SIG_DEPTH`].
     depth: usize,
@@ -98,6 +109,7 @@ impl<'a> SigParser<'a> {
             s,
             pos: 0,
             params,
+            shadow: Vec::new(),
             depth: 0,
         }
     }
@@ -263,6 +275,9 @@ impl<'a> SigParser<'a> {
     }
 
     fn var(&self, name: &str) -> String {
+        if self.shadow.iter().any(|p| p == name) {
+            return name.to_string();
+        }
         match self.params.iter().position(|p| p == name) {
             Some(i) => format!("{{{i}}}"),
             None => name.to_string(),
@@ -385,6 +400,68 @@ mod tests {
     }
 
     #[test]
+    fn method_type_param_shadows_class_type_param() {
+        // class Box<T> { <T> T foo(T x) } — legal Java: the method's own T
+        // shadows the class's T, so inside foo's signature `T` must render by
+        // name, never as the class's {0} placeholder.
+        let tp = vec!["T".to_string()];
+        assert_eq!(
+            method_template("<T:Ljava/lang/Object;>(TT;)TT;", &tp),
+            Some((vec!["T".to_string()], "T".into(), vec!["T".into()]))
+        );
+        // A class param NOT shadowed by the method still substitutes to its
+        // placeholder alongside the shadowed one.
+        let tp = vec!["T".to_string(), "U".to_string()];
+        assert_eq!(
+            method_template("<T:Ljava/lang/Object;>(TT;TU;)TT;", &tp),
+            Some((
+                vec!["T".to_string()],
+                "T".into(),
+                vec!["T".into(), "{1}".into()]
+            ))
+        );
+    }
+
+    #[test]
+    fn multiple_bounds_and_empty_class_bound_parse() {
+        // `<T::Ljava/lang/Comparable;>` — empty class bound, one interface
+        // bound (javac emits this for `<T extends Comparable>`).
+        let sig = "<T::Ljava/lang/Comparable;>Ljava/lang/Object;";
+        let tp = class_type_params(sig);
+        assert_eq!(tp, vec!["T".to_string()]);
+        assert_eq!(field_template("TT;", &tp).as_deref(), Some("{0}"));
+        assert_eq!(super_type_args(sig, &tp), vec![Vec::<String>::new()]);
+
+        // `<T:Ljava/lang/Object;:Ljava/lang/Comparable;>` — class bound plus
+        // interface bound (`<T extends Object & Comparable>`).
+        let sig = "<T:Ljava/lang/Object;:Ljava/lang/Comparable;>Ljava/lang/Object;";
+        let tp = class_type_params(sig);
+        assert_eq!(tp, vec!["T".to_string()]);
+        assert_eq!(field_template("TT;", &tp).as_deref(), Some("{0}"));
+
+        // Same shapes on a method's own type-parameter list.
+        assert_eq!(
+            method_template("<T::Ljava/lang/Comparable<TT;>;>(TT;)TT;", &[]),
+            Some((vec!["T".to_string()], "T".into(), vec!["T".into()]))
+        );
+    }
+
+    #[test]
+    fn throws_clause_after_return_type_is_ignored() {
+        let tp = params(); // ["E"]
+        assert_eq!(
+            method_template("(TE;)V^Ljava/lang/Exception;", &tp),
+            Some((vec![], "void".into(), vec!["{0}".into()]))
+        );
+        // Non-void return, multiple throws entries (including a type-variable
+        // throws `^TX;`) — all safely ignored.
+        assert_eq!(
+            method_template("()TE;^Ljava/io/IOException;^TX;", &tp),
+            Some((vec![], "{0}".into(), vec![]))
+        );
+    }
+
+    #[test]
     fn super_type_args_maps_class_params_across_hierarchy() {
         // class MyList<T> extends AbstractList<T> implements List<T>, Serializable
         let sig = "<T:Ljava/lang/Object;>Ljava/util/AbstractList<TT;>;Ljava/util/List<TT;>;Ljava/io/Serializable;";
@@ -467,11 +544,14 @@ mod tests {
 
     #[test]
     fn moderately_nested_generics_within_cap_still_render() {
-        // A handful of levels — well under the cap — must still succeed.
+        // A handful of levels — well under the cap — must still render fully.
         let mut nested = "Ljava/lang/Integer;".to_string();
         for _ in 0..5 {
             nested = format!("Ljava/util/List<{nested}>;");
         }
-        assert!(field_template(&nested, &[]).is_some());
+        assert_eq!(
+            field_template(&nested, &[]).as_deref(),
+            Some("List<List<List<List<List<Integer>>>>>")
+        );
     }
 }
