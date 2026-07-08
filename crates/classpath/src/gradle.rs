@@ -1,16 +1,23 @@
 //! Best-effort **static** discovery of a Gradle project's dependencies:
 //! `group:artifact:version` string literals in `build.gradle(.kts)` and
-//! `gradle/libs.versions.toml`, located in the Gradle module cache. The build is
-//! never executed, so dynamic/computed/`platform` dependencies are not seen —
-//! this is intentionally a heuristic.
+//! `gradle/libs.versions.toml`, located in the Gradle module cache, then
+//! walked transitively. The build is never executed, so dynamic/computed/
+//! `platform` dependencies are not seen — the initial coordinate list is
+//! intentionally a heuristic. Gradle caches each downloaded artifact's Maven
+//! POM alongside its jar (in its own hash-keyed subdirectory), so the
+//! transitive walk reuses the exact same POM semantics as the Maven backend
+//! (`resolve.rs`) — only the "locate this coordinate's pom/jar" step differs.
 
 use std::path::{Path, PathBuf};
 
+use crate::resolve::{self, Locator, ResolvedProject};
+
 const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 
-/// Jars for the coordinates found statically in the project's build files that
-/// exist in the Gradle cache.
-pub(crate) fn dependency_jars(root: &Path, gradle_cache: &Path) -> Vec<PathBuf> {
+/// Resolve a Gradle project's dependencies (direct + transitive) from what
+/// can be statically scraped out of its build files, located in
+/// `gradle_cache` (`~/.gradle/caches`).
+pub(crate) fn resolve_project(root: &Path, gradle_cache: &Path) -> ResolvedProject {
     let mut coords = Vec::new();
     for name in [
         "build.gradle",
@@ -32,10 +39,17 @@ pub(crate) fn dependency_jars(root: &Path, gradle_cache: &Path) -> Vec<PathBuf> 
     }
     coords.sort();
     coords.dedup();
-    coords
-        .iter()
-        .filter_map(|(g, a, v)| cache_jar(gradle_cache, g, a, v))
-        .collect()
+
+    let locator = GradleLocator {
+        cache: gradle_cache,
+    };
+    let seeds = resolve::coord_seeds(&coords);
+    let (jars, degraded) = resolve::resolve_transitive(seeds, &locator);
+    ResolvedProject {
+        jars,
+        source_roots: Vec::new(),
+        degraded,
+    }
 }
 
 /// Pull `group:artifact:version` out of quoted string literals — the dominant
@@ -84,12 +98,37 @@ fn string_literals(text: &str) -> Vec<String> {
     out
 }
 
-/// `<cache>/modules-2/files-2.1/<group>/<artifact>/<version>/<hash>/<artifact>-<version>.jar`
+/// Locates artifacts in the Gradle module cache
+/// (`<cache>/modules-2/files-2.1/<group>/<artifact>/<version>/<hash>/...`).
+/// The pom and jar for the same coordinate can live in different hash
+/// directories (Gradle hashes each downloaded file independently), so each
+/// extension is globbed for separately.
+struct GradleLocator<'a> {
+    cache: &'a Path,
+}
+
+impl Locator for GradleLocator<'_> {
+    fn locate_pom(&self, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+        cache_file(self.cache, group, artifact, version, "pom")
+    }
+
+    fn locate_jar(&self, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+        cache_file(self.cache, group, artifact, version, "jar")
+    }
+}
+
+/// `<cache>/modules-2/files-2.1/<group>/<artifact>/<version>/<hash>/<artifact>-<version>.<ext>`
 /// (the leaf hash directory is globbed).
-fn cache_jar(cache: &Path, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+fn cache_file(
+    cache: &Path,
+    group: &str,
+    artifact: &str,
+    version: &str,
+    ext: &str,
+) -> Option<PathBuf> {
     if [group, artifact, version]
         .iter()
-        .any(|s| s.is_empty() || s.contains("..") || s.contains('/') || s.contains('\\'))
+        .any(|s| crate::maven::unsafe_coord(s))
     {
         return None;
     }
@@ -98,9 +137,9 @@ fn cache_jar(cache: &Path, group: &str, artifact: &str, version: &str) -> Option
         .join(group)
         .join(artifact)
         .join(version);
-    let jar_name = format!("{artifact}-{version}.jar");
+    let file_name = format!("{artifact}-{version}.{ext}");
     for hash_dir in std::fs::read_dir(&version_dir).ok()?.flatten() {
-        let candidate = hash_dir.path().join(&jar_name);
+        let candidate = hash_dir.path().join(&file_name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -182,9 +221,60 @@ mod tests {
         )
         .unwrap();
 
-        let jars = dependency_jars(&root, &cache);
-        assert_eq!(jars.len(), 1, "{jars:?}");
-        assert!(jars[0].ends_with("lib-1.0.jar"));
+        let result = resolve_project(&root, &cache);
+        assert_eq!(result.jars.len(), 1, "{:?}", result.jars);
+        assert!(result.jars[0].ends_with("lib-1.0.jar"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolves_one_transitive_hop_via_cached_pom() {
+        let base =
+            std::env::temp_dir().join(format!("jvl-gradle-transitive-{}", std::process::id()));
+        let root = base.join("proj");
+        let cache = base.join("gcache");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // B: jar + pom (in separate hash dirs, as Gradle actually lays them out),
+        // depending on C.
+        let b_jar_dir = cache.join("modules-2/files-2.1/g/B/1.0/hash-jar");
+        let b_pom_dir = cache.join("modules-2/files-2.1/g/B/1.0/hash-pom");
+        std::fs::create_dir_all(&b_jar_dir).unwrap();
+        std::fs::create_dir_all(&b_pom_dir).unwrap();
+        std::fs::write(b_jar_dir.join("B-1.0.jar"), b"jar").unwrap();
+        std::fs::write(
+            b_pom_dir.join("B-1.0.pom"),
+            "<project><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>C</artifactId>\
+             <version>1.0</version></dependency></dependencies></project>",
+        )
+        .unwrap();
+
+        // C: jar + pom, no further deps.
+        let c_dir = cache.join("modules-2/files-2.1/g/C/1.0/hash-c");
+        std::fs::create_dir_all(&c_dir).unwrap();
+        std::fs::write(c_dir.join("C-1.0.jar"), b"jar").unwrap();
+        std::fs::write(
+            c_dir.join("C-1.0.pom"),
+            "<project><groupId>g</groupId><artifactId>C</artifactId><version>1.0</version></project>",
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("build.gradle"),
+            "dependencies { implementation 'g:B:1.0' }",
+        )
+        .unwrap();
+
+        let result = resolve_project(&root, &cache);
+        let names: Vec<String> = result
+            .jars
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"B-1.0.jar".to_string()), "{names:?}");
+        assert!(names.contains(&"C-1.0.jar".to_string()), "{names:?}");
 
         let _ = std::fs::remove_dir_all(&base);
     }

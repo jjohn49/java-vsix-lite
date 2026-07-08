@@ -20,6 +20,7 @@ mod generics;
 mod gradle;
 mod jdk;
 mod maven;
+mod resolve;
 mod zip;
 
 use zip::ZipArchive;
@@ -79,6 +80,13 @@ pub struct Classpath {
     sources: Vec<SourceArchive>,
     cache: RwLock<HashMap<String, Option<Arc<ClassInfo>>>>,
     source_cache: RwLock<HashMap<String, Option<Arc<String>>>>,
+    /// Extra source roots surfaced by multi-module Maven resolution (sibling
+    /// modules' `src/main/java`), beyond the project root itself.
+    source_roots: Vec<PathBuf>,
+    /// Coordinates that could not be fully resolved (missing pom/jar in the
+    /// local cache, or a resolution bound was hit) — e.g. for surfacing
+    /// "IntelliSense partial: N unresolved deps" to the user.
+    degraded: Vec<String>,
 }
 
 impl Classpath {
@@ -90,6 +98,8 @@ impl Classpath {
             sources: Vec::new(),
             cache: RwLock::new(HashMap::new()),
             source_cache: RwLock::new(HashMap::new()),
+            source_roots: Vec::new(),
+            degraded: Vec::new(),
         }
     }
 
@@ -118,20 +128,44 @@ impl Classpath {
         cp
     }
 
-    /// The JDK classpath plus a project's **direct, declared** dependency jars,
-    /// discovered statically (Maven `pom.xml`; Gradle build files +
-    /// `libs.versions.toml`) from `root`. No build tool is executed.
+    /// The JDK classpath plus a project's dependency jars, resolved
+    /// **transitively** and statically (Maven `pom.xml` + `~/.m2/repository`
+    /// parent/BOM/exclusion/scope semantics; Gradle build files +
+    /// `libs.versions.toml` scraped, then walked through `~/.gradle/caches`'
+    /// cached POMs) from `root`. No build tool is executed, nothing is ever
+    /// fetched from the network; resolution is bounded (depth/node caps) and
+    /// degrades gracefully — see [`Classpath::degraded`].
     pub fn from_jdk_and_project(root: Option<&Path>) -> Classpath {
         let mut cp = Classpath::from_jdk();
         if let (Some(root), Some(home)) = (root, home_dir()) {
-            for jar in maven::dependency_jars(root, &home.join(".m2/repository")) {
-                cp.add_jar(&jar);
+            let maven = maven::resolve_project(root, &home.join(".m2/repository"));
+            for jar in &maven.jars {
+                cp.add_jar(jar);
             }
-            for jar in gradle::dependency_jars(root, &home.join(".gradle/caches")) {
-                cp.add_jar(&jar);
+            cp.source_roots.extend(maven.source_roots);
+            cp.degraded.extend(maven.degraded);
+
+            let gradle = gradle::resolve_project(root, &home.join(".gradle/caches"));
+            for jar in &gradle.jars {
+                cp.add_jar(jar);
             }
+            cp.degraded.extend(gradle.degraded);
         }
         cp
+    }
+
+    /// Extra source roots surfaced by multi-module Maven resolution (sibling
+    /// modules' `src/main/java` directories), beyond the project root itself.
+    /// Empty unless `root` was a multi-module Maven reactor.
+    pub fn source_roots(&self) -> &[PathBuf] {
+        &self.source_roots
+    }
+
+    /// Dependency coordinates that could not be fully resolved from the local
+    /// cache (missing pom/jar, or a resolution bound was hit), e.g. to
+    /// surface "IntelliSense partial: N unresolved deps" to the user.
+    pub fn degraded(&self) -> &[String] {
+        &self.degraded
     }
 
     /// Add a dependency jar to the classpath (no-op if it can't be opened). Its
