@@ -17,8 +17,15 @@
 //!
 //! Hard bounds: max depth 25, max 2,000 visited nodes, cycle detection on
 //! `(group, artifact)`. A dependency the resolver can't finish (missing
-//! pom/jar, depth/node bound hit) is recorded in `degraded` instead of
-//! failing the whole resolution.
+//! pom/jar or parent pom, unresolved version, unsupported classifier,
+//! depth/node bound hit) is recorded in `degraded` instead of failing the
+//! whole resolution.
+//!
+//! Path safety: all cache paths flow through the coordinate guards
+//! (`maven::unsafe_coord`); `<relativePath>` parent references are honored
+//! only for project-local poms and are lexically containment-checked against
+//! the project root before any file I/O (see [`parse_effective_pom`]) —
+//! cache poms resolve their parent by coordinates alone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -79,6 +86,9 @@ struct ManagedDep {
 pub(crate) struct EffectivePom {
     pub dependencies: Vec<RawDep>,
     pub modules: Vec<String>,
+    /// Problems hit while building the effective pom (e.g. a declared parent
+    /// pom that could not be found in the local cache).
+    pub degraded: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -98,15 +108,28 @@ fn coord_str(group: &str, artifact: &str, version: &str) -> String {
 /// (including `scope=import` BOMs) applied, own `<dependencies>` versions
 /// filled in from management where absent. `chain_depth` bounds parent/BOM
 /// recursion (reuses the same hard cap as BFS depth).
+///
+/// `project_root` is `Some` only for poms that live inside the project being
+/// resolved (the workspace root pom and its `<modules>` siblings): their
+/// `<relativePath>` parent reference is honored, but strictly confined to the
+/// project root (lexically normalized and containment-checked **before any
+/// file I/O**, then canonicalize-re-checked against symlinks). For cache poms
+/// (`~/.m2`, `~/.gradle`) it is `None` and `<relativePath>` is ignored
+/// entirely — parents of repository poms resolve by coordinates only, which
+/// is also Maven's own install-time behavior. A malicious cached pom can
+/// therefore never steer the resolver to read a file outside the project
+/// dir / cache roots.
 pub(crate) fn parse_effective_pom(
     pom_path: &Path,
     locator: &dyn Locator,
     chain_depth: usize,
+    project_root: Option<&Path>,
 ) -> Option<EffectivePom> {
-    let raw = parse_effective_pom_raw(pom_path, locator, chain_depth)?;
+    let raw = parse_effective_pom_raw(pom_path, locator, chain_depth, project_root)?;
     Some(EffectivePom {
         dependencies: raw.dependencies,
         modules: raw.modules,
+        degraded: raw.degraded,
     })
 }
 
@@ -119,12 +142,65 @@ struct RawEffective {
     managed: HashMap<(String, String), ManagedDep>,
     dependencies: Vec<RawDep>,
     modules: Vec<String>,
+    degraded: Vec<String>,
+}
+
+/// Resolve a `<relativePath>` parent reference from a **project-local** pom,
+/// refusing anything that would escape `project_root`. The containment check
+/// is lexical (`..`/`.` components resolved without touching the filesystem),
+/// so no out-of-root path is ever the subject of any file I/O; a follow-up
+/// canonicalize re-check defends against symlinks inside the root pointing
+/// out of it.
+fn project_local_parent(pom_path: &Path, rel: &str, project_root: &Path) -> Option<PathBuf> {
+    if rel.is_empty() || Path::new(rel).is_absolute() {
+        return None;
+    }
+    let joined = pom_path.parent()?.join(rel);
+    let candidate = lexical_normalize(&joined)?;
+    let root = lexical_normalize(project_root)?;
+    if !candidate.starts_with(&root) {
+        return None; // would escape the project — never touched on disk.
+    }
+    if !candidate.is_file() {
+        return None;
+    }
+    // Symlink defense: the real location must also be under the real root.
+    let canon = candidate.canonicalize().ok()?;
+    let canon_root = project_root.canonicalize().ok()?;
+    canon.starts_with(&canon_root).then_some(candidate)
+}
+
+/// Resolve `.` and `..` components of `path` purely lexically (no file I/O).
+/// `None` if `..` would climb above the path's root.
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    let mut depth = 0usize; // Normal components currently in `out`
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return None; // would climb above the root
+                }
+                out.pop();
+                depth -= 1;
+            }
+            Component::Normal(part) => {
+                out.push(part);
+                depth += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn parse_effective_pom_raw(
     pom_path: &Path,
     locator: &dyn Locator,
     chain_depth: usize,
+    project_root: Option<&Path>,
 ) -> Option<RawEffective> {
     if chain_depth > MAX_DEPTH {
         return None;
@@ -147,6 +223,7 @@ fn parse_effective_pom_raw(
     let mut parent_managed: HashMap<(String, String), ManagedDep> = HashMap::new();
     let mut parent_group = None;
     let mut parent_version = None;
+    let mut degraded: Vec<String> = Vec::new();
     if let Some(parent) = parent {
         let pg = child_text(parent, "groupId");
         let pa = child_text(parent, "artifactId");
@@ -155,30 +232,48 @@ fn parse_effective_pom_raw(
         parent_group = pg.clone();
         parent_version = pv.clone();
 
-        let parent_pom_path = if !Path::new(&rel_path).is_absolute() && !rel_path.is_empty() {
-            pom_path.parent().map(|dir| dir.join(&rel_path))
+        // <relativePath> is honored only for project-local poms, and only
+        // within the project root (see `project_local_parent`). Cache poms
+        // resolve their parent by coordinates alone.
+        let local = project_root.and_then(|root| project_local_parent(pom_path, &rel_path, root));
+
+        let parsed = if let Some(local_path) = local {
+            parse_effective_pom_raw(&local_path, locator, chain_depth + 1, project_root)
+        } else if let (Some(g), Some(a), Some(v)) = (&pg, &pa, &pv) {
+            locator
+                .locate_pom(g, a, v)
+                .and_then(|p| parse_effective_pom_raw(&p, locator, chain_depth + 1, None))
         } else {
             None
-        }
-        .filter(|p| p.is_file())
-        .or_else(|| match (&pg, &pa, &pv) {
-            (Some(g), Some(a), Some(v)) => locator.locate_pom(g, a, v),
-            _ => None,
-        });
+        };
 
-        if let Some(parent_pom_path) = parent_pom_path {
-            if let Some(parent_effective) =
-                parse_effective_pom_raw(&parent_pom_path, locator, chain_depth + 1)
-            {
+        match parsed {
+            Some(parent_effective) => {
                 parent_props = parent_effective.props;
                 parent_managed = parent_effective.managed;
                 parent_group = Some(parent_effective.group);
                 parent_version = Some(parent_effective.version);
+                degraded.extend(parent_effective.degraded);
+            }
+            None => {
+                let child = child_text(project, "artifactId")
+                    .or_else(|| {
+                        pom_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                let parent_coord = coord_str(
+                    pg.as_deref().unwrap_or("?"),
+                    pa.as_deref().unwrap_or("?"),
+                    pv.as_deref().unwrap_or("?"),
+                );
+                degraded.push(format!("{child}: parent {parent_coord} unreadable"));
             }
         }
     }
 
-    Some(parse_effective_pom_raw_from_doc(
+    let mut raw = parse_effective_pom_raw_from_doc(
         project,
         locator,
         chain_depth,
@@ -186,7 +281,10 @@ fn parse_effective_pom_raw(
         parent_managed,
         parent_group,
         parent_version,
-    ))
+    );
+    degraded.append(&mut raw.degraded);
+    raw.degraded = degraded;
+    Some(raw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,10 +355,12 @@ fn parse_effective_pom_raw_from_doc(
                 if scope.as_deref() == Some("import") {
                     // BOM import: merge its managed entries in, first-wins
                     // among entries declared in *this* pom (imports included).
+                    // BOMs are located in the cache, so `<relativePath>`
+                    // handling is off (`project_root = None`).
                     if let Some(bom_version) = &version_txt {
                         if let Some(bom_path) = locator.locate_pom(&g, &a, bom_version) {
                             if let Some(bom) =
-                                parse_effective_pom_raw(&bom_path, locator, chain_depth + 1)
+                                parse_effective_pom_raw(&bom_path, locator, chain_depth + 1, None)
                             {
                                 for (k, v) in bom.managed {
                                     own_managed.entry(k).or_insert(v);
@@ -368,6 +468,7 @@ fn parse_effective_pom_raw_from_doc(
         managed,
         dependencies,
         modules,
+        degraded: Vec::new(),
     }
 }
 
@@ -400,27 +501,41 @@ pub(crate) fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Root-level dependency filter: drop `test`; keep `compile`/`runtime`/
-/// `provided`. Root-declared `optional` deps are still included (the owning
-/// project itself compiles against them).
-fn keep_at_root(dep: &RawDep) -> bool {
-    dep.scope != "test" && dep.classifier.is_none()
+/// Classifier variants (out of scope beyond the implicit none/`-sources`)
+/// are not resolved; the drop is made visible via a `degraded` record.
+fn record_classifier_skip(dep: &RawDep, classifier: &str, degraded: &mut Vec<String>) {
+    degraded.push(format!(
+        "{}:{}:{} (classifier {classifier} unsupported)",
+        dep.group,
+        dep.artifact,
+        dep.version.as_deref().unwrap_or("?"),
+    ));
 }
 
-/// Transitive-edge filter: only `compile`/`runtime`, never `optional`, never
-/// a classifier variant (out of scope beyond none/sources).
-fn keep_transitively(dep: &RawDep) -> bool {
-    (dep.scope == "compile" || dep.scope == "runtime") && !dep.optional && dep.classifier.is_none()
+fn record_unresolved_version(dep: &RawDep, degraded: &mut Vec<String>) {
+    degraded.push(format!(
+        "{}:{} (unresolved version)",
+        dep.group, dep.artifact
+    ));
 }
 
 /// Seed the graph from a pom's own direct dependencies (root pom, or a
 /// sibling multi-module pom — both are "depth 0" for nearest-wins purposes).
-fn root_seeds(effective: &EffectivePom, seeds: &mut Vec<Seed>) {
+/// Root-level filter: drop `test`; keep `compile`/`runtime`/`provided`.
+/// Root-declared `optional` deps are still included (the owning project
+/// itself compiles against them). Deps that can't be seeded (classifier
+/// variant, unresolved version) are recorded in `degraded`.
+fn root_seeds(effective: &EffectivePom, seeds: &mut Vec<Seed>, degraded: &mut Vec<String>) {
     for dep in &effective.dependencies {
-        if !keep_at_root(dep) {
+        if dep.scope == "test" {
+            continue;
+        }
+        if let Some(classifier) = &dep.classifier {
+            record_classifier_skip(dep, classifier, degraded);
             continue;
         }
         let Some(version) = &dep.version else {
+            record_unresolved_version(dep, degraded);
             continue;
         };
         seeds.push(Seed {
@@ -493,13 +608,18 @@ pub(crate) fn resolve_transitive(
             degraded.push(coord_str(&seed.group, &seed.artifact, &seed.version));
             continue;
         };
-        let Some(effective) = parse_effective_pom(&pom_path, locator, 0) else {
+        // Cache poms never honor `<relativePath>` (`project_root = None`).
+        let Some(effective) = parse_effective_pom(&pom_path, locator, 0, None) else {
             degraded.push(coord_str(&seed.group, &seed.artifact, &seed.version));
             continue;
         };
+        degraded.extend(effective.degraded.iter().cloned());
 
         for dep in &effective.dependencies {
-            if !keep_transitively(dep) {
+            // Transitive-edge filter: only `compile`/`runtime`, never
+            // `optional` (both are silent by design — correct Maven
+            // semantics, not degradation).
+            if (dep.scope != "compile" && dep.scope != "runtime") || dep.optional {
                 continue;
             }
             if seed
@@ -508,7 +628,12 @@ pub(crate) fn resolve_transitive(
             {
                 continue;
             }
+            if let Some(classifier) = &dep.classifier {
+                record_classifier_skip(dep, classifier, &mut degraded);
+                continue;
+            }
             let Some(version) = &dep.version else {
+                record_unresolved_version(dep, &mut degraded);
                 continue;
             };
             let mut child_exclusions = (*seed.exclusions).clone();
@@ -538,15 +663,15 @@ pub(crate) fn resolve_maven_like_project(
     locator: &dyn Locator,
 ) -> ResolvedProject {
     let root_pom = project_root.join("pom.xml");
-    let Some(effective) = parse_effective_pom(&root_pom, locator, 0) else {
+    let Some(effective) = parse_effective_pom(&root_pom, locator, 0, Some(project_root)) else {
         return ResolvedProject::default();
     };
 
     let mut seeds = Vec::new();
     let mut source_roots = Vec::new();
-    let mut degraded = Vec::new();
+    let mut degraded = effective.degraded.clone();
 
-    root_seeds(&effective, &mut seeds);
+    root_seeds(&effective, &mut seeds, &mut degraded);
     let root_src = project_root.join("src/main/java");
     if root_src.is_dir() {
         source_roots.push(root_src);
@@ -558,8 +683,11 @@ pub(crate) fn resolve_maven_like_project(
         }
         let module_dir = project_root.join(module);
         let module_pom = module_dir.join("pom.xml");
-        match parse_effective_pom(&module_pom, locator, 0) {
-            Some(module_effective) => root_seeds(&module_effective, &mut seeds),
+        match parse_effective_pom(&module_pom, locator, 0, Some(project_root)) {
+            Some(module_effective) => {
+                degraded.extend(module_effective.degraded.iter().cloned());
+                root_seeds(&module_effective, &mut seeds, &mut degraded);
+            }
             None => degraded.push(format!("module {module} (pom unreadable)")),
         }
         let module_src = module_dir.join("src/main/java");
@@ -811,6 +939,253 @@ mod tests {
         let result = resolve_maven_like_project(&f.root, &locator);
         let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
         assert!(names.contains(&"B-2.0.jar".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn relative_path_escaping_project_root_is_not_read() {
+        let f = fixture("relpath-escape");
+        // A "secret" pom OUTSIDE the project root (sibling of proj/ in the
+        // fixture base). If the resolver followed the traversal it would
+        // inherit x.version=9.9 and resolve B-9.9.
+        let outside = f.base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("pom.xml"),
+            "<project><groupId>g</groupId><artifactId>evil</artifactId><version>1.0</version>\
+             <properties><x.version>9.9</x.version></properties></project>",
+        )
+        .unwrap();
+        put_artifact(&f.m2, "g", "B", "9.9", &simple_dep_pom(""));
+        std::fs::write(
+            f.root.join("pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>evil</artifactId><version>1.0</version>\
+             <relativePath>../outside/pom.xml</relativePath></parent><artifactId>x</artifactId>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>B</artifactId>\
+             <version>${x.version}</version></dependency></dependencies></project>",
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+        assert!(
+            !names.contains(&"B-9.9.jar".to_string()),
+            "traversal target was read: {names:?}"
+        );
+        assert!(
+            result
+                .degraded
+                .iter()
+                .any(|d| d.contains("parent g:evil:1.0")),
+            "{:?}",
+            result.degraded
+        );
+    }
+
+    #[test]
+    fn deep_relative_path_traversal_is_rejected_without_panic() {
+        let f = fixture("relpath-deep");
+        std::fs::write(
+            f.root.join("pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>evil</artifactId><version>1.0</version>\
+             <relativePath>../../../../../../../../etc/hosts</relativePath></parent>\
+             <artifactId>x</artifactId></project>",
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        assert!(result.jars.is_empty());
+        assert!(
+            result
+                .degraded
+                .iter()
+                .any(|d| d.contains("parent g:evil:1.0")),
+            "{:?}",
+            result.degraded
+        );
+    }
+
+    #[test]
+    fn cached_pom_relative_path_is_ignored_parent_comes_from_cache() {
+        let f = fixture("relpath-cache");
+        // An "evil" pom placed exactly where the cached pom's relativePath
+        // points (outside ~/.m2, inside the fixture base). If followed, it
+        // would set x.version=9.9 and resolve C-9.9.
+        let evil = f.base.join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(
+            evil.join("pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1.0</version>\
+             <properties><x.version>9.9</x.version></properties></project>",
+        )
+        .unwrap();
+        // The legitimate parent, in the cache, pins x.version=1.0.
+        put_pom_only(
+            &f.m2,
+            "g",
+            "parent",
+            "1.0",
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1.0</version>\
+             <properties><x.version>1.0</x.version></properties></project>",
+        );
+        // B's cached pom declares the parent WITH a malicious relativePath
+        // (from m2/g/B/1.0/ four `..`s reach the fixture base).
+        put_artifact(
+            &f.m2,
+            "g",
+            "B",
+            "1.0",
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+             <version>1.0</version><relativePath>../../../../evil/pom.xml</relativePath></parent>\
+             <artifactId>B</artifactId>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>C</artifactId>\
+             <version>${x.version}</version></dependency></dependencies></project>",
+        );
+        put_artifact(&f.m2, "g", "C", "1.0", &simple_dep_pom(""));
+        put_artifact(&f.m2, "g", "C", "9.9", &simple_dep_pom(""));
+        std::fs::write(
+            f.root.join("pom.xml"),
+            simple_dep_pom(
+                "<dependency><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version></dependency>",
+            ),
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+        assert!(
+            names.contains(&"C-1.0.jar".to_string()),
+            "parent should come from the cache: {names:?}"
+        );
+        assert!(
+            !names.contains(&"C-9.9.jar".to_string()),
+            "cached pom's relativePath must be ignored: {names:?}"
+        );
+    }
+
+    #[test]
+    fn project_local_parent_within_root_resolves() {
+        let f = fixture("relpath-legit");
+        put_artifact(&f.m2, "g", "B", "4.0", &simple_dep_pom(""));
+        // Workspace root pom is the parent (properties) and the aggregator.
+        std::fs::write(
+            f.root.join("pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1.0</version>\
+             <packaging>pom</packaging>\
+             <properties><b.version>4.0</b.version></properties>\
+             <modules><module>modA</module></modules></project>",
+        )
+        .unwrap();
+        // The module inherits ${b.version} via the default ../pom.xml
+        // relativePath — the parent is NOT in the cache.
+        std::fs::create_dir_all(f.root.join("modA")).unwrap();
+        std::fs::write(
+            f.root.join("modA/pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+             <version>1.0</version></parent><artifactId>modA</artifactId>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>B</artifactId>\
+             <version>${b.version}</version></dependency></dependencies></project>",
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+        assert!(names.contains(&"B-4.0.jar".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn unresolved_version_records_degraded() {
+        let f = fixture("unresolved-version");
+        // Transitive case: B's pom has a versionless dep C.
+        put_artifact(
+            &f.m2,
+            "g",
+            "B",
+            "1.0",
+            &simple_dep_pom(
+                "<dependency><groupId>g</groupId><artifactId>C</artifactId></dependency>",
+            ),
+        );
+        // Root case: dep D declared without a version and no management.
+        std::fs::write(
+            f.root.join("pom.xml"),
+            simple_dep_pom(
+                "<dependency><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version></dependency>\
+                 <dependency><groupId>g</groupId><artifactId>D</artifactId></dependency>",
+            ),
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        assert!(
+            result
+                .degraded
+                .contains(&"g:D (unresolved version)".to_string()),
+            "{:?}",
+            result.degraded
+        );
+        assert!(
+            result
+                .degraded
+                .contains(&"g:C (unresolved version)".to_string()),
+            "{:?}",
+            result.degraded
+        );
+    }
+
+    #[test]
+    fn missing_parent_pom_records_degraded() {
+        let f = fixture("missing-parent");
+        put_artifact(&f.m2, "g", "B", "1.0", &simple_dep_pom(""));
+        std::fs::write(
+            f.root.join("pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>ghost</artifactId>\
+             <version>7.0</version></parent><artifactId>x</artifactId>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>B</artifactId>\
+             <version>1.0</version></dependency></dependencies></project>",
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+        assert!(names.contains(&"B-1.0.jar".to_string()), "{names:?}");
+        assert!(
+            result
+                .degraded
+                .contains(&"x: parent g:ghost:7.0 unreadable".to_string()),
+            "{:?}",
+            result.degraded
+        );
+    }
+
+    #[test]
+    fn classifier_dependency_records_degraded() {
+        let f = fixture("classifier");
+        put_artifact(&f.m2, "g", "B", "1.0", &simple_dep_pom(""));
+        std::fs::write(
+            f.root.join("pom.xml"),
+            simple_dep_pom(
+                "<dependency><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version>\
+                 <classifier>natives-linux</classifier></dependency>",
+            ),
+        )
+        .unwrap();
+
+        let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+        let result = resolve_maven_like_project(&f.root, &locator);
+        assert!(result.jars.is_empty(), "{:?}", result.jars);
+        assert!(
+            result
+                .degraded
+                .contains(&"g:B:1.0 (classifier natives-linux unsupported)".to_string()),
+            "{:?}",
+            result.degraded
+        );
     }
 
     #[test]

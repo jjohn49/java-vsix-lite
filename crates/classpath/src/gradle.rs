@@ -40,21 +40,47 @@ pub(crate) fn resolve_project(root: &Path, gradle_cache: &Path) -> ResolvedProje
     coords.sort();
     coords.dedup();
 
+    // Dynamic versions (`+`, `latest.*`, `[..]`/`(..)` ranges) can't be
+    // pinned without executing Gradle — skip them, but record each skip so
+    // callers can surface the gap (per the resolution contract).
+    let mut degraded_dynamic = Vec::new();
+    coords.retain(|(g, a, v)| {
+        if is_dynamic_version(v) {
+            degraded_dynamic.push(format!("{g}:{a}:{v} (dynamic version unsupported)"));
+            false
+        } else {
+            true
+        }
+    });
+
     let locator = GradleLocator {
         cache: gradle_cache,
     };
     let seeds = resolve::coord_seeds(&coords);
-    let (jars, degraded) = resolve::resolve_transitive(seeds, &locator);
+    let (jars, mut degraded) = resolve::resolve_transitive(seeds, &locator);
+    degraded_dynamic.append(&mut degraded);
     ResolvedProject {
         jars,
         source_roots: Vec::new(),
-        degraded,
+        degraded: degraded_dynamic,
     }
+}
+
+/// Gradle dynamic-version notations that need the build tool to pin:
+/// `1.+`/`+` prefix wildcards, `latest.release`-style, and Ivy/Maven
+/// `[1.0,2.0)` ranges.
+fn is_dynamic_version(version: &str) -> bool {
+    version.contains('+')
+        || version.starts_with("latest.")
+        || version.starts_with('[')
+        || version.starts_with('(')
 }
 
 /// Pull `group:artifact:version` out of quoted string literals — the dominant
 /// declaration form. Conservative: three non-empty, whitespace-free,
-/// non-interpolated segments, with a digit in the version.
+/// non-interpolated segments, with a digit or `+` wildcard in the version
+/// (dynamic versions are kept here as candidates so the resolver can record
+/// them as degraded rather than dropping them invisibly).
 pub(crate) fn scrape_coords(text: &str, out: &mut Vec<(String, String, String)>) {
     for literal in string_literals(text) {
         if literal.contains('$') {
@@ -65,7 +91,7 @@ pub(crate) fn scrape_coords(text: &str, out: &mut Vec<(String, String, String)>)
             && parts
                 .iter()
                 .all(|p| !p.is_empty() && !p.contains(char::is_whitespace))
-            && parts[2].chars().any(|c| c.is_ascii_digit())
+            && parts[2].chars().any(|c| c.is_ascii_digit() || c == '+')
         {
             out.push((parts[0].into(), parts[1].into(), parts[2].into()));
         }
@@ -224,6 +250,42 @@ mod tests {
         let result = resolve_project(&root, &cache);
         assert_eq!(result.jars.len(), 1, "{:?}", result.jars);
         assert!(result.jars[0].ends_with("lib-1.0.jar"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dynamic_versions_are_skipped_with_degraded_record() {
+        let base = std::env::temp_dir().join(format!("jvl-gradle-dynamic-{}", std::process::id()));
+        let root = base.join("proj");
+        let cache = base.join("gcache");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            root.join("build.gradle"),
+            "dependencies {\n\
+             implementation 'g:wild:1.+'\n\
+             implementation 'g:range:[1.0,2.0)'\n\
+             }",
+        )
+        .unwrap();
+
+        let result = resolve_project(&root, &cache);
+        assert!(result.jars.is_empty(), "{:?}", result.jars);
+        assert!(
+            result
+                .degraded
+                .contains(&"g:wild:1.+ (dynamic version unsupported)".to_string()),
+            "{:?}",
+            result.degraded
+        );
+        assert!(
+            result
+                .degraded
+                .contains(&"g:range:[1.0,2.0) (dynamic version unsupported)".to_string()),
+            "{:?}",
+            result.degraded
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
