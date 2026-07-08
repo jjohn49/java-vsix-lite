@@ -6,6 +6,7 @@
 // commands. All parsing/lint/IntelliSense (and, later, supervision of the
 // optional javac tier) lives inside the Rust server.
 
+import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -57,6 +58,33 @@ function resolveServerPath(context: vscode.ExtensionContext): string | undefined
   return fs.existsSync(bundled) ? bundled : undefined;
 }
 
+// Version handshake: runs the server binary with `--version` and warns (via
+// the LSP output channel, non-fatally) if it disagrees with the extension's
+// own version. Catches a stale bundled binary left over from a partial
+// update; never blocks startup — a spawn failure or an older binary that
+// doesn't understand `--version` is swallowed as a warning too.
+function checkVersionHandshake(
+  serverPath: string,
+  extensionVersion: string,
+  outputChannel: vscode.OutputChannel,
+): void {
+  try {
+    const serverVersion = execFileSync(serverPath, ["--version"], {
+      encoding: "utf8",
+      timeout: 5000,
+    }).trim();
+    if (serverVersion.length > 0 && serverVersion !== extensionVersion) {
+      outputChannel.appendLine(
+        `[java-vsix-lite] warning: bundled server version (${serverVersion}) does not match extension version (${extensionVersion}); consider reinstalling the extension.`,
+      );
+    }
+  } catch (err) {
+    outputChannel.appendLine(
+      `[java-vsix-lite] warning: could not verify jvl-server's version (${String(err)}).`,
+    );
+  }
+}
+
 async function start(context: vscode.ExtensionContext): Promise<void> {
   const serverPath = resolveServerPath(context);
   if (!serverPath) {
@@ -83,7 +111,7 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     initializationOptions: {
       unresolvedMemberDiagnostics: vscode.workspace
         .getConfiguration("java-vsix-lite")
-        .get<boolean>("diagnostics.unresolvedMembers", true),
+        .get<boolean>("diagnostics.unresolvedMembers", false),
     },
   };
 
@@ -92,6 +120,12 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     "java-vsix-lite",
     serverOptions,
     clientOptions,
+  );
+
+  checkVersionHandshake(
+    serverPath,
+    context.extension.packageJSON.version as string,
+    client.outputChannel,
   );
 
   client.onDidChangeState((event) => updateStatus(event.newState));

@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege: read-only by default. Only the `release` job (which creates
+# the GitHub release and uploads assets) elevates to `contents: write`; every
+# other job stays read-only, including the two publish jobs (they don't touch
+# repo contents at all).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Single source of truth for the shipped version is the git tag. Fail fast,
+  # before spending matrix build minutes, if it disagrees with the workspace
+  # Cargo.toml version (prevents shipping a mislabeled server).
+  check-version:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive and verify version
+        id: version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(awk '/^\[workspace\.package\]/{f=1;next}/^\[/{f=0}f' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p')
+          if [ -z "$cargo_version" ]; then
+            echo "::error::could not read [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag version ($tag_version) does not match workspace Cargo.toml version ($cargo_version); refusing to ship a mislabeled server"
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & package (${{ matrix.target }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            vscode_platform: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            vscode_platform: linux-arm64
+            cross_linux_arm64: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            vscode_platform: alpine-x64
+            musl: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            vscode_platform: darwin-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            vscode_platform: darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            vscode_platform: win32-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      # aarch64-linux is cross-compiled from the ubuntu-latest (x86_64) runner;
+      # no `cross`/container tooling, just the gcc cross-toolchain + linker env.
+      - name: Install aarch64 cross-compiler
+        if: matrix.cross_linux_arm64
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Configure aarch64-linux-gnu linker
+        if: matrix.cross_linux_arm64
+        shell: bash
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Build jvl-server (release, locked)
+        run: cargo build --release --locked -p jvl-server --target ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install extension deps (locked)
+        working-directory: editors/vscode
+        run: npm ci
+
+      - name: Stamp extension version from the release tag
+        # Single source of truth is the git tag (verified against Cargo.toml
+        # above); stamp it into package.json right before packaging.
+        shell: bash
+        working-directory: editors/vscode
+        run: npm version --no-git-tag-version "${VERSION}"
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+
+      - name: Bundle the platform server binary
+        # extension.ts's resolveServerPath() looks for exactly this path:
+        # context.asAbsolutePath("server/" + ("jvl-server" | "jvl-server.exe")).
+        shell: bash
+        run: |
+          mkdir -p editors/vscode/server
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/jvl-server.exe" editors/vscode/server/jvl-server.exe
+          else
+            cp "target/${{ matrix.target }}/release/jvl-server" editors/vscode/server/jvl-server
+            chmod +x editors/vscode/server/jvl-server
+          fi
+
+      - name: Package platform VSIX
+        working-directory: editors/vscode
+        run: npx --no-install @vscode/vsce package --no-dependencies --target ${{ matrix.vscode_platform }} --out java-vsix-lite-${{ matrix.vscode_platform }}.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.vscode_platform }}
+          path: editors/vscode/java-vsix-lite-${{ matrix.vscode_platform }}.vsix
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    # Only this job needs to write repo contents (the release + its assets).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload VSIXes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.vsix \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
+
+  publish-marketplace:
+    name: Publish to VS Code Marketplace
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install (locked)
+        working-directory: editors/vscode
+        run: npm ci
+      - name: Publish all platform VSIXes
+        # Tolerant of a missing VSCE_PAT secret so tag builds still succeed on
+        # forks (which won't have the publishing secret configured).
+        if: ${{ env.VSCE_PAT != '' }}
+        working-directory: editors/vscode
+        run: npx --no-install @vscode/vsce publish --packagePath ../../dist/*.vsix
+      - name: Skip (no VSCE_PAT secret configured)
+        if: ${{ env.VSCE_PAT == '' }}
+        run: echo "::notice::VSCE_PAT secret not set — skipping VS Code Marketplace publish."
+
+  publish-openvsx:
+    name: Publish to Open VSX
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    env:
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Publish each platform VSIX
+        # Tolerant of a missing OVSX_PAT secret, same rationale as the
+        # Marketplace publish job above. ovsx isn't a project devDependency
+        # (it's only ever invoked here, in the gated, network-requiring
+        # publish step), so it's fetched pinned via npx rather than npm ci.
+        if: ${{ env.OVSX_PAT != '' }}
+        run: |
+          for vsix in dist/*.vsix; do
+            npx --yes ovsx@1.0.2 publish "$vsix" -p "$OVSX_PAT"
+          done
+      - name: Skip (no OVSX_PAT secret configured)
+        if: ${{ env.OVSX_PAT == '' }}
+        run: echo "::notice::OVSX_PAT secret not set — skipping Open VSX publish."

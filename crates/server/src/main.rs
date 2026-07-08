@@ -509,8 +509,21 @@ fn open_docs<'a>(
     open
 }
 
+/// `jvl-server --version` prints the crate version and exits, with no LSP
+/// startup. This lets the extension shell do a lightweight version handshake
+/// (comparing the bundled server's version against its own) before spawning
+/// the real LSP session.
+fn print_version_and_exit_if_requested() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    print_version_and_exit_if_requested();
+
     // Logs go to stderr; stdout is the LSP transport. ANSI is disabled because
     // the editor's output panel renders raw escape codes as a jumble; the noisy
     // module-path target is dropped; and the default filter mutes the LSP
