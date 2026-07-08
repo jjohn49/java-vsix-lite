@@ -541,12 +541,35 @@ fn walk_members<'t>(
                         .push(HierMember::External(ExternalMember { signature, ..m }));
                 }
             }
-            // Supertype members render erased (parameterized-super args untracked).
-            for sup in class.supers {
+            // Map this instantiation's type arguments through each supertype's
+            // own type-argument list (index-aligned with `class.supers`, same
+            // convention as `ClassInfo::super_type_args`) so an inherited
+            // member substitutes with the *use-site* concrete types rather
+            // than the supertype's raw type variables — e.g. `ArrayList<E>
+            // extends AbstractList<E>` with `args = ["String"]` maps
+            // `AbstractList`'s `["{0}"]` entry to `["String"]`. A raw
+            // (unparameterized) supertype, or one whose arguments aren't
+            // tracked (length mismatch against `supers`), degrades to no args
+            // — today's behavior.
+            let super_type_args = ctx.symbols.super_type_args(fqn);
+            let super_type_args = if super_type_args.len() == class.supers.len() {
+                super_type_args
+            } else {
+                vec![Vec::new(); class.supers.len()]
+            };
+            for (sup, sup_args) in class.supers.into_iter().zip(super_type_args) {
+                // Each raw arg string uses the same `{i}` placeholder
+                // convention as a member template, over the *current* class's
+                // `type_params` — so the same substitution helper composes
+                // directly, nested generics (`List<{0}>`) included.
+                let mapped_args: Vec<String> = sup_args
+                    .iter()
+                    .map(|raw| substitute_template(raw, args, &class.type_params))
+                    .collect();
                 walk_members(
                     &ResolvedType::External {
                         fqn: sup,
-                        args: Vec::new(),
+                        args: mapped_args,
                     },
                     ctx,
                     static_only,
@@ -1032,5 +1055,243 @@ mod decl_site_tests {
         };
         let member = find_member_hier(&resolved, &ctx, "length").expect("member found");
         assert!(member.decl_site().is_none());
+    }
+}
+
+/// M5 (5.3b): mapping a parameterized supertype's type arguments through
+/// `SymbolSource::super_type_args` so an inherited external member's template
+/// substitutes with the *use-site* concrete types, not the raw class's own
+/// type variables.
+#[cfg(test)]
+mod super_type_args_tests {
+    use super::*;
+    use crate::external::{ExternalClass, ExternalMember, ExternalMemberKind, SymbolSource};
+    use crate::{new_parser, parse};
+
+    fn tree(src: &str) -> Tree {
+        parse(&mut new_parser(), src, None).expect("parse")
+    }
+
+    fn method(name: &str, signature: &str, template: &str) -> ExternalMember {
+        ExternalMember {
+            name: name.to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: signature.to_string(),
+            template: Some(template.to_string()),
+            is_static: false,
+        }
+    }
+
+    fn find(fqn: &str, args: Vec<String>, symbols: &dyn SymbolSource, name: &str) -> String {
+        let src = "class C {}\n";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&t, src);
+        let ctx = Ctx {
+            doc: &docs[0],
+            current: 0,
+            table: &table,
+            imports: &imports,
+            symbols,
+        };
+        let resolved = Resolved {
+            ty: ResolvedType::External {
+                fqn: fqn.to_string(),
+                args,
+            },
+            static_only: false,
+        };
+        let member = find_member_hier(&resolved, &ctx, name).expect("member found");
+        match member {
+            HierMember::External(m) => m.signature,
+            HierMember::InProject(_) => panic!("expected external member"),
+        }
+    }
+
+    /// `ArrayList<E> extends AbstractList<E>`; `AbstractList` declares
+    /// `E get(int)`. `ArrayList<String>` → inherited `get` renders `String
+    /// get(int)`, not erased/`E`.
+    struct ArrayListStub;
+    impl SymbolSource for ArrayListStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.ArrayList" => Some(ExternalClass {
+                    supers: vec!["test.AbstractList".to_string()],
+                    type_params: vec!["E".to_string()],
+                    members: Vec::new(),
+                }),
+                "test.AbstractList" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["E".to_string()],
+                    members: vec![method("get", "Object get(int)", "{0} get(int)")],
+                }),
+                _ => None,
+            }
+        }
+        fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+            match fqn {
+                "test.ArrayList" => vec![vec!["{0}".to_string()]],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_member_substitutes_through_direct_supertype_type_arg() {
+        let sig = find(
+            "test.ArrayList",
+            vec!["String".to_string()],
+            &ArrayListStub,
+            "get",
+        );
+        assert_eq!(sig, "String get(int)");
+    }
+
+    /// Two-hop: `class C<T> extends B<T>`, `B<T> extends A<T>`; `A` declares
+    /// `T id(T)`. `C<Integer>` → `Integer id(Integer)`.
+    struct TwoHopStub;
+    impl SymbolSource for TwoHopStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.C" => Some(ExternalClass {
+                    supers: vec!["test.B".to_string()],
+                    type_params: vec!["T".to_string()],
+                    members: Vec::new(),
+                }),
+                "test.B" => Some(ExternalClass {
+                    supers: vec!["test.A".to_string()],
+                    type_params: vec!["T".to_string()],
+                    members: Vec::new(),
+                }),
+                "test.A" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["T".to_string()],
+                    members: vec![method("id", "Object id(Object)", "{0} id({0})")],
+                }),
+                _ => None,
+            }
+        }
+        fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+            match fqn {
+                "test.C" | "test.B" => vec![vec!["{0}".to_string()]],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_member_substitutes_through_two_hop_hierarchy() {
+        let sig = find("test.C", vec!["Integer".to_string()], &TwoHopStub, "id");
+        assert_eq!(sig, "Integer id(Integer)");
+    }
+
+    /// Re-ordered args: `class M<K,V> extends Base<V,K>`; `Base` declares
+    /// `K first()` (Base's own `K` = `M`'s `V`). `M<String,Integer>` →
+    /// `Integer first()`.
+    struct ReorderedStub;
+    impl SymbolSource for ReorderedStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.M" => Some(ExternalClass {
+                    supers: vec!["test.Base".to_string()],
+                    type_params: vec!["K".to_string(), "V".to_string()],
+                    members: Vec::new(),
+                }),
+                "test.Base" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["K".to_string(), "V".to_string()],
+                    members: vec![method("first", "Object first()", "{0} first()")],
+                }),
+                _ => None,
+            }
+        }
+        fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+            match fqn {
+                // Base<V, K> — first arg is M's V ({1}), second is M's K ({0}).
+                "test.M" => vec![vec!["{1}".to_string(), "{0}".to_string()]],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_member_substitutes_through_reordered_type_args() {
+        let sig = find(
+            "test.M",
+            vec!["String".to_string(), "Integer".to_string()],
+            &ReorderedStub,
+            "first",
+        );
+        assert_eq!(sig, "Integer first()");
+    }
+
+    /// Concrete supertype args: `class S extends Box<String>`; `Box` declares
+    /// `T unwrap()` → `String unwrap()`.
+    struct ConcreteStub;
+    impl SymbolSource for ConcreteStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.S" => Some(ExternalClass {
+                    supers: vec!["test.Box".to_string()],
+                    type_params: Vec::new(),
+                    members: Vec::new(),
+                }),
+                "test.Box" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["T".to_string()],
+                    members: vec![method("unwrap", "Object unwrap()", "{0} unwrap()")],
+                }),
+                _ => None,
+            }
+        }
+        fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+            match fqn {
+                "test.S" => vec![vec!["String".to_string()]],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_member_substitutes_through_concrete_supertype_arg() {
+        let sig = find("test.S", Vec::new(), &ConcreteStub, "unwrap");
+        assert_eq!(sig, "String unwrap()");
+    }
+
+    /// Raw supertype (no `super_type_args` tracked for it) → inherited member
+    /// renders as today: erased/var-name, no panic.
+    struct RawStub;
+    impl SymbolSource for RawStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.RawUser" => Some(ExternalClass {
+                    supers: vec!["test.Generic".to_string()],
+                    type_params: Vec::new(),
+                    members: Vec::new(),
+                }),
+                "test.Generic" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["T".to_string()],
+                    members: vec![method("get", "Object get()", "{0} get()")],
+                }),
+                _ => None,
+            }
+        }
+        // No override: defaults to `Vec::new()` for every fqn — "nothing
+        // tracked", exactly like a raw (unparameterized) supertype use.
+    }
+
+    #[test]
+    fn raw_supertype_falls_back_to_erased_rendering_without_panicking() {
+        // No type args flow through an untracked supertype (`RawStub` never
+        // overrides `super_type_args`), so the inherited member keeps
+        // rendering its today's-behavior erased signature — no panic, no
+        // spurious substitution.
+        let sig = find("test.RawUser", Vec::new(), &RawStub, "get");
+        assert_eq!(sig, "Object get()");
     }
 }

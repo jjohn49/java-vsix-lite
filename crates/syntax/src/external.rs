@@ -43,6 +43,22 @@ pub trait SymbolSource {
     fn doc(&self, _fqn: &str, _member: Option<&str>) -> Option<String> {
         None
     }
+
+    /// Type arguments applied to each entry of `class(fqn)`'s `supers` list —
+    /// index-aligned with `supers`, e.g. for `class MyList<T> extends
+    /// AbstractList<T>`, entry 0 is `["{0}"]`. Uses the same `{i}` placeholder
+    /// convention as [`ExternalMember::template`] (referring to `fqn`'s own
+    /// `type_params`), so a caller substitutes through it exactly like a member
+    /// template. A raw (unparameterized) supertype, or one whose arguments
+    /// aren't tracked, is `[]`.
+    ///
+    /// Defaults to "nothing tracked" for every entry, so existing
+    /// implementations keep compiling unchanged and inherited members from a
+    /// supertype fall back to today's erased/var-name rendering — the same
+    /// graceful degradation as a raw supertype.
+    fn super_type_args(&self, _fqn: &str) -> Vec<Vec<String>> {
+        Vec::new()
+    }
 }
 
 /// A [`SymbolSource`] that resolves nothing — used when no JDK is available and
