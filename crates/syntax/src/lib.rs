@@ -36,6 +36,7 @@ mod external;
 mod hover;
 mod imports;
 mod model;
+mod references;
 mod resolve;
 mod signature;
 mod signature_help;
@@ -46,6 +47,7 @@ pub use diagnostics::member_diagnostics;
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource};
 pub use hover::hover;
+pub use references::{reference_target, references_in_doc, ReferenceHits, ReferenceTarget, Tier};
 pub use signature_help::signature_help;
 
 /// A snapshot of one open document the analysis can read: its source text and

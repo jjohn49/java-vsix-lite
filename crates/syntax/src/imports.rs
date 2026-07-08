@@ -74,7 +74,12 @@ impl Imports {
 
 /// Extract the dotted path from a `package x.y;` / `import x.y.Z;` declaration:
 /// strip the keyword and the trailing `;`, and collapse any stray whitespace.
-fn dotted_path(text: &str, keyword: &str) -> Option<String> {
+///
+/// `pub(crate)`: also used by `references.rs` to recover an arbitrary
+/// declaration's own *actual* package (from its declaring document's
+/// `package_declaration`, walked to independent of any particular `Imports`
+/// instance) for package-aware type-reference confirmation.
+pub(crate) fn dotted_path(text: &str, keyword: &str) -> Option<String> {
     let rest = text.trim().strip_prefix(keyword)?;
     let path: String = rest
         .trim()

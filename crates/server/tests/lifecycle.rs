@@ -634,3 +634,281 @@ fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn temp_root(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "jvl-refs-test-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ))
+}
+
+/// M4 (4.3): `textDocument/references` end-to-end, Tier 2 (Workspace
+/// visibility — `public`) — a public class's references are found across
+/// three files: the declaring file (open, cursor on its own declaration
+/// name) plus two same-package unopened files on disk, each holding a plain
+/// field-typed use. `includeDeclaration` gates whether the declaration's own
+/// occurrence is included.
+#[test]
+fn references_cross_file_public_class_round_trip() {
+    let root = temp_root("cross-file");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("UseB.java"),
+        "package p;\nclass UseB {\n  Foo f;\n}\n",
+    )
+    .expect("write UseB.java");
+    std::fs::write(
+        src_dir.join("UseC.java"),
+        "package p;\nclass UseC {\n  Foo f;\n}\n",
+    )
+    .expect("write UseC.java");
+    let foo_path = src_dir.join("Foo.java");
+    let foo_text = "package p;\n\npublic class Foo {\n}\n";
+    std::fs::write(&foo_path, foo_text).expect("write Foo.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"referencesProvider\":true"),
+        "missing referencesProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let foo_uri = format!("file://{}", foo_path.display());
+    let use_b_uri = format!("file://{}", src_dir.join("UseB.java").display());
+    let use_c_uri = format!("file://{}", src_dir.join("UseC.java").display());
+
+    // Open only Foo.java (the declaring file); UseB/UseC stay on disk.
+    let escaped_foo_text = foo_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"{escaped_foo_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Foo` in `public class Foo` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":2,"character":13}},"context":{{"includeDeclaration":false}}}}}}"#
+    ));
+    let without_decl = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        without_decl.contains(&use_b_uri),
+        "expected a result in UseB.java: {without_decl}"
+    );
+    assert!(
+        without_decl.contains(&use_c_uri),
+        "expected a result in UseC.java: {without_decl}"
+    );
+    assert!(
+        !without_decl.contains(&foo_uri),
+        "declaration itself must be excluded when includeDeclaration is false: {without_decl}"
+    );
+
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":2,"character":13}},"context":{{"includeDeclaration":true}}}}}}"#
+    ));
+    let with_decl = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        with_decl.contains(&use_b_uri)
+            && with_decl.contains(&use_c_uri)
+            && with_decl.contains(&foo_uri),
+        "expected results in all three files when includeDeclaration is true: {with_decl}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M4 (4.3): `textDocument/references` end-to-end — a workspace with more
+/// `.java` files under the source root than the hardcoded 500-file scan cap
+/// surfaces truncation via a `window/showMessage` (Info) notification,
+/// worded per the task brief.
+#[test]
+fn references_truncation_notice_round_trip() {
+    let root = temp_root("truncation");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    // Comfortably over the 500-file cap so the scan is truncated regardless
+    // of directory-walk order.
+    for i in 0..510 {
+        std::fs::write(
+            src_dir.join(format!("Filler{i}.java")),
+            format!("package p;\nclass Filler{i} {{}}\n"),
+        )
+        .expect("write filler file");
+    }
+    let target_path = src_dir.join("Trigger.java");
+    let target_text = "package p;\n\npublic class Trigger {\n}\n";
+    std::fs::write(&target_path, target_text).expect("write Trigger.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let target_uri = format!("file://{}", target_path.display());
+    let escaped_text = target_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{target_uri}","languageId":"java","version":1,"text":"{escaped_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Trigger` in `public class Trigger` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{target_uri}"}},"position":{{"line":2,"character":13}},"context":{{"includeDeclaration":true}}}}}}"#
+    ));
+    // The `window/showMessage` notification and the `id:2` response reach
+    // stdout via independent server output paths, so their relative order is
+    // NOT guaranteed. Wait for the notification first (`read_until`
+    // accumulates whatever else arrives — possibly the response — into
+    // `seen`), then only read further frames for the response if it didn't
+    // already race ahead of the notification; a second blocking read for a
+    // frame that was already consumed would hang forever.
+    let notice = read_until(&mut reader, "window/showMessage", &mut seen);
+    assert!(
+        notice.contains("truncated at 500 files"),
+        "expected the task brief's truncation wording: {notice}"
+    );
+    // The request itself must still complete (the declaring file's own
+    // occurrence, at minimum, is always found directly).
+    if !seen.iter().any(|f| f.contains("\"id\":2")) {
+        let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M4 (4.3): `textDocument/references` end-to-end — a file under `target/`
+/// (build output) whose content textually matches the searched identifier is
+/// never scanned, even though it lies under the workspace root.
+#[test]
+fn references_skips_target_directory() {
+    let root = temp_root("skip-target");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let marker_path = src_dir.join("Marker.java");
+    let marker_text = "package p;\n\npublic class Marker {\n}\n";
+    std::fs::write(&marker_path, marker_text).expect("write Marker.java");
+
+    // Build-output directory holding a textual (but not semantic) match —
+    // must never be scanned.
+    let build_dir = root.join("target/generated/p");
+    std::fs::create_dir_all(&build_dir).expect("create target/ dir");
+    std::fs::write(
+        build_dir.join("Fake.java"),
+        "package p;\nclass Fake {\n  Marker m;\n}\n",
+    )
+    .expect("write file under target/");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let marker_uri = format!("file://{}", marker_path.display());
+    let escaped_text = marker_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{marker_uri}","languageId":"java","version":1,"text":"{escaped_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Marker` in `public class Marker` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{marker_uri}"}},"position":{{"line":2,"character":13}},"context":{{"includeDeclaration":false}}}}}}"#
+    ));
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        !result.contains("Fake.java"),
+        "a file under target/ must never be scanned, even with a textual match: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

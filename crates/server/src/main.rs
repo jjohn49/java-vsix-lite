@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod references;
 mod workspace_index;
 
 use std::collections::{HashMap, HashSet};
@@ -195,15 +196,14 @@ impl Backend {
         &self.workspace_index
     }
 
-    /// Parse (or reuse a cached parse of) a single project source file for
-    /// ladder step (c). At most one file is read per candidate tried, and the
-    /// caller (`resolve_location`) stops at the first hit — no directory
-    /// walking or indexing.
-    fn locate_in_project_file(
-        &self,
-        path: &Path,
-        simple_name: &str,
-    ) -> Option<(StdRange<usize>, Arc<String>)> {
+    /// Parse (or reuse a cached parse of) a single project source file,
+    /// invalidated by `mtime` so an on-disk edit is picked up without an
+    /// explicit notification (the server never watches files). Shared by
+    /// ladder step (c) (`locate_in_project_file`, below) and M4.3
+    /// find-references' Tier 2 per-hit-file confirm (`references()`/
+    /// `references.rs`) — both are one-off, cold, parse-on-demand lookups
+    /// of a file that isn't open in the editor.
+    fn parsed_project_file(&self, path: &Path) -> Option<(Arc<String>, Tree)> {
         let metadata = std::fs::metadata(path).ok()?;
         let mtime = metadata.modified().ok()?;
 
@@ -228,8 +228,21 @@ impl Backend {
             );
         }
         let cached = cache.get(path)?;
-        let range = jvl_syntax::locate_type_in_source(&cached.tree, &cached.text, simple_name)?;
-        Some((range, Arc::clone(&cached.text)))
+        Some((Arc::clone(&cached.text), cached.tree.clone()))
+    }
+
+    /// Parse (or reuse a cached parse of) a single project source file for
+    /// ladder step (c). At most one file is read per candidate tried, and the
+    /// caller (`resolve_location`) stops at the first hit — no directory
+    /// walking or indexing.
+    fn locate_in_project_file(
+        &self,
+        path: &Path,
+        simple_name: &str,
+    ) -> Option<(StdRange<usize>, Arc<String>)> {
+        let (text, tree) = self.parsed_project_file(path)?;
+        let range = jvl_syntax::locate_type_in_source(&tree, &text, simple_name)?;
+        Some((range, text))
     }
 
     /// The source text to serve for an external (JDK/dependency) FQN: real
@@ -573,6 +586,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     // `.` requests member completion; identifier/keyword
                     // completion is requested explicitly (Ctrl-Space) or by the
@@ -938,6 +952,208 @@ impl LanguageServer for Backend {
         let def = jvl_syntax::type_definition(&open, 0, &index, position, &symbols);
         let location = def.and_then(|def| self.resolve_location(def, &docs, &uris));
         Ok(location.map(GotoDefinitionResponse::Scalar))
+    }
+
+    /// M4 (4.3): `textDocument/references` — two-tier, bounded, confirm-by-
+    /// resolution (see the `jvl_syntax::references` module doc for the full
+    /// design). The target's visibility tier (`jvl_syntax::Tier`, read off
+    /// its declaration's modifiers) decides the scan's reach:
+    ///
+    /// - `FileLocal` (local/param/`private` member): only the declaring file
+    ///   is scanned — already open, already parsed, no disk I/O.
+    /// - `Workspace` (package-private/protected/public): a bounded textual
+    ///   prefilter (`references::prefilter`) finds candidate files under the
+    ///   discovered source roots; each is parsed on demand (reusing the
+    ///   ladder-step-(c) `(path, mtime)` cache, or a currently-open
+    ///   document's live text/tree when the hit is itself open) and
+    ///   semantically confirmed one file at a time
+    ///   (`jvl_syntax::references_in_doc`), yielding to the runtime between
+    ///   files so a cancelled request actually stops promptly.
+    ///
+    /// Only symbols declared in a currently *open* document are supported
+    /// (open-files-first, like every other feature here) —
+    /// `jvl_syntax::reference_target` answers `None` for anything else
+    /// (an external/JDK symbol, an unopened project file, `this`/`super`, a
+    /// non-identifier), and this handler answers `Ok(None)` in that case.
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+
+        // Resolve the target and snapshot everything the (possibly slow,
+        // Tier-2-only) workspace scan below needs, then release the
+        // documents lock before it — mirrors `workspace_index::ensure_built`'s
+        // own pattern of never holding the lock across a directory walk.
+        struct Snapshot {
+            target: jvl_syntax::ReferenceTarget,
+            target_uri: String,
+            target_text: String,
+            target_tree: Tree,
+            roots: Vec<PathBuf>,
+            project_root: Option<PathBuf>,
+            /// Currently-open documents' live text/tree, keyed by
+            /// canonicalized path (falling back to the raw path when
+            /// canonicalization fails) — a Tier-2 hit file that is itself
+            /// open is read from here instead of disk, so unsaved edits are
+            /// reflected.
+            open_snapshot: HashMap<PathBuf, (String, Tree)>,
+        }
+
+        let snapshot = {
+            let docs = self.documents.lock().await;
+            let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
+                return Ok(None);
+            };
+            let index = LineIndex::new(open[0].source, self.encoding());
+            let symbols = ClasspathSymbols(self.classpath());
+            let Some(target) = jvl_syntax::reference_target(&open, 0, &index, position, &symbols)
+            else {
+                return Ok(None);
+            };
+
+            let target_uri = uris[target.doc].to_string();
+            let Some(target_doc) = docs.get(&target_uri) else {
+                return Ok(None);
+            };
+            let target_text = target_doc.text.clone();
+            let target_tree = target_doc.tree.clone();
+
+            let project_root = self.project_root();
+            let roots = project_root
+                .as_deref()
+                .map(|root| self.source_roots(&docs, root))
+                .unwrap_or_default();
+
+            let mut open_snapshot = HashMap::new();
+            for (doc_uri, doc) in docs.iter() {
+                if let Some(path) = open_doc_path(doc_uri) {
+                    let key = std::fs::canonicalize(&path).unwrap_or(path);
+                    open_snapshot.insert(key, (doc.text.clone(), doc.tree.clone()));
+                }
+            }
+
+            Snapshot {
+                target,
+                target_uri,
+                target_text,
+                target_tree,
+                roots,
+                project_root,
+                open_snapshot,
+            }
+        };
+
+        let symbols = ClasspathSymbols(self.classpath());
+        let target_index = LineIndex::new(&snapshot.target_text, self.encoding());
+        let target_open = jvl_syntax::OpenDoc {
+            source: &snapshot.target_text,
+            tree: &snapshot.target_tree,
+        };
+        let Some(target_uri_parsed) = snapshot.target_uri.parse::<Uri>().ok() else {
+            return Ok(None);
+        };
+
+        let mut locations = Vec::new();
+
+        // The declaring file's own occurrences are always in scope — Tier 1
+        // stops here entirely; Tier 2 also always checks it directly
+        // (self-references), whether or not it happens to lie under a
+        // discovered source root.
+        let self_target = jvl_syntax::ReferenceTarget {
+            doc: 0,
+            ..snapshot.target.clone()
+        };
+        let own_hits = jvl_syntax::references_in_doc(
+            std::slice::from_ref(&target_open),
+            0,
+            &self_target,
+            include_declaration,
+            &symbols,
+        );
+        locations.extend(own_hits.ranges.into_iter().map(|range| Location {
+            uri: target_uri_parsed.clone(),
+            range: byte_range_to_lsp(&target_index, range),
+        }));
+
+        if snapshot.target.tier == jvl_syntax::Tier::Workspace {
+            let scan = references::prefilter(
+                &snapshot.roots,
+                snapshot.project_root.as_deref(),
+                &snapshot.target.name,
+            )
+            .await;
+
+            let target_path = open_doc_path(&snapshot.target_uri);
+            let target_canon = target_path
+                .as_ref()
+                .and_then(|p| std::fs::canonicalize(p).ok());
+
+            for hit_path in scan.files {
+                let hit_canon = std::fs::canonicalize(&hit_path).ok();
+                let is_target_file = target_path.as_ref() == Some(&hit_path)
+                    || (hit_canon.is_some() && hit_canon == target_canon);
+                if is_target_file {
+                    continue; // already handled above
+                }
+
+                let cached = hit_canon
+                    .as_ref()
+                    .and_then(|c| snapshot.open_snapshot.get(c))
+                    .map(|(text, tree)| (Arc::new(text.clone()), tree.clone()))
+                    .or_else(|| self.parsed_project_file(&hit_path));
+                let Some((hit_text, hit_tree)) = cached else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+
+                let docs_for_scan = [
+                    jvl_syntax::OpenDoc {
+                        source: &hit_text,
+                        tree: &hit_tree,
+                    },
+                    jvl_syntax::OpenDoc {
+                        source: &snapshot.target_text,
+                        tree: &snapshot.target_tree,
+                    },
+                ];
+                let remapped = jvl_syntax::ReferenceTarget {
+                    doc: 1,
+                    ..snapshot.target.clone()
+                };
+                let hits = jvl_syntax::references_in_doc(
+                    &docs_for_scan,
+                    0,
+                    &remapped,
+                    include_declaration,
+                    &symbols,
+                );
+                if !hits.ranges.is_empty() {
+                    if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
+                        let hit_index = LineIndex::new(&hit_text, self.encoding());
+                        locations.extend(hits.ranges.into_iter().map(|range| Location {
+                            uri: hit_uri.clone(),
+                            range: byte_range_to_lsp(&hit_index, range),
+                        }));
+                    }
+                }
+
+                tokio::task::yield_now().await;
+            }
+
+            if scan.truncated {
+                self.client
+                    .show_message(
+                        MessageType::INFO,
+                        format!(
+                            "References search truncated at {} files; results may be incomplete.",
+                            references::MAX_FILES_SCANNED
+                        ),
+                    )
+                    .await;
+            }
+        }
+
+        Ok((!locations.is_empty()).then_some(locations))
     }
 }
 
