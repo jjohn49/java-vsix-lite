@@ -47,16 +47,11 @@ pub(crate) struct Binding<'t> {
     /// the document this binding is declared in. A field binding can name a
     /// different document than the usage site (inherited from a supertype
     /// declared elsewhere); locals/params/for-vars are always the current doc.
-    ///
-    /// M4.0 bookkeeping only — read by `decl_site` below, which nothing outside
-    /// tests calls yet (the M4 goto-definition facade is next).
-    #[allow(dead_code)]
     pub doc: usize,
 }
 
 impl<'t> Binding<'t> {
     /// Where this binding is declared.
-    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
     pub(crate) fn decl_site(&self) -> Option<DeclSite> {
         let name = binding_name_node(self.decl_node)?;
         Some(DeclSite::new(self.doc, name, self.decl_node))
@@ -68,7 +63,6 @@ impl<'t> Binding<'t> {
 /// `enhanced_for_statement`, and the field-origin `Member` node kinds); a bare
 /// lambda parameter's decl node *is* its name (`identifier`); a varargs
 /// parameter's name lives on its nested `variable_declarator`.
-#[allow(dead_code)] // only caller (`Binding::decl_site`) is itself dead_code-allowed
 fn binding_name_node(decl_node: Node) -> Option<Node> {
     match decl_node.kind() {
         "identifier" => Some(decl_node),
@@ -213,6 +207,16 @@ fn resolve_receiver_depth<'t>(
         // it must resolve like `identifier` — instance var or static type name.
         "identifier" | "type_identifier" => {
             resolve_name_to_type(node_text(recv, ctx.doc.source), recv.start_byte(), ctx)
+        }
+        // A string literal receiver (`"".length()`) is always `java.lang.String`.
+        "string_literal" => {
+            let fqn = "java.lang.String".to_string();
+            ctx.symbols.class(&fqn).is_some().then(|| {
+                instance(ResolvedType::External {
+                    fqn,
+                    args: Vec::new(),
+                })
+            })
         }
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
@@ -430,7 +434,6 @@ impl HierMember<'_> {
 
     /// Where this member is declared, or `None` for an external (JDK/dependency)
     /// member — those aren't backed by an open document in this task.
-    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
     pub(crate) fn decl_site(&self) -> Option<DeclSite> {
         match self {
             HierMember::InProject(m) => m.decl_site(),

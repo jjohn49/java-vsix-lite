@@ -72,8 +72,10 @@ pub fn hover(
     })
 }
 
-/// The identifier-like node at the cursor, if any.
-fn identifier_at<'t>(tree: &'t Tree, cursor: usize) -> Option<Node<'t>> {
+/// The identifier-like node at the cursor, if any. Shared with the
+/// goto-definition facade (`definition.rs`), which resolves the same
+/// identifier/type-name/`this`/`super` shapes hover does.
+pub(crate) fn identifier_at<'t>(tree: &'t Tree, cursor: usize) -> Option<Node<'t>> {
     let node = resolve::node_at(tree, cursor);
     matches!(
         node.kind(),
@@ -168,7 +170,8 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
 }
 
 /// Whether `name_node` is the `name` field of a renderable declaration `parent`.
-fn is_decl_name(parent: Node, name_node: Node) -> bool {
+/// Shared with `definition.rs` (see [`identifier_at`]).
+pub(crate) fn is_decl_name(parent: Node, name_node: Node) -> bool {
     let renderable = matches!(
         parent.kind(),
         "method_declaration"
@@ -188,7 +191,8 @@ fn is_decl_name(parent: Node, name_node: Node) -> bool {
     renderable && parent.child_by_field_name("name") == Some(name_node)
 }
 
-fn field_is(parent: Node, field: &str, name_node: Node) -> bool {
+/// Shared with `definition.rs` (see [`identifier_at`]).
+pub(crate) fn field_is(parent: Node, field: &str, name_node: Node) -> bool {
     parent.child_by_field_name(field) == Some(name_node)
 }
 

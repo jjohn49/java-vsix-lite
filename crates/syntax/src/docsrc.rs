@@ -20,6 +20,26 @@ pub fn javadoc_in_source(source: &str, type_simple: &str, member: Option<&str>) 
     }
 }
 
+/// Parse external source (or a signature-only stub rendered the same shape)
+/// and return the byte range of the *name* identifier of the type named
+/// `type_simple` (when `member` is `None`) or its named method/field — the
+/// goto-definition target inside a virtual `jvl-src:` document. Same
+/// one-shot-parse technique as [`javadoc_in_source`].
+pub fn locate_in_source(
+    source: &str,
+    type_simple: &str,
+    member: Option<&str>,
+) -> Option<std::ops::Range<usize>> {
+    let mut parser = new_parser();
+    let tree = parse(&mut parser, source, None)?;
+    let type_node = find_type(tree.root_node(), source, type_simple)?;
+    let target = match member {
+        None => type_node,
+        Some(name) => find_member_decl(type_node, source, name)?,
+    };
+    target.child_by_field_name("name").map(|n| n.byte_range())
+}
+
 fn is_type_decl(kind: &str) -> bool {
     matches!(
         kind,
@@ -117,5 +137,34 @@ mod tests {
     fn missing_member_or_type_is_none() {
         assert_eq!(javadoc_in_source(SRC, "MyList", Some("nope")), None);
         assert_eq!(javadoc_in_source(SRC, "Other", None), None);
+    }
+
+    #[test]
+    fn locates_type_and_member_name_ranges() {
+        let type_at = SRC.find("MyList").unwrap();
+        let range = locate_in_source(SRC, "MyList", None).expect("type located");
+        assert_eq!(range, type_at..type_at + "MyList".len());
+
+        let add_at = SRC.find("add").unwrap();
+        let range = locate_in_source(SRC, "MyList", Some("add")).expect("member located");
+        assert_eq!(range, add_at..add_at + "add".len());
+    }
+
+    #[test]
+    fn locates_member_in_a_body_only_stub() {
+        // A signature-only stub (no method bodies) parses fine — abstract-style
+        // declarations are ordinary Java syntax (interfaces, abstract methods).
+        let stub = "class Widget {\n    int size;\n    boolean add(Object e);\n}\n";
+        let at = stub.find("add").unwrap();
+        assert_eq!(
+            locate_in_source(stub, "Widget", Some("add")),
+            Some(at..at + "add".len())
+        );
+    }
+
+    #[test]
+    fn missing_member_or_type_has_no_location() {
+        assert_eq!(locate_in_source(SRC, "MyList", Some("nope")), None);
+        assert_eq!(locate_in_source(SRC, "Other", None), None);
     }
 }

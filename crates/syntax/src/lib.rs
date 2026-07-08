@@ -29,6 +29,7 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 pub use tree_sitter;
 
 mod completion;
+mod definition;
 mod diagnostics;
 mod docsrc;
 mod external;
@@ -39,8 +40,9 @@ mod resolve;
 mod signature;
 
 pub use completion::completion;
+pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::member_diagnostics;
-pub use docsrc::javadoc_in_source;
+pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource};
 pub use hover::hover;
 

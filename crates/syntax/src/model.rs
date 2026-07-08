@@ -38,12 +38,6 @@ pub(crate) fn children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
 ///
 /// Built for symbols that live in an open document; external (JDK/jar) symbols
 /// have no `DeclSite` — callers get `None` for those instead.
-///
-/// M4.0 wires this bookkeeping through the resolver only; nothing outside
-/// tests constructs one yet. `#[allow(dead_code)]` here (and on the
-/// `decl_site` methods below) is temporary scaffolding for the M4
-/// goto-definition/find-references/rename facade landing on top of it.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeclSite {
     pub doc: usize,
@@ -51,7 +45,6 @@ pub(crate) struct DeclSite {
     pub full_range: std::ops::Range<usize>,
 }
 
-#[allow(dead_code)]
 impl DeclSite {
     /// Build a `DeclSite` from a name node and the declaration node it belongs
     /// to (`full`), both required to exist — callers pass `None` up when a name
@@ -139,7 +132,6 @@ impl<'t> Member<'t> {
     /// Where this member is declared, or `None` if `node` unexpectedly has no
     /// `name` field (never true for the node kinds [`Member`] is built from,
     /// but resolution never panics on a shape it didn't expect).
-    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
     pub(crate) fn decl_site(&self) -> Option<DeclSite> {
         let name = self.node.child_by_field_name("name")?;
         Some(DeclSite::new(self.doc, name, self.node))
@@ -181,7 +173,6 @@ impl<'t> TypeDecl<'t> {
     }
 
     /// Where this type is declared.
-    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
     pub(crate) fn decl_site(&self) -> Option<DeclSite> {
         let name = self.node.child_by_field_name("name")?;
         Some(DeclSite::new(self.doc, name, self.node))
