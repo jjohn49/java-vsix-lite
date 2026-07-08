@@ -186,7 +186,11 @@ impl<'a> SigParser<'a> {
 }
 
 fn simple(binary: &str) -> String {
-    binary.rsplit('/').next().unwrap_or(binary).replace('$', ".")
+    binary
+        .rsplit('/')
+        .next()
+        .unwrap_or(binary)
+        .replace('$', ".")
 }
 
 #[cfg(test)]
@@ -194,7 +198,9 @@ mod tests {
     use super::*;
 
     fn params() -> Vec<String> {
-        class_type_params("<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;")
+        class_type_params(
+            "<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;",
+        )
     }
 
     #[test]
@@ -205,8 +211,14 @@ mod tests {
     #[test]
     fn renders_method_templates_with_slots() {
         let tp = params();
-        assert_eq!(method_template("(TE;)Z", &tp), Some(("boolean".into(), vec!["{0}".into()])));
-        assert_eq!(method_template("(I)TE;", &tp), Some(("{0}".into(), vec!["int".into()])));
+        assert_eq!(
+            method_template("(TE;)Z", &tp),
+            Some(("boolean".into(), vec!["{0}".into()]))
+        );
+        assert_eq!(
+            method_template("(I)TE;", &tp),
+            Some(("{0}".into(), vec!["int".into()]))
+        );
         assert_eq!(
             method_template("()Ljava/util/ListIterator<TE;>;", &tp),
             Some(("ListIterator<{0}>".into(), vec![]))

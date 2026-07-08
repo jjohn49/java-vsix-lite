@@ -2,7 +2,9 @@
 //! readable (raw, generics-erased) member signatures from JVM descriptors.
 
 use cafebabe::attributes::{AttributeData, AttributeInfo};
-use cafebabe::descriptors::{ClassName, FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor};
+use cafebabe::descriptors::{
+    ClassName, FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor,
+};
 use cafebabe::{parse_class_with_options, FieldAccessFlags, MethodAccessFlags, ParseOptions};
 
 use crate::{generics, ClassInfo, Member, MemberKind};

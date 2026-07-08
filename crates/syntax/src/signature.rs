@@ -304,7 +304,10 @@ mod tests {
             "class C { public static List<Integer> f(int a, String b) throws IOException { return null; } }",
             "method_declaration",
         );
-        assert_eq!(s, "public static List<Integer> f(int a, String b) throws IOException");
+        assert_eq!(
+            s,
+            "public static List<Integer> f(int a, String b) throws IOException"
+        );
     }
 
     #[test]

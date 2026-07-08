@@ -11,7 +11,10 @@ pub(crate) fn best_jdk() -> Option<PathBuf> {
             return Some(home);
         }
     }
-    let mut candidates: Vec<PathBuf> = candidate_homes().into_iter().filter(|p| has_jmods(p)).collect();
+    let mut candidates: Vec<PathBuf> = candidate_homes()
+        .into_iter()
+        .filter(|p| has_jmods(p))
+        .collect();
     candidates.sort_by_key(|p| std::cmp::Reverse(major_version(p)));
     candidates.into_iter().next()
 }

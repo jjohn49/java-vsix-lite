@@ -72,7 +72,8 @@ fn instance(ty: ResolvedType) -> Resolved {
 pub(crate) fn node_at<'t>(tree: &'t Tree, byte: usize) -> Node<'t> {
     let root = tree.root_node();
     let byte = byte.min(root.end_byte());
-    root.named_descendant_for_byte_range(byte, byte).unwrap_or(root)
+    root.named_descendant_for_byte_range(byte, byte)
+        .unwrap_or(root)
 }
 
 fn is_type_decl(kind: &str) -> bool {
@@ -111,11 +112,7 @@ fn is_ident_byte(b: u8) -> bool {
 /// return the receiver expression node. The decision is text-anchored: skip any
 /// partially-typed member name and surrounding whitespace; if the preceding
 /// non-space byte is `.`, it is member access.
-pub(crate) fn member_receiver<'t>(
-    tree: &'t Tree,
-    source: &str,
-    cursor: usize,
-) -> Option<Node<'t>> {
+pub(crate) fn member_receiver<'t>(tree: &'t Tree, source: &str, cursor: usize) -> Option<Node<'t>> {
     let bytes = source.as_bytes();
     let mut i = cursor.min(bytes.len());
     while i > 0 && is_ident_byte(bytes[i - 1]) {
@@ -148,10 +145,7 @@ fn receiver_ending_at<'t>(tree: &'t Tree, dot: usize) -> Option<Node<'t>> {
 }
 
 /// Resolve a receiver expression node to the type whose members it exposes.
-pub(crate) fn resolve_receiver_type<'t>(
-    recv: Node<'t>,
-    ctx: &Ctx<'_, 't>,
-) -> Option<Resolved<'t>> {
+pub(crate) fn resolve_receiver_type<'t>(recv: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
     resolve_receiver_depth(recv, ctx, 0)
 }
 
@@ -164,7 +158,9 @@ fn resolve_receiver_depth<'t>(
         return None;
     }
     match recv.kind() {
-        "this" => enclosing_typedecl(recv, ctx.doc.source).map(|td| instance(ResolvedType::InProject(td))),
+        "this" => {
+            enclosing_typedecl(recv, ctx.doc.source).map(|td| instance(ResolvedType::InProject(td)))
+        }
         "super" => {
             let td = enclosing_typedecl(recv, ctx.doc.source)?;
             let sup = td.supers.first()?;
@@ -185,7 +181,9 @@ fn resolve_receiver_depth<'t>(
             let ResolvedType::InProject(td) = &obj_ty.ty else {
                 return None;
             };
-            let member = ctx.table.find_member(td, node_text(field, ctx.doc.source))?;
+            let member = ctx
+                .table
+                .find_member(td, node_text(field, ctx.doc.source))?;
             let type_node = field_type_node(member.node)?;
             resolve_type_node(type_node, member.source, ctx).map(instance)
         }
@@ -284,7 +282,10 @@ fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>
     if let Some(td) = ctx.table.get(simple) {
         return Some(ResolvedType::InProject(td.clone()));
     }
-    resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External { fqn, args: Vec::new() })
+    resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External {
+        fqn,
+        args: Vec::new(),
+    })
 }
 
 /// First import candidate FQN that the symbol source can actually resolve.
@@ -437,7 +438,13 @@ fn walk_members<'t>(
             }
             for sup in &td.supers {
                 if let Some(sd) = ctx.table.get(sup) {
-                    walk_members(&ResolvedType::InProject(sd.clone()), ctx, static_only, acc, depth + 1);
+                    walk_members(
+                        &ResolvedType::InProject(sd.clone()),
+                        ctx,
+                        static_only,
+                        acc,
+                        depth + 1,
+                    );
                 } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
                     walk_members(
                         &ResolvedType::External {
@@ -468,7 +475,8 @@ fn walk_members<'t>(
                 // type arguments (e.g. `add({0})` + `[String]` → `add(String)`).
                 if acc.seen.insert(m.signature.clone()) {
                     let signature = display_signature(&m, args, &class.type_params);
-                    acc.out.push(HierMember::External(ExternalMember { signature, ..m }));
+                    acc.out
+                        .push(HierMember::External(ExternalMember { signature, ..m }));
                 }
             }
             // Supertype members render erased (parameterized-super args untracked).
@@ -568,7 +576,10 @@ fn diag_walk(
                     );
                 } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
                     diag_walk(
-                        &ResolvedType::External { fqn, args: Vec::new() },
+                        &ResolvedType::External {
+                            fqn,
+                            args: Vec::new(),
+                        },
                         ctx,
                         names,
                         complete,
@@ -592,7 +603,10 @@ fn diag_walk(
                     }
                     for sup in class.supers {
                         diag_walk(
-                            &ResolvedType::External { fqn: sup, args: Vec::new() },
+                            &ResolvedType::External {
+                                fqn: sup,
+                                args: Vec::new(),
+                            },
                             ctx,
                             names,
                             complete,
@@ -651,8 +665,7 @@ pub(crate) fn collect_bindings<'t>(
         match n.kind() {
             "block" | "constructor_body" | "switch_block" => {
                 for child in named_children(n) {
-                    if child.start_byte() < cursor && child.kind() == "local_variable_declaration"
-                    {
+                    if child.start_byte() < cursor && child.kind() == "local_variable_declaration" {
                         push_locals(child, source, &mut out);
                     }
                 }

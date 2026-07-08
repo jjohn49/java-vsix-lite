@@ -119,7 +119,10 @@ mod tests {
 
     fn diags(src: &str, symbols: &dyn SymbolSource) -> Vec<String> {
         let tree = parse(&mut new_parser(), src, None).unwrap();
-        let docs = [OpenDoc { source: src, tree: &tree }];
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         member_diagnostics(&docs, 0, &index, symbols)
             .into_iter()
@@ -155,7 +158,10 @@ mod tests {
         let src = "import x.Base;\n\
                    class Box extends Base { }\n\
                    class C { void m() { Box b; b.nope(); } }\n";
-        assert!(diags(src, &ObjectAware(vec![])).is_empty(), "unknown super must mute");
+        assert!(
+            diags(src, &ObjectAware(vec![])).is_empty(),
+            "unknown super must mute"
+        );
     }
 
     #[test]
@@ -170,6 +176,9 @@ mod tests {
         let symbols = ObjectAware(vec![("a.Widget", vec!["java.lang.Object"], vec!["spin"])]);
         let msgs = diags(src, &symbols);
         assert!(msgs.iter().any(|m| m.contains("nope")), "{msgs:?}");
-        assert!(!msgs.iter().any(|m| m.contains("spin")), "spin is real: {msgs:?}");
+        assert!(
+            !msgs.iter().any(|m| m.contains("spin")),
+            "spin is real: {msgs:?}"
+        );
     }
 }

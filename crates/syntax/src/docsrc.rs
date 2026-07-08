@@ -36,7 +36,10 @@ fn find_type<'t>(root: Node<'t>, source: &str, simple: &str) -> Option<Node<'t>>
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if is_type_decl(node.kind())
-            && node.child_by_field_name("name").map(|n| node_text(n, source)) == Some(simple)
+            && node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                == Some(simple)
         {
             return Some(node);
         }
@@ -73,7 +76,8 @@ fn find_member_decl<'t>(type_node: Node<'t>, source: &str, name: &str) -> Option
 }
 
 fn named_field<'a>(node: Node, source: &'a str) -> Option<&'a str> {
-    node.child_by_field_name("name").map(|n| node_text(n, source))
+    node.child_by_field_name("name")
+        .map(|n| node_text(n, source))
 }
 
 #[cfg(test)]

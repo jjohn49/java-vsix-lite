@@ -74,7 +74,11 @@ pub fn hover(
 /// The identifier-like node at the cursor, if any.
 fn identifier_at<'t>(tree: &'t Tree, cursor: usize) -> Option<Node<'t>> {
     let node = resolve::node_at(tree, cursor);
-    matches!(node.kind(), "identifier" | "type_identifier" | "this" | "super").then_some(node)
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "this" | "super"
+    )
+    .then_some(node)
 }
 
 /// Resolve the identifier node to what hover should render. Handles declaration
@@ -125,9 +129,13 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
     }
 
     // Plain reference: a local/param/field, then an in-project type name.
-    if let Some(binding) =
-        resolve::lookup_binding(ctx.doc.tree, ctx.doc.source, name_node.start_byte(), name, ctx.table)
-    {
+    if let Some(binding) = resolve::lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        name_node.start_byte(),
+        name,
+        ctx.table,
+    ) {
         return Some(Target::InProject(binding.decl_node, binding.source));
     }
     ctx.table
@@ -142,11 +150,7 @@ fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     }
 }
 
-fn member_target<'t>(
-    resolved: &Resolved<'t>,
-    ctx: &Ctx<'_, 't>,
-    name: &str,
-) -> Option<Target<'t>> {
+fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> Option<Target<'t>> {
     match resolve::find_member_hier(resolved, ctx, name)? {
         HierMember::InProject(m) => Some(Target::InProject(m.node, m.source)),
         HierMember::External(m) => {

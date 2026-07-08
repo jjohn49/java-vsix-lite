@@ -348,11 +348,27 @@ mod generic_tests {
     #[test]
     fn arraylist_add_get_have_generic_templates() {
         let cp = Classpath::from_jdk();
-        if cp.is_empty() { return; }
+        if cp.is_empty() {
+            return;
+        }
         let al = cp.class("java.util.ArrayList").unwrap();
         assert_eq!(al.type_params, vec!["E".to_string()]);
-        let t = |n: &str| al.members.iter().find(|m| m.name==n).and_then(|m| m.template.clone());
-        assert_eq!(t("add").as_deref(), Some("boolean add({0})"), "all add templates: {:?}", al.members.iter().filter(|m|m.name=="add").map(|m|(&m.signature,&m.template)).collect::<Vec<_>>());
+        let t = |n: &str| {
+            al.members
+                .iter()
+                .find(|m| m.name == n)
+                .and_then(|m| m.template.clone())
+        };
+        assert_eq!(
+            t("add").as_deref(),
+            Some("boolean add({0})"),
+            "all add templates: {:?}",
+            al.members
+                .iter()
+                .filter(|m| m.name == "add")
+                .map(|m| (&m.signature, &m.template))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(t("get").as_deref(), Some("{0} get(int)"));
     }
 }

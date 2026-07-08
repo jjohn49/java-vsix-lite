@@ -12,10 +12,18 @@ const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 /// exist in the Gradle cache.
 pub(crate) fn dependency_jars(root: &Path, gradle_cache: &Path) -> Vec<PathBuf> {
     let mut coords = Vec::new();
-    for name in ["build.gradle", "build.gradle.kts", "gradle/libs.versions.toml"] {
+    for name in [
+        "build.gradle",
+        "build.gradle.kts",
+        "gradle/libs.versions.toml",
+    ] {
         let path = root.join(name);
         // Bound the read by file size before reading it into memory.
-        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) > MAX_BUILD_BYTES as u64 {
+        if std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > MAX_BUILD_BYTES as u64
+        {
             continue;
         }
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -119,7 +127,11 @@ mod tests {
                 testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
             }"#;
         let found = coords(build);
-        assert!(found.contains(&("com.google.guava".into(), "guava".into(), "33.0.0-jre".into())));
+        assert!(found.contains(&(
+            "com.google.guava".into(),
+            "guava".into(),
+            "33.0.0-jre".into()
+        )));
         assert!(found.contains(&(
             "org.apache.commons".into(),
             "commons-lang3".into(),

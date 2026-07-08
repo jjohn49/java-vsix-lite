@@ -18,12 +18,62 @@ use crate::{LineIndex, OpenDoc};
 
 /// Java reserved words + literals offered in scope completion.
 const KEYWORDS: &[&str] = &[
-    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "continue",
-    "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "if",
-    "implements", "import", "instanceof", "int", "interface", "long", "native", "new", "package",
-    "private", "protected", "public", "return", "short", "static", "strictfp", "super", "switch",
-    "synchronized", "this", "throw", "throws", "transient", "try", "void", "volatile", "while",
-    "var", "yield", "record", "sealed", "permits", "true", "false", "null",
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "try",
+    "void",
+    "volatile",
+    "while",
+    "var",
+    "yield",
+    "record",
+    "sealed",
+    "permits",
+    "true",
+    "false",
+    "null",
 ];
 
 /// Produce completion items for the cursor position. After a resolvable `.` this
@@ -338,8 +388,16 @@ mod tests {
                    class Derived extends Base { int own; void m() { this.x; } }\n";
         let items = complete(src, "this.");
         assert!(has(&items, "own"), "{:?}", labels(&items));
-        assert!(has(&items, "baseField"), "inherited field {:?}", labels(&items));
-        assert!(has(&items, "baseM"), "inherited method {:?}", labels(&items));
+        assert!(
+            has(&items, "baseField"),
+            "inherited field {:?}",
+            labels(&items)
+        );
+        assert!(
+            has(&items, "baseM"),
+            "inherited method {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
@@ -372,8 +430,16 @@ mod tests {
                    class B { int bOnly; }\n\
                    class C { A v; void m() { B v; v.x; } }\n";
         let items = complete(src, "v.");
-        assert!(has(&items, "bOnly"), "inner type wins: {:?}", labels(&items));
-        assert!(!has(&items, "aOnly"), "outer field shadowed: {:?}", labels(&items));
+        assert!(
+            has(&items, "bOnly"),
+            "inner type wins: {:?}",
+            labels(&items)
+        );
+        assert!(
+            !has(&items, "aOnly"),
+            "outer field shadowed: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
@@ -400,8 +466,16 @@ mod tests {
     fn scope_completion_respects_declaration_order() {
         let src = "class C { void m() { int before = 1; ZZZ; int after = 2; } }\n";
         let items = complete(src, "ZZZ");
-        assert!(has(&items, "before"), "before-cursor local: {:?}", labels(&items));
-        assert!(!has(&items, "after"), "after-cursor local: {:?}", labels(&items));
+        assert!(
+            has(&items, "before"),
+            "before-cursor local: {:?}",
+            labels(&items)
+        );
+        assert!(
+            !has(&items, "after"),
+            "after-cursor local: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
@@ -474,7 +548,11 @@ mod tests {
         let items = complete(src, "Helper.s");
         assert!(has(&items, "S"), "static field: {:?}", labels(&items));
         assert!(has(&items, "sm"), "static method: {:?}", labels(&items));
-        assert!(!has(&items, "inst"), "instance member excluded: {:?}", labels(&items));
+        assert!(
+            !has(&items, "inst"),
+            "instance member excluded: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
@@ -482,8 +560,16 @@ mod tests {
         let src = "interface Sized { int MAX = 10; int size(); }\n\
                    class C implements Sized { void m() { this.x; } }\n";
         let items = complete(src, "this.");
-        assert!(has(&items, "MAX"), "interface constant: {:?}", labels(&items));
-        assert!(has(&items, "size"), "interface method: {:?}", labels(&items));
+        assert!(
+            has(&items, "MAX"),
+            "interface constant: {:?}",
+            labels(&items)
+        );
+        assert!(
+            has(&items, "size"),
+            "interface method: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
@@ -638,7 +724,11 @@ mod tests {
             ),
         ]);
         let items = complete_ext(src, "this.", &symbols);
-        assert!(has(&items, "add"), "inherited external: {:?}", labels(&items));
+        assert!(
+            has(&items, "add"),
+            "inherited external: {:?}",
+            labels(&items)
+        );
         assert!(has(&items, "toString"), "via Object: {:?}", labels(&items));
     }
 
@@ -678,10 +768,17 @@ mod tests {
             ext_generic_class(
                 &["E"],
                 &[],
-                vec![ext_generic_method("add", "boolean add(Object)", "boolean add({0})")],
+                vec![ext_generic_method(
+                    "add",
+                    "boolean add(Object)",
+                    "boolean add({0})",
+                )],
             ),
         )]);
         // No type args at the use site -> erased signature.
-        assert_eq!(detail_of(&complete_ext(src, "xs.", &symbols), "add"), Some("boolean add(Object)"));
+        assert_eq!(
+            detail_of(&complete_ext(src, "xs.", &symbols), "add"),
+            Some("boolean add(Object)")
+        );
     }
 }

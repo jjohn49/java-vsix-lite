@@ -95,13 +95,13 @@ impl ZipArchive {
         let compressed = read_at(&mut file, data_pos, entry.comp_size as usize)?;
 
         match entry.method {
-            METHOD_STORE => {
-                (compressed.len() == entry.uncomp_size as usize).then_some(compressed)
-            }
+            METHOD_STORE => (compressed.len() == entry.uncomp_size as usize).then_some(compressed),
             METHOD_DEFLATE => {
-                let out =
-                    miniz_oxide::inflate::decompress_to_vec_with_limit(&compressed, MAX_UNCOMPRESSED)
-                        .ok()?;
+                let out = miniz_oxide::inflate::decompress_to_vec_with_limit(
+                    &compressed,
+                    MAX_UNCOMPRESSED,
+                )
+                .ok()?;
                 (out.len() <= MAX_UNCOMPRESSED).then_some(out)
             }
             _ => None,
@@ -133,8 +133,23 @@ fn parse_central_directory(cd: &[u8]) -> HashMap<String, Entry> {
         let extra_len = u16le(cd, p + 30).map(|v| v as usize);
         let comment_len = u16le(cd, p + 32).map(|v| v as usize);
         let local_offset = u32le(cd, p + 42);
-        let (Some(method), Some(comp_size), Some(uncomp_size), Some(name_len), Some(extra_len), Some(comment_len), Some(local_offset)) =
-            (method, comp_size, uncomp_size, name_len, extra_len, comment_len, local_offset)
+        let (
+            Some(method),
+            Some(comp_size),
+            Some(uncomp_size),
+            Some(name_len),
+            Some(extra_len),
+            Some(comment_len),
+            Some(local_offset),
+        ) = (
+            method,
+            comp_size,
+            uncomp_size,
+            name_len,
+            extra_len,
+            comment_len,
+            local_offset,
+        )
         else {
             break;
         };
@@ -173,9 +188,7 @@ fn parse_central_directory(cd: &[u8]) -> HashMap<String, Entry> {
 /// Reject path-traversal / absolute / backslash names (defense in depth — we only
 /// ever look entries up by our own constructed names).
 fn is_unsafe_name(name: &str) -> bool {
-    name.starts_with('/')
-        || name.contains('\\')
-        || name.split('/').any(|seg| seg == "..")
+    name.starts_with('/') || name.contains('\\') || name.split('/').any(|seg| seg == "..")
 }
 
 fn read_at(file: &mut File, pos: u64, len: usize) -> Option<Vec<u8>> {

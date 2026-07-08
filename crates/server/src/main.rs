@@ -157,7 +157,12 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
 /// Walk up from a document's path to the nearest ancestor containing a Maven or
 /// Gradle build file, used as the project root when no workspace folder is set.
 fn derive_project_root(uri: &Uri) -> Option<PathBuf> {
-    const MARKERS: [&str; 4] = ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"];
+    const MARKERS: [&str; 4] = [
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+    ];
     let path = uri.to_file_path()?;
     let mut dir = path.parent();
     while let Some(d) = dir {
@@ -533,8 +538,9 @@ async fn main() {
         .with_ansi(false)
         .with_target(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("JVL_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tower_lsp_server=warn")),
+            tracing_subscriber::EnvFilter::try_from_env("JVL_LOG").unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,tower_lsp_server=warn")
+            }),
         )
         .init();
 

@@ -113,7 +113,9 @@ impl<'t> TypeDecl<'t> {
     /// not a type declaration.
     pub(crate) fn from_node(node: Node<'t>, source: &'t str) -> Option<TypeDecl<'t>> {
         let kind = TypeKind::from_kind(node.kind())?;
-        let name = node.child_by_field_name("name").map(|n| node_text(n, source))?;
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source))?;
         let supers = collect_supers(node, source);
         Some(TypeDecl {
             name,
@@ -381,8 +383,8 @@ impl<'t> TypeTable<'t> {
             return;
         }
         for m in decl.own_members() {
-            let sig = crate::signature::signature(m.node, m.source)
-                .unwrap_or_else(|| m.name.to_string());
+            let sig =
+                crate::signature::signature(m.node, m.source).unwrap_or_else(|| m.name.to_string());
             if seen_sig.insert(sig) {
                 out.push(m);
             }

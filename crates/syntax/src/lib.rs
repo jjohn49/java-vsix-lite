@@ -1048,9 +1048,21 @@ mod tests {
 
         // Package segments are namespaces; the `p` param and `field` are lit at
         // their *usage* sites in `field = p;`, not just their declarations.
-        assert!(labeled.contains(&("com", TT_NAMESPACE)), "package: {labeled:?}");
-        assert!(labeled.contains(&("demo", TT_NAMESPACE)), "package: {labeled:?}");
-        assert!(labeled.contains(&("p", TT_PARAMETER)), "param usage: {labeled:?}");
-        assert!(labeled.contains(&("field", TT_PROPERTY)), "field usage: {labeled:?}");
+        assert!(
+            labeled.contains(&("com", TT_NAMESPACE)),
+            "package: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("demo", TT_NAMESPACE)),
+            "package: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("p", TT_PARAMETER)),
+            "param usage: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("field", TT_PROPERTY)),
+            "field usage: {labeled:?}"
+        );
     }
 }

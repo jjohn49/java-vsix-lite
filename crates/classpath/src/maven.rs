@@ -171,8 +171,14 @@ mod tests {
             </project>"#;
         let deps = parse_dependencies(pom);
         assert!(deps.iter().all(|(_, a, _)| a != "managed"), "{deps:?}");
-        assert!(deps.iter().all(|(_, a, _)| a != "nov"), "version-less skipped");
-        assert!(deps.iter().all(|(_, a, _)| a != "unresolved"), "unresolved skipped");
+        assert!(
+            deps.iter().all(|(_, a, _)| a != "nov"),
+            "version-less skipped"
+        );
+        assert!(
+            deps.iter().all(|(_, a, _)| a != "unresolved"),
+            "unresolved skipped"
+        );
     }
 
     #[test]
