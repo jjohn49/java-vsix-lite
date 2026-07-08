@@ -52,10 +52,10 @@ pub trait SymbolSource {
     /// template. A raw (unparameterized) supertype, or one whose arguments
     /// aren't tracked, is `[]`.
     ///
-    /// Defaults to "nothing tracked" for every entry, so existing
-    /// implementations keep compiling unchanged and inherited members from a
-    /// supertype fall back to today's erased/var-name rendering — the same
-    /// graceful degradation as a raw supertype.
+    /// Defaults to "nothing tracked" for every entry: an implementation that
+    /// doesn't override this (e.g. [`NoSymbols`], test stubs) degrades
+    /// inherited members to erased rendering — the same graceful degradation
+    /// as a raw supertype.
     fn super_type_args(&self, _fqn: &str) -> Vec<Vec<String>> {
         Vec::new()
     }

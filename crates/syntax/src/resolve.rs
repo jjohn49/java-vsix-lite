@@ -1294,4 +1294,40 @@ mod super_type_args_tests {
         let sig = find("test.RawUser", Vec::new(), &RawStub, "get");
         assert_eq!(sig, "Object get()");
     }
+
+    /// Nested arg: `class C<T> extends Base<List<T>>` — the placeholder is
+    /// *embedded* inside a larger rendered supertype-arg string
+    /// (`super_type_args = [["List<{0}>"]]`), so substitution must rewrite
+    /// inside the string, not just match whole-arg placeholders. `Base`
+    /// declares `T head()`; `C<String>` → `List<String> head()`.
+    struct NestedStub;
+    impl SymbolSource for NestedStub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "test.C" => Some(ExternalClass {
+                    supers: vec!["test.Base".to_string()],
+                    type_params: vec!["T".to_string()],
+                    members: Vec::new(),
+                }),
+                "test.Base" => Some(ExternalClass {
+                    supers: Vec::new(),
+                    type_params: vec!["T".to_string()],
+                    members: vec![method("head", "Object head()", "{0} head()")],
+                }),
+                _ => None,
+            }
+        }
+        fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+            match fqn {
+                "test.C" => vec![vec!["List<{0}>".to_string()]],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_member_substitutes_inside_nested_supertype_arg() {
+        let sig = find("test.C", vec!["String".to_string()], &NestedStub, "head");
+        assert_eq!(sig, "List<String> head()");
+    }
 }

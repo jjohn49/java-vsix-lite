@@ -843,6 +843,17 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
         })
     }
 
+    /// Type arguments each supertype entry is instantiated with (index-aligned
+    /// with `class(fqn)?.supers`, `{i}` placeholders over `fqn`'s own type
+    /// params) — the shapes match by design, so this is a straight delegation
+    /// to the classpath crate's `Signature`-attribute parse.
+    fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
+        self.0
+            .class(fqn)
+            .map(|info| info.super_type_args.clone())
+            .unwrap_or_default()
+    }
+
     /// Find a member's Javadoc by walking the type and its supertypes' sources
     /// (a member may be declared in a supertype), first match wins.
     fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {

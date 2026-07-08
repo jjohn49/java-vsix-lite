@@ -450,3 +450,66 @@ fn definition_external_jdk_member_round_trip() {
     let status = child.wait().expect("wait for server exit");
     assert!(status.success(), "server exited with failure: {status:?}");
 }
+
+/// M5 (5.3b): parameterized-supertype type arguments flow through the real
+/// classpath into inherited-member hover, end to end. `ArrayList<String>`
+/// does NOT declare `stream()` — it inherits it from `java.util.Collection`
+/// (a default method), so rendering `Stream<String> stream()` proves the
+/// whole chain: `ClassInfo::super_type_args` → `ClasspathSymbols` →
+/// `walk_members`'s substitution mapping. (Hovering `get` would prove
+/// nothing: `ArrayList` declares `get` itself, and direct-member
+/// substitution predates this work.) Skips gracefully (like the definition
+/// round-trip above and `jvl-classpath`'s own JDK-gated tests) if no JDK is
+/// discoverable.
+#[test]
+fn hover_inherited_generic_member_jdk_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///HoverGen.java","languageId":"java","version":1,"text":"import java.util.ArrayList; class H { void m() { new ArrayList<String>().stream(); } }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `stream` in `new ArrayList<String>().stream()` (line 0, char 73).
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///HoverGen.java"},"position":{"line":0,"character":73}}}"#,
+    );
+    let hover = read_until(&mut reader, "\"id\":2", &mut seen);
+
+    if hover.contains("\"result\":null") {
+        // No JDK discoverable in this environment — nothing further to check.
+    } else {
+        assert!(
+            hover.contains("Stream<String> stream()"),
+            "inherited member should substitute the use-site type argument: {hover}"
+        );
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
