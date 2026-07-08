@@ -450,3 +450,119 @@ fn definition_external_jdk_member_round_trip() {
     let status = child.wait().expect("wait for server exit");
     assert!(status.success(), "server exited with failure: {status:?}");
 }
+
+/// M4.5: `workspace/symbol` end-to-end — the lazy, bounded index built on
+/// the first request finds a top-level type declared in an *unopened*
+/// project source file (via the conventional `src/main/java` source root),
+/// with a zero-length 0:0 range (never parsed). Once that same file is
+/// opened, a later query for the same name returns the *live*
+/// `document_symbol`-derived range instead — the open-document-shadows-the-
+/// index behavior.
+#[test]
+fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
+    let root = std::env::temp_dir().join(format!(
+        "jvl-wsym-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let foo_path = src_dir.join("Foo.java");
+    std::fs::write(&foo_path, "package p;\n\npublic class Foo {\n}\n").expect("write Foo.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"workspaceSymbolProvider\":true"),
+        "missing workspaceSymbolProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let foo_uri = format!("file://{}", foo_path.display());
+
+    // 1. `Foo` is never opened -> the first workspace/symbol query builds
+    // the on-disk index and finds it, with a zero-length range at 0:0.
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"Foo"}}"#);
+    let unopened = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        unopened.contains(&foo_uri),
+        "expected a result pointing at {foo_uri}: {unopened}"
+    );
+    assert!(
+        unopened.contains(r#""start":{"character":0,"line":0}"#)
+            && unopened.contains(r#""end":{"character":0,"line":0}"#),
+        "expected a zero-length 0:0 range for the unopened file: {unopened}"
+    );
+
+    // 2. Camel-hump query: "Fo" alone also matches (substring), and "F" would
+    // too, but exercise the documented camel-hump rule with a query that
+    // isn't a plain substring is covered by the module's own unit tests;
+    // here just confirm a case-insensitive substring query also finds it.
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/symbol","params":{"query":"foo"}}"#);
+    let ci = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        ci.contains(&foo_uri),
+        "expected a case-insensitive match for 'foo': {ci}"
+    );
+
+    // 3. A non-matching query returns no results.
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"workspace/symbol","params":{"query":"NoSuchType"}}"#);
+    let none = read_until(&mut reader, "\"id\":4", &mut seen);
+    assert!(
+        none.contains("\"result\":[]"),
+        "expected an empty result for a non-matching query: {none}"
+    );
+
+    // 4. Open `Foo.java` -> a later query must return the *live* range from
+    // `document_symbol` (line 2, char 13 — "Foo" in "public class Foo"),
+    // shadowing the index's zero-length entry for the same path.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"package p;\n\npublic class Foo {{\n}}\n"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(r#"{"jsonrpc":"2.0","id":5,"method":"workspace/symbol","params":{"query":"Foo"}}"#);
+    let shadowed = read_until(&mut reader, "\"id\":5", &mut seen);
+    assert!(
+        shadowed.contains(&foo_uri),
+        "expected a result pointing at {foo_uri}: {shadowed}"
+    );
+    assert!(
+        shadowed.contains(r#""start":{"character":13,"line":2}"#),
+        "expected the live document_symbol range once Foo.java is open: {shadowed}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":6,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":6", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

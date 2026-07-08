@@ -16,7 +16,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+mod workspace_index;
+
+use std::collections::{HashMap, HashSet};
 use std::ops::Range as StdRange;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -88,6 +90,12 @@ struct Backend {
     /// through the `jvl-src:` virtual document scheme. Keyed by FQN. Never
     /// held across an `.await`.
     external_stub_cache: StdMutex<HashMap<String, Arc<String>>>,
+    /// M4.5: the lazy, bounded workspace symbol index (built on the first
+    /// `workspace/symbol` request, not at startup).
+    workspace_index: workspace_index::WorkspaceIndex,
+    /// Whether [`workspace_index`]'s cap-truncation has already been logged
+    /// to the client — logged once, not on every subsequent query.
+    workspace_index_truncation_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Backend {
@@ -104,6 +112,8 @@ impl Backend {
             unresolved_member_diagnostics: OnceLock::new(),
             project_file_cache: StdMutex::new(HashMap::new()),
             external_stub_cache: StdMutex::new(HashMap::new()),
+            workspace_index: workspace_index::WorkspaceIndex::new(),
+            workspace_index_truncation_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -174,6 +184,15 @@ impl Backend {
             .into_iter()
             .map(|source_root| source_root.join(&rel))
             .collect()
+    }
+
+    /// The lazy, bounded workspace symbol index (see `workspace_index`),
+    /// exposed so another feature in this crate (e.g. a future add-import)
+    /// can do "simple name -> paths" lookups without re-walking the
+    /// workspace itself. Building/rebuilding only happens via `ensure_built`
+    /// (called from the `symbol` handler); this accessor never triggers it.
+    pub(crate) fn workspace_index(&self) -> &workspace_index::WorkspaceIndex {
+        &self.workspace_index
     }
 
     /// Parse (or reuse a cached parse of) a single project source file for
@@ -415,6 +434,14 @@ fn extract_package(tree: &Tree, source: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// An open document's URI (its `HashMap` key) as a filesystem path, or
+/// `None` for a non-`file:` URI (e.g. an in-memory/untitled document) — such
+/// documents simply can't shadow anything in the on-disk workspace index.
+fn open_doc_path(uri: &str) -> Option<PathBuf> {
+    let uri: Uri = uri.parse().ok()?;
+    Some(uri.to_file_path()?.into_owned())
+}
+
 /// Whether every dotted segment of a fully-qualified name is a safe, single
 /// path component — guards ladder step (c)'s file lookup against a crafted
 /// `package`/`import` declaration escaping the inferred source root (e.g. a
@@ -540,6 +567,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -668,6 +696,127 @@ impl LanguageServer for Backend {
         let index = LineIndex::new(&doc.text, self.encoding());
         let symbols = jvl_syntax::document_symbols(&doc.tree, &doc.text, &index);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    /// M4.5: `workspace/symbol` over the lazy, bounded workspace index (see
+    /// `workspace_index`), built here on the first request. Query matching
+    /// is case-insensitive substring or camel-hump prefix (see
+    /// `workspace_index::matches_query`). Open documents are looked up live
+    /// via `jvl_syntax::document_symbols` (a real parse, so more precise)
+    /// and shadow whatever the index says about that same file, rather than
+    /// being merged with it.
+    ///
+    /// Locations for entries the index found on disk (i.e. never opened)
+    /// use a zero-length range at 0:0 — resolving the exact name range would
+    /// require parsing the file, which is exactly what the index avoids;
+    /// VS Code jumps to the top of the file, and opening it makes precise,
+    /// live symbols (and later queries) reflect the real position.
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        let query = params.query;
+
+        // Compute the source roots (needs a peek at open documents, for the
+        // package-inferred ones) and release the lock *before* the
+        // potentially slow disk walk in `ensure_built`, so a concurrent
+        // `didOpen`/`didChange` isn't blocked on it.
+        let project_root = self.project_root();
+        let roots = {
+            let docs = self.documents.lock().await;
+            project_root
+                .as_deref()
+                .map(|root| self.source_roots(&docs, root))
+                .unwrap_or_default()
+        };
+        self.workspace_index()
+            .ensure_built(&roots, project_root.as_deref())
+            .await;
+        tracing::debug!(
+            entries = self.workspace_index().len(),
+            generation = self.workspace_index().generation(),
+            "workspace symbol index ready"
+        );
+
+        if self.workspace_index().truncated()
+            && self
+                .workspace_index_truncation_logged
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "workspace symbol index truncated at its entry cap; some results may be missing",
+                )
+                .await;
+        }
+
+        // Open documents shadow the index for the same path: their symbols
+        // come live from a real parse, and their path is excluded from the
+        // index's (possibly-stale, name-only) results below.
+        let docs = self.documents.lock().await;
+        let mut results = Vec::new();
+        let mut shadowed_paths = HashSet::new();
+        for (uri, doc) in docs.iter() {
+            let Some(path) = open_doc_path(uri) else {
+                continue;
+            };
+            shadowed_paths.insert(path.clone());
+            let Some(uri) = Uri::from_file_path(&path) else {
+                continue;
+            };
+            let index = LineIndex::new(&doc.text, self.encoding());
+            // Only the top-level Vec entries are top-level type
+            // declarations (Java allows only types at a file's root); each
+            // one's own children (methods/fields/nested types) are
+            // intentionally not flattened in here, matching the on-disk
+            // index's top-level-types-only scope.
+            for symbol in jvl_syntax::document_symbols(&doc.tree, &doc.text, &index) {
+                if !workspace_index::matches_query(&query, &symbol.name) {
+                    continue;
+                }
+                results.push(WorkspaceSymbol {
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    tags: None,
+                    container_name: None,
+                    location: OneOf::Left(Location {
+                        uri: uri.clone(),
+                        range: symbol.selection_range,
+                    }),
+                    data: None,
+                });
+            }
+        }
+
+        for entry in self.workspace_index().matching(&query) {
+            if shadowed_paths.contains(&entry.path) {
+                continue;
+            }
+            let Some(uri) = Uri::from_file_path(&entry.path) else {
+                continue;
+            };
+            results.push(WorkspaceSymbol {
+                name: entry.simple_name,
+                kind: entry.kind,
+                tags: None,
+                container_name: (!entry.package.is_empty()).then_some(entry.package),
+                // Zero-length range at 0:0 — see the doc comment above.
+                location: OneOf::Left(Location {
+                    uri,
+                    range: Range::default(),
+                }),
+                data: None,
+            });
+        }
+
+        Ok(Some(WorkspaceSymbolResponse::Nested(results)))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
