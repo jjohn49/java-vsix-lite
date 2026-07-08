@@ -35,6 +35,16 @@ pub struct ClassInfo {
     /// Formal type-parameter names, e.g. `["E"]` for `ArrayList<E>`.
     pub type_params: Vec<String>,
     pub members: Vec<Member>,
+    /// Type arguments applied to each entry of `supers` (index-aligned:
+    /// superclass, then interfaces, in that order), from the class's own
+    /// `Signature` attribute — e.g. for `class MyList extends
+    /// AbstractList<String>`, `super_type_args[0]` is `["String"]`. An
+    /// argument that is one of *this* class's own type parameters renders as
+    /// a `{i}` placeholder (as in [`Member::template`]), so a caller can
+    /// substitute inherited-member templates through the hierarchy from a
+    /// use-site instantiation. Empty for a non-generic supertype entry, or
+    /// when there's no `Signature` attribute / it fails to parse.
+    pub super_type_args: Vec<Vec<String>>,
 }
 
 /// One member of a class: a method or field.
@@ -404,5 +414,96 @@ mod generic_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(t("get").as_deref(), Some("{0} get(int)"));
+    }
+
+    #[test]
+    fn map_put_template_has_two_slots() {
+        let cp = Classpath::from_jdk();
+        if cp.is_empty() {
+            return;
+        }
+        let map = cp.class("java.util.Map").unwrap();
+        assert_eq!(map.type_params, vec!["K".to_string(), "V".to_string()]);
+        let put = map
+            .members
+            .iter()
+            .find(|m| m.name == "put")
+            .and_then(|m| m.template.clone());
+        assert_eq!(put.as_deref(), Some("{1} put({0}, {1})"));
+    }
+
+    /// `ArrayList<E>`'s Signature attribute parameterizes its supertypes
+    /// (`AbstractList<E>`, `List<E>`) with ArrayList's own type parameter, and
+    /// leaves its non-generic ones (`RandomAccess`, `Cloneable`,
+    /// `Serializable`) with no extra info — `super_type_args` is index-aligned
+    /// with `supers` (superclass, then interfaces, in declaration order).
+    #[test]
+    fn arraylist_super_type_args_map_e_across_hierarchy() {
+        let cp = Classpath::from_jdk();
+        if cp.is_empty() {
+            return;
+        }
+        let al = cp.class("java.util.ArrayList").unwrap();
+        assert_eq!(al.supers.len(), al.super_type_args.len());
+        let by_super = |fqn: &str| -> Option<&Vec<String>> {
+            al.supers
+                .iter()
+                .position(|s| s == fqn)
+                .map(|i| &al.super_type_args[i])
+        };
+        assert_eq!(
+            by_super("java.util.AbstractList"),
+            Some(&vec!["{0}".to_string()]),
+            "supers: {:?}, super_type_args: {:?}",
+            al.supers,
+            al.super_type_args
+        );
+        assert_eq!(by_super("java.util.List"), Some(&vec!["{0}".to_string()]));
+        // Non-generic interfaces: present, with no type arguments.
+        for plain in ["java.util.RandomAccess", "java.lang.Cloneable"] {
+            assert_eq!(
+                by_super(plain),
+                Some(&Vec::new()),
+                "expected no super_type_args for {plain}"
+            );
+        }
+    }
+
+    /// End-to-end proof that `Member::template` + `ClassInfo::type_params`
+    /// carry enough structured information for a caller to substitute a real
+    /// use-site instantiation — mirroring (without depending on) the
+    /// `{i}`-placeholder substitution `crates/syntax`'s hover/completion path
+    /// performs today.
+    #[test]
+    fn template_substitution_end_to_end_list_of_string() {
+        let cp = Classpath::from_jdk();
+        if cp.is_empty() {
+            return;
+        }
+        let list = cp.class("java.util.List").unwrap();
+        assert_eq!(list.type_params, vec!["E".to_string()]);
+        let get_template = list
+            .members
+            .iter()
+            .find(|m| m.name == "get")
+            .and_then(|m| m.template.clone())
+            .expect("List.get has a generic template");
+
+        // `List<String>` instantiation: substitute {0} -> "String".
+        let args = ["String".to_string()];
+        let rendered = substitute_placeholders(&get_template, &args);
+        assert_eq!(rendered, "String get(int)");
+    }
+
+    /// Minimal `{i}` → argument substitution, standing in for the real
+    /// substitution logic living in `crates/syntax::resolve` (out of scope for
+    /// this crate) — exists only to prove the classpath crate's templates are
+    /// sufficient to perform it.
+    fn substitute_placeholders(template: &str, args: &[String]) -> String {
+        let mut out = template.to_string();
+        for (i, arg) in args.iter().enumerate() {
+            out = out.replace(&format!("{{{i}}}"), arg);
+        }
+        out
     }
 }
