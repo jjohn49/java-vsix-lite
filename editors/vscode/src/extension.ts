@@ -56,6 +56,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.registerTextDocumentContentProvider("jvl-src", new ExternalSourceProvider()),
   );
 
+  // VS Code normally infers the `java` language id from the `.java` extension
+  // in a jvl-src URI's path, but that inference is what the documentSelector
+  // match (and thus server sync) hinges on — pin it explicitly so the virtual
+  // docs always reach the server regardless of detection quirks.
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (doc.uri.scheme === "jvl-src" && doc.languageId !== "java") {
+        void vscode.languages.setTextDocumentLanguage(doc, "java");
+      }
+    }),
+  );
+
   await start(context);
 }
 
@@ -136,7 +148,14 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   };
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: "file", language: "java" }],
+    // `jvl-src` is included so the virtual documents served by
+    // ExternalSourceProvider are synced to the server too — hover, further
+    // go-to-definition, and semantic tokens keep working while browsing
+    // external/JDK source.
+    documentSelector: [
+      { scheme: "file", language: "java" },
+      { scheme: "jvl-src", language: "java" },
+    ],
     outputChannelName: "java-vsix-lite",
     initializationOptions: {
       unresolvedMemberDiagnostics: vscode.workspace
