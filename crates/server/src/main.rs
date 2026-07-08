@@ -80,7 +80,7 @@ struct Backend {
     /// Fallback project root derived from the first opened document (so deps
     /// resolve even when a lone file is opened with no workspace folder).
     project_root_hint: OnceLock<Option<PathBuf>>,
-    /// Whether to emit unresolved-member diagnostics (opt-in; default off).
+    /// Whether to emit unresolved-member diagnostics (default on; opt-out).
     unresolved_member_diagnostics: OnceLock<bool>,
     /// Ladder step (c): a single unopened project source file, parsed on
     /// demand and cached by path (see [`CachedProjectFile`]). Never held
@@ -341,7 +341,7 @@ impl Backend {
     }
 
     /// Syntax diagnostics for a document already stored under `uri`, plus
-    /// unresolved-member diagnostics when that opt-in setting is enabled.
+    /// unresolved-member diagnostics unless that setting has been turned off.
     fn compute_diagnostics(&self, docs: &HashMap<String, Document>, uri: &str) -> Vec<Diagnostic> {
         let Some(doc) = docs.get(uri) else {
             return Vec::new();
@@ -514,14 +514,18 @@ fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Range {
     }
 }
 
-/// The opt-in `unresolvedMemberDiagnostics` flag from `initializationOptions`.
+/// The `unresolvedMemberDiagnostics` flag from `initializationOptions`.
+/// Default-on (M5.6): the diagnostic itself (`member_diagnostics`) is
+/// conservative and stays silent whenever resolution is incomplete, so this
+/// flag exists only for a user who wants to opt back out, not to gate an
+/// otherwise-risky feature.
 fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
     params
         .initialization_options
         .as_ref()
         .and_then(|opts| opts.get("unresolvedMemberDiagnostics"))
         .and_then(|value| value.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.
@@ -1342,4 +1346,42 @@ async fn main() {
         .custom_method("jvl/externalSource", Backend::external_source)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M5.6: with no `initializationOptions` at all, unresolved-member
+    /// diagnostics must default to **on** (the conservative gating inside
+    /// `member_diagnostics` is what keeps this safe, not this flag).
+    #[test]
+    fn unresolved_member_diagnostics_defaults_to_true_when_absent() {
+        let params = InitializeParams::default();
+        assert!(unresolved_member_diagnostics_opt(&params));
+    }
+
+    /// An explicit `false` (the user opting back out) must still be honored.
+    #[test]
+    fn unresolved_member_diagnostics_respects_explicit_false() {
+        let params = InitializeParams {
+            initialization_options: Some(
+                serde_json::json!({ "unresolvedMemberDiagnostics": false }),
+            ),
+            ..Default::default()
+        };
+        assert!(!unresolved_member_diagnostics_opt(&params));
+    }
+
+    /// An explicit `true` is, of course, still `true`.
+    #[test]
+    fn unresolved_member_diagnostics_respects_explicit_true() {
+        let params = InitializeParams {
+            initialization_options: Some(
+                serde_json::json!({ "unresolvedMemberDiagnostics": true }),
+            ),
+            ..Default::default()
+        };
+        assert!(unresolved_member_diagnostics_opt(&params));
+    }
 }
