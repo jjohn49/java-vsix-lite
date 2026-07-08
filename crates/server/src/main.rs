@@ -552,6 +552,13 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec![".".to_string()]),
                     ..Default::default()
                 }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    // `(` opens a call's signature help; `,` re-triggers it as
+                    // the user moves to the next argument.
+                    trigger_characters: Some(vec!["(".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    ..Default::default()
+                }),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -716,6 +723,23 @@ impl LanguageServer for Backend {
         let index = LineIndex::new(&current.text, self.encoding());
         let symbols = ClasspathSymbols(self.classpath());
         Ok(jvl_syntax::hover(&open, 0, &index, position, &symbols))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(current) = docs.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        // Same plumbing as hover: cursor's document plus every other open
+        // document, for cross-file overload resolution. All synchronous.
+        let open = open_docs(&docs, uri.as_str(), current);
+        let index = LineIndex::new(&current.text, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        Ok(jvl_syntax::signature_help(
+            &open, 0, &index, position, &symbols,
+        ))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {

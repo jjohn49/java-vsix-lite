@@ -212,6 +212,31 @@ impl<'t> TypeDecl<'t> {
         }
         out
     }
+
+    /// This type's directly-declared constructors (never inherited — Java
+    /// constructors aren't members of the [`Member`]/`MemberKind` model since
+    /// completion/hover never need to list them; signature help does, for
+    /// `new Foo(...)` calls).
+    pub(crate) fn constructors(&self) -> Vec<Node<'t>> {
+        let mut out = Vec::new();
+        if let Some(body) = self.body() {
+            collect_constructors(body, &mut out);
+        }
+        out
+    }
+}
+
+/// Walk a type body, pushing each declared constructor (descending into the
+/// `enum_body_declarations` wrapper the same way [`collect_body_members`]
+/// does for methods/fields).
+fn collect_constructors<'t>(body: Node<'t>, out: &mut Vec<Node<'t>>) {
+    for child in named_children(body) {
+        match child.kind() {
+            "constructor_declaration" => out.push(child),
+            "enum_body_declarations" => collect_constructors(child, out),
+            _ => {}
+        }
+    }
 }
 
 /// Extract supertype simple names from `extends`/`implements` clauses.

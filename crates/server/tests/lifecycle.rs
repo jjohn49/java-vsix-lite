@@ -175,6 +175,67 @@ fn lifecycle_smoke() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
+/// M4.2: `textDocument/signatureHelp` end-to-end — a call site with two
+/// in-project overloads (`helper(int)` / `helper(int, int)`) returns both
+/// signatures, with `activeParameter` correctly picking out the second
+/// argument (one comma precedes the cursor).
+#[test]
+fn signature_help_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"signatureHelpProvider\""),
+        "missing signatureHelpProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // Line 3, "  void m() { helper(1, 2); }" — character 23 is the `2` in
+    // `helper(1, 2)`, one comma past the open paren.
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Sig.java","languageId":"java","version":1,"text":"class Sample {\n  void helper(int a) {}\n  void helper(int a, int b) {}\n  void m() { helper(1, 2); }\n}\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":"file:///Sig.java"},"position":{"line":3,"character":23}}}"#,
+    );
+    let help = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        help.contains("helper(int a)") && help.contains("helper(int a, int b)"),
+        "expected both overloads: {help}"
+    );
+    assert!(
+        help.contains("\"activeParameter\":1"),
+        "expected activeParameter 1 (second argument): {help}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
 /// M4.1: `textDocument/definition` end-to-end, ladder step (b) — a
 /// cross-document member call (`this.methodFromA()` in an open doc `B` that
 /// extends an open doc `A`) resolves into `A`, at `methodFromA`'s name.

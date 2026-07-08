@@ -179,8 +179,17 @@ fn clause_types(clause: Node, source: &str) -> String {
 
 /// Render the `formal_parameters` of a method/constructor as `type name, …`.
 fn parameters(node: Node, source: &str) -> String {
+    param_labels(node, source).join(", ")
+}
+
+/// Each parameter's rendered label (`type name`), in declaration order — the
+/// same per-parameter rendering [`parameters`] joins into a method/constructor
+/// signature. Exposed (rather than folded into `parameters`' `String` return)
+/// for signature help, which needs each parameter's own byte span within the
+/// full label to drive LSP's per-parameter highlight.
+pub(crate) fn param_labels(node: Node, source: &str) -> Vec<String> {
     let Some(params) = node.child_by_field_name("parameters") else {
-        return String::new();
+        return Vec::new();
     };
     named_children(params)
         .into_iter()
@@ -191,8 +200,34 @@ fn parameters(node: Node, source: &str) -> String {
             )
         })
         .map(|p| param_signature(p, source))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
+}
+
+/// A method/constructor declaration's rendered label plus each parameter's
+/// `[start, end)` byte offsets within that label, for LSP signature help's
+/// per-parameter highlight. `None` if `node` isn't a signature-renderable
+/// declaration (see [`signature`]).
+///
+/// Offsets are found by searching the label for each parameter's own
+/// rendering, in order, starting from just past the previous match — so a
+/// parameter list with repeated types/names (`(int a, int a)`, or a name that
+/// recurs in a later parameter's type) still lines up left-to-right instead of
+/// all collapsing onto the first occurrence.
+pub(crate) fn signature_with_param_offsets(
+    node: Node,
+    source: &str,
+) -> Option<(String, Vec<[u32; 2]>)> {
+    let label = signature(node, source)?;
+    let mut offsets = Vec::new();
+    let mut search_from = 0usize;
+    for param in param_labels(node, source) {
+        let idx = label[search_from..].find(param.as_str())?;
+        let start = search_from + idx;
+        let end = start + param.len();
+        offsets.push([start as u32, end as u32]);
+        search_from = end;
+    }
+    Some((label, offsets))
 }
 
 fn throws_clause(node: Node, source: &str) -> Option<String> {
