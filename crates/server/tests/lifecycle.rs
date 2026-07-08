@@ -554,6 +554,11 @@ fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
         shadowed.contains(r#""start":{"character":13,"line":2}"#),
         "expected the live document_symbol range once Foo.java is open: {shadowed}"
     );
+    assert!(
+        !shadowed.contains(r#""start":{"character":0,"line":0}"#),
+        "the stale zero-position index entry for {foo_uri} must not still appear once the \
+         doc is open — shadowing must replace it, not append alongside it: {shadowed}"
+    );
 
     send(r#"{"jsonrpc":"2.0","id":6,"method":"shutdown"}"#);
     let _ = read_until(&mut reader, "\"id\":6", &mut seen);

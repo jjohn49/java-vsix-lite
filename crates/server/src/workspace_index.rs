@@ -30,7 +30,7 @@
 //! is always more precise (a real parse) and must shadow whatever the index
 //! says about that same file; see the `symbol` handler in `main.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -233,6 +233,18 @@ async fn walk_root(
     let mut truncated = false;
     let mut stack = vec![root.to_path_buf()];
     let mut since_yield = 0usize;
+    // Canonical directory paths already walked: a symlink inside the root
+    // that points at a sibling directory (already-visited or not-yet-visited
+    // — either way, the same canonical target) would otherwise index its
+    // contents twice, and one pointing at an ancestor would re-walk the same
+    // subtree indefinitely (bounded only by `cap`, and filling the index
+    // with duplicates before hitting it). Recording the canonical path here
+    // — already computed for the boundary check below — and skipping an
+    // already-seen one closes both holes.
+    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+    if let Ok(root_canon) = fs::canonicalize(root) {
+        visited_dirs.insert(root_canon);
+    }
 
     while let Some(dir) = stack.pop() {
         if entries.len() >= cap {
@@ -268,6 +280,12 @@ async fn walk_root(
             }
 
             if canon.is_dir() {
+                if !visited_dirs.insert(canon) {
+                    // Already-walked canonical directory: a same-root
+                    // sibling symlink (would duplicate every file under it)
+                    // or an ancestor symlink (would cycle). Skip either way.
+                    continue;
+                }
                 stack.push(path);
             } else if name_str.ends_with(".java") {
                 if let Some(entry) = index_file(&path) {
@@ -607,6 +625,62 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&secret_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_symlink_inside_root_indexes_each_file_once() {
+        let root = temp_dir("symlink-sibling");
+        write(&root, "real/Foo.java", "class Foo {}\n");
+
+        // A symlink inside the root pointing at another in-boundary
+        // directory: without de-duplication by canonical path, every file
+        // under `real` would be indexed a second time via `alias`.
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias"))
+            .expect("create in-boundary sibling symlink");
+
+        let index = WorkspaceIndex::new();
+        built(&index, std::slice::from_ref(&root), &root).await;
+
+        assert_eq!(
+            index.len(),
+            1,
+            "Foo.java must be indexed exactly once despite the sibling symlink"
+        );
+        let foo = index.matching("Foo");
+        assert_eq!(foo.len(), 1, "no duplicate entries for Foo");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ancestor_symlink_cycle_terminates_without_duplicates_or_truncation() {
+        let root = temp_dir("symlink-cycle");
+        write(&root, "src/Foo.java", "class Foo {}\n");
+
+        // A symlink under `src` pointing back at an ancestor (`root`)
+        // creates a cycle: without visited-dir tracking the walk would
+        // re-descend into `src` (and back into the cycle) until the cap
+        // stopped it, filling the index with duplicates and reporting
+        // spurious truncation for what is really a tiny workspace.
+        std::os::unix::fs::symlink(&root, root.join("src/back-to-root"))
+            .expect("create ancestor symlink cycle");
+
+        let index = WorkspaceIndex::new();
+        built(&index, std::slice::from_ref(&root), &root).await;
+
+        assert_eq!(
+            index.len(),
+            1,
+            "the cycle must not produce duplicate entries for Foo"
+        );
+        assert!(
+            !index.truncated(),
+            "a tiny workspace with a symlink cycle must not report truncation"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
