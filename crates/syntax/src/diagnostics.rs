@@ -26,6 +26,7 @@ pub fn member_diagnostics(
     let imports = Imports::parse(doc.tree, doc.source);
     let ctx = Ctx {
         doc,
+        current,
         table: &table,
         imports: &imports,
         symbols,

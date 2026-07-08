@@ -9,7 +9,9 @@ use tree_sitter::{Node, Tree};
 
 use crate::external::{ExternalMember, SymbolSource};
 use crate::imports::Imports;
-use crate::model::{base_type_name, named_children, Member, MemberKind, TypeDecl, TypeTable};
+use crate::model::{
+    base_type_name, named_children, DeclSite, Member, MemberKind, TypeDecl, TypeTable,
+};
 use crate::{node_text, OpenDoc};
 
 /// Depth cap for receiver/path resolution — real receiver chains are a handful
@@ -21,6 +23,11 @@ const MAX_RESOLVE_DEPTH: usize = 64;
 /// the file's imports, and the external symbol source (JDK/deps).
 pub(crate) struct Ctx<'a, 't> {
     pub doc: &'a OpenDoc<'t>,
+    /// Index of `doc` in the `&[OpenDoc]` slice `table` was built from — needed
+    /// to stamp a [`DeclSite`] on bindings/types declared in `doc` itself (e.g.
+    /// the enclosing type via `this`/`super`), whose site isn't otherwise
+    /// recorded on the node.
+    pub current: usize,
     pub table: &'a TypeTable<'t>,
     pub imports: &'a Imports,
     pub symbols: &'a dyn SymbolSource,
@@ -36,6 +43,38 @@ pub(crate) struct Binding<'t> {
     /// Declaration node, used to render hover signatures.
     pub decl_node: Node<'t>,
     pub source: &'t str,
+    /// Index (into the `&[OpenDoc]` slice `collect_bindings` was called with) of
+    /// the document this binding is declared in. A field binding can name a
+    /// different document than the usage site (inherited from a supertype
+    /// declared elsewhere); locals/params/for-vars are always the current doc.
+    ///
+    /// M4.0 bookkeeping only — read by `decl_site` below, which nothing outside
+    /// tests calls yet (the M4 goto-definition facade is next).
+    #[allow(dead_code)]
+    pub doc: usize,
+}
+
+impl<'t> Binding<'t> {
+    /// Where this binding is declared.
+    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
+    pub(crate) fn decl_site(&self) -> Option<DeclSite> {
+        let name = binding_name_node(self.decl_node)?;
+        Some(DeclSite::new(self.doc, name, self.decl_node))
+    }
+}
+
+/// The name-identifier node of a binding's declaration node. Most binding decl
+/// nodes carry a `name` field (`variable_declarator`, `formal_parameter`,
+/// `enhanced_for_statement`, and the field-origin `Member` node kinds); a bare
+/// lambda parameter's decl node *is* its name (`identifier`); a varargs
+/// parameter's name lives on its nested `variable_declarator`.
+#[allow(dead_code)] // only caller (`Binding::decl_site`) is itself dead_code-allowed
+fn binding_name_node(decl_node: Node) -> Option<Node> {
+    match decl_node.kind() {
+        "identifier" => Some(decl_node),
+        "spread_parameter" => crate::signature::spread_param_name(decl_node),
+        _ => decl_node.child_by_field_name("name"),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,9 +138,13 @@ pub(crate) fn enclosing_type_node<'t>(node: Node<'t>) -> Option<Node<'t>> {
     None
 }
 
-/// The [`TypeDecl`] for the type enclosing `node`.
-pub(crate) fn enclosing_typedecl<'t>(node: Node<'t>, source: &'t str) -> Option<TypeDecl<'t>> {
-    TypeDecl::from_node(enclosing_type_node(node)?, source)
+/// The [`TypeDecl`] for the type enclosing `node`, declared in document `doc`.
+pub(crate) fn enclosing_typedecl<'t>(
+    node: Node<'t>,
+    source: &'t str,
+    doc: usize,
+) -> Option<TypeDecl<'t>> {
+    TypeDecl::from_node(enclosing_type_node(node)?, source, doc)
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -158,11 +201,10 @@ fn resolve_receiver_depth<'t>(
         return None;
     }
     match recv.kind() {
-        "this" => {
-            enclosing_typedecl(recv, ctx.doc.source).map(|td| instance(ResolvedType::InProject(td)))
-        }
+        "this" => enclosing_typedecl(recv, ctx.doc.source, ctx.current)
+            .map(|td| instance(ResolvedType::InProject(td))),
         "super" => {
-            let td = enclosing_typedecl(recv, ctx.doc.source)?;
+            let td = enclosing_typedecl(recv, ctx.doc.source, ctx.current)?;
             let sup = td.supers.first()?;
             resolve_super(sup, ctx).map(instance)
         }
@@ -204,7 +246,14 @@ pub(crate) fn resolve_name_to_type<'t>(
     byte: usize,
     ctx: &Ctx<'_, 't>,
 ) -> Option<Resolved<'t>> {
-    if let Some(binding) = lookup_binding(ctx.doc.tree, ctx.doc.source, byte, name, ctx.table) {
+    if let Some(binding) = lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        byte,
+        name,
+        ctx.table,
+        ctx.current,
+    ) {
         let type_node = binding.type_node?;
         return resolve_type_node(type_node, binding.source, ctx).map(instance);
     }
@@ -376,6 +425,16 @@ impl HierMember<'_> {
         match self {
             HierMember::InProject(m) => m.name,
             HierMember::External(m) => &m.name,
+        }
+    }
+
+    /// Where this member is declared, or `None` for an external (JDK/dependency)
+    /// member — those aren't backed by an open document in this task.
+    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
+    pub(crate) fn decl_site(&self) -> Option<DeclSite> {
+        match self {
+            HierMember::InProject(m) => m.decl_site(),
+            HierMember::External(_) => None,
         }
     }
 }
@@ -657,6 +716,7 @@ pub(crate) fn collect_bindings<'t>(
     cursor: usize,
     table: &TypeTable<'t>,
     include_fields: bool,
+    doc: usize,
 ) -> Vec<Binding<'t>> {
     let mut out = Vec::new();
     let mut node = Some(node_at(tree, cursor));
@@ -666,14 +726,14 @@ pub(crate) fn collect_bindings<'t>(
             "block" | "constructor_body" | "switch_block" => {
                 for child in named_children(n) {
                     if child.start_byte() < cursor && child.kind() == "local_variable_declaration" {
-                        push_locals(child, source, &mut out);
+                        push_locals(child, source, doc, &mut out);
                     }
                 }
             }
             "for_statement" => {
                 if let Some(init) = n.child_by_field_name("init") {
                     if init.kind() == "local_variable_declaration" {
-                        push_locals(init, source, &mut out);
+                        push_locals(init, source, doc, &mut out);
                     }
                 }
             }
@@ -685,13 +745,14 @@ pub(crate) fn collect_bindings<'t>(
                         type_node: n.child_by_field_name("type"),
                         decl_node: n,
                         source,
+                        doc,
                     });
                 }
             }
             "method_declaration"
             | "constructor_declaration"
             | "compact_constructor_declaration"
-            | "lambda_expression" => push_params(n, source, &mut out),
+            | "lambda_expression" => push_params(n, source, doc, &mut out),
             k if is_type_decl(k) => {
                 if enclosing_type.is_none() {
                     enclosing_type = Some(n);
@@ -703,7 +764,7 @@ pub(crate) fn collect_bindings<'t>(
     }
     if include_fields {
         if let Some(type_node) = enclosing_type {
-            if let Some(td) = TypeDecl::from_node(type_node, source) {
+            if let Some(td) = TypeDecl::from_node(type_node, source, doc) {
                 push_fields(&td, table, &mut out);
             }
         }
@@ -711,7 +772,7 @@ pub(crate) fn collect_bindings<'t>(
     out
 }
 
-fn push_locals<'t>(decl: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) {
+fn push_locals<'t>(decl: Node<'t>, source: &'t str, doc: usize, out: &mut Vec<Binding<'t>>) {
     let ty = decl.child_by_field_name("type");
     for declarator in named_children(decl) {
         if declarator.kind() == "variable_declarator" {
@@ -722,13 +783,14 @@ fn push_locals<'t>(decl: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
                     type_node: ty,
                     decl_node: declarator,
                     source,
+                    doc,
                 });
             }
         }
     }
 }
 
-fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) {
+fn push_params<'t>(node: Node<'t>, source: &'t str, doc: usize, out: &mut Vec<Binding<'t>>) {
     let Some(params) = node.child_by_field_name("parameters") else {
         return;
     };
@@ -744,6 +806,7 @@ fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
                                 type_node: p.child_by_field_name("type"),
                                 decl_node: p,
                                 source,
+                                doc,
                             });
                         }
                     }
@@ -758,6 +821,7 @@ fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
                                 kind: BindingKind::Param,
                                 type_node,
                                 decl_node: p,
+                                doc,
                                 source,
                             });
                         }
@@ -775,6 +839,7 @@ fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
                         type_node: None,
                         decl_node: p,
                         source,
+                        doc,
                     });
                 }
             }
@@ -785,11 +850,15 @@ fn push_params<'t>(node: Node<'t>, source: &'t str, out: &mut Vec<Binding<'t>>) 
             type_node: None,
             decl_node: params,
             source,
+            doc,
         }),
         _ => {}
     }
 }
 
+/// Bind each of `td`'s fields (own + inherited). A field's `doc` is the
+/// declaring [`Member`]'s own document — not necessarily `td`'s — since fields
+/// can be inherited from a supertype declared in a different open file.
 fn push_fields<'t>(td: &TypeDecl<'t>, table: &TypeTable<'t>, out: &mut Vec<Binding<'t>>) {
     for m in table.all_members(td, false) {
         if matches!(m.kind, MemberKind::Field | MemberKind::EnumConstant) {
@@ -798,21 +867,167 @@ fn push_fields<'t>(td: &TypeDecl<'t>, table: &TypeTable<'t>, out: &mut Vec<Bindi
                 kind: BindingKind::Field,
                 type_node: field_type_node(m.node),
                 decl_node: m.node,
+                doc: m.doc,
                 source: m.source,
             });
         }
     }
 }
 
-/// Find the innermost binding named `name` visible at `byte`.
+/// Find the innermost binding named `name` visible at `byte`, in document `doc`.
 pub(crate) fn lookup_binding<'t>(
     tree: &'t Tree,
     source: &'t str,
     byte: usize,
     name: &str,
     table: &TypeTable<'t>,
+    doc: usize,
 ) -> Option<Binding<'t>> {
-    collect_bindings(tree, source, byte, table, true)
+    collect_bindings(tree, source, byte, table, true, doc)
         .into_iter()
         .find(|b| b.name == name)
+}
+
+#[cfg(test)]
+mod decl_site_tests {
+    use super::*;
+    use crate::external::{
+        ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource,
+    };
+    use crate::{new_parser, parse};
+
+    fn tree(src: &str) -> Tree {
+        parse(&mut new_parser(), src, None).expect("parse")
+    }
+
+    /// M4.0: a usage of a local variable resolves to a `DeclSite` in the same
+    /// document, at the byte range of the declaring identifier.
+    #[test]
+    fn binding_decl_site_points_at_declaring_identifier() {
+        let src = "class C { void m() { int count = 0; count++; } }\n";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+        let table = TypeTable::build(&docs, 0);
+        let byte = src.find("count++").unwrap();
+        let binding = lookup_binding(&t, src, byte, "count", &table, 0).expect("binding found");
+        let site = binding.decl_site().expect("decl site");
+        assert_eq!(site.doc, 0);
+        let expected = src.find("count = 0").unwrap();
+        assert_eq!(site.name_range, expected..expected + "count".len());
+    }
+
+    /// M4.0: a type used in doc B but declared in doc A resolves to a
+    /// `DeclSite` naming A's index and the byte range of `Foo`'s name.
+    #[test]
+    fn cross_file_type_decl_site_points_at_declaring_document() {
+        let doc_a = "class Foo {}\n";
+        let doc_b = "class B { Foo f; }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let td = table.get("Foo").expect("Foo indexed");
+        let site = td.decl_site().expect("decl site");
+        assert_eq!(site.doc, 1);
+        let expected = doc_a.find("Foo").unwrap();
+        assert_eq!(site.name_range, expected..expected + "Foo".len());
+    }
+
+    /// M4.0: resolving a member inherited from a supertype declared in another
+    /// open document yields a `DeclSite` in that other document.
+    #[test]
+    fn inherited_member_decl_site_points_at_supertype_document() {
+        let doc_a = "class A { void methodFromA() {} }\n";
+        let doc_b = "class B extends A { void m() { B b = new B(); b.methodFromA(); } }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&tree_b, doc_b);
+        let ctx = Ctx {
+            doc: &docs[0],
+            current: 0,
+            table: &table,
+            imports: &imports,
+            symbols: &NoSymbols,
+        };
+        let td_b = table.get("B").expect("B indexed").clone();
+        let resolved = Resolved {
+            ty: ResolvedType::InProject(td_b),
+            static_only: false,
+        };
+        let member = find_member_hier(&resolved, &ctx, "methodFromA").expect("member found");
+        let site = member.decl_site().expect("decl site");
+        assert_eq!(site.doc, 1);
+        let expected = doc_a.find("methodFromA").unwrap();
+        assert_eq!(site.name_range, expected..expected + "methodFromA".len());
+    }
+
+    /// M4.0: a member resolved from an external `SymbolSource` (JDK/jar) has no
+    /// `DeclSite` in this task — no open document backs it.
+    #[test]
+    fn external_member_decl_site_is_absent() {
+        struct StubSymbols;
+        impl SymbolSource for StubSymbols {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                (fqn == "java.lang.String").then(|| ExternalClass {
+                    supers: Vec::new(),
+                    type_params: Vec::new(),
+                    members: vec![ExternalMember {
+                        name: "length".to_string(),
+                        kind: ExternalMemberKind::Method,
+                        signature: "int length()".to_string(),
+                        template: None,
+                        is_static: false,
+                    }],
+                })
+            }
+        }
+
+        let src = "class C {}\n";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&t, src);
+        let ctx = Ctx {
+            doc: &docs[0],
+            current: 0,
+            table: &table,
+            imports: &imports,
+            symbols: &StubSymbols,
+        };
+        let resolved = Resolved {
+            ty: ResolvedType::External {
+                fqn: "java.lang.String".to_string(),
+                args: Vec::new(),
+            },
+            static_only: false,
+        };
+        let member = find_member_hier(&resolved, &ctx, "length").expect("member found");
+        assert!(member.decl_site().is_none());
+    }
 }

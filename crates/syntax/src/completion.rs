@@ -95,6 +95,7 @@ pub fn completion(
     let imports = Imports::parse(doc.tree, doc.source);
     let ctx = Ctx {
         doc,
+        current,
         table: &table,
         imports: &imports,
         symbols,
@@ -202,14 +203,16 @@ fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<Comp
 
     // Locals, params, for-vars. Fields come from the member pass below, so they
     // are excluded here to avoid recomputing the member set.
-    for binding in resolve::collect_bindings(doc.tree, doc.source, cursor, ctx.table, false) {
+    for binding in
+        resolve::collect_bindings(doc.tree, doc.source, cursor, ctx.table, false, ctx.current)
+    {
         push(binding_item(&binding), &mut items);
     }
 
     // The enclosing type's members (fields + methods + nested types), own and
     // inherited (including from external supertypes), callable unqualified.
     let node = resolve::node_at(doc.tree, cursor);
-    if let Some(td) = resolve::enclosing_typedecl(node, doc.source) {
+    if let Some(td) = resolve::enclosing_typedecl(node, doc.source, ctx.current) {
         let resolved = Resolved {
             ty: ResolvedType::InProject(td),
             static_only: false,

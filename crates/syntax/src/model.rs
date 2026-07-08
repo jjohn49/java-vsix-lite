@@ -29,6 +29,42 @@ pub(crate) fn children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     node.children(&mut cursor).collect()
 }
 
+/// Where a symbol is declared: which open document (an index into the
+/// `&[OpenDoc]` slice given to [`TypeTable::build`]) and byte ranges within that
+/// document — the declaring **name** identifier (what a client should jump the
+/// cursor to / highlight for rename) and the enclosing declaration (whatever
+/// node the owning [`TypeDecl`]/[`Member`]/`Binding` already holds — cheap to
+/// carry alongside since no extra tree walk is needed to produce it).
+///
+/// Built for symbols that live in an open document; external (JDK/jar) symbols
+/// have no `DeclSite` — callers get `None` for those instead.
+///
+/// M4.0 wires this bookkeeping through the resolver only; nothing outside
+/// tests constructs one yet. `#[allow(dead_code)]` here (and on the
+/// `decl_site` methods below) is temporary scaffolding for the M4
+/// goto-definition/find-references/rename facade landing on top of it.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeclSite {
+    pub doc: usize,
+    pub name_range: std::ops::Range<usize>,
+    pub full_range: std::ops::Range<usize>,
+}
+
+#[allow(dead_code)]
+impl DeclSite {
+    /// Build a `DeclSite` from a name node and the declaration node it belongs
+    /// to (`full`), both required to exist — callers pass `None` up when a name
+    /// node can't be found rather than fabricating a range.
+    pub(crate) fn new(doc: usize, name: Node, full: Node) -> DeclSite {
+        DeclSite {
+            doc,
+            name_range: name.byte_range(),
+            full_range: full.byte_range(),
+        }
+    }
+}
+
 /// Kind of a Java type declaration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TypeKind {
@@ -94,6 +130,20 @@ pub(crate) struct Member<'t> {
     /// Source text of the document this member came from (members can be
     /// inherited from a type declared in a different open file).
     pub source: &'t str,
+    /// Index (into the `&[OpenDoc]` slice given to [`TypeTable::build`]) of the
+    /// document this member's declaring [`TypeDecl`] came from.
+    pub doc: usize,
+}
+
+impl<'t> Member<'t> {
+    /// Where this member is declared, or `None` if `node` unexpectedly has no
+    /// `name` field (never true for the node kinds [`Member`] is built from,
+    /// but resolution never panics on a shape it didn't expect).
+    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
+    pub(crate) fn decl_site(&self) -> Option<DeclSite> {
+        let name = self.node.child_by_field_name("name")?;
+        Some(DeclSite::new(self.doc, name, self.node))
+    }
 }
 
 /// A single type declaration, located in some open document.
@@ -106,12 +156,15 @@ pub(crate) struct TypeDecl<'t> {
     /// The type declaration node.
     pub node: Node<'t>,
     pub source: &'t str,
+    /// Index (into the `&[OpenDoc]` slice given to [`TypeTable::build`]) of the
+    /// document this type is declared in.
+    pub doc: usize,
 }
 
 impl<'t> TypeDecl<'t> {
     /// Build a `TypeDecl` from a type declaration node, or `None` if `node` is
     /// not a type declaration.
-    pub(crate) fn from_node(node: Node<'t>, source: &'t str) -> Option<TypeDecl<'t>> {
+    pub(crate) fn from_node(node: Node<'t>, source: &'t str, doc: usize) -> Option<TypeDecl<'t>> {
         let kind = TypeKind::from_kind(node.kind())?;
         let name = node
             .child_by_field_name("name")
@@ -123,7 +176,15 @@ impl<'t> TypeDecl<'t> {
             supers,
             node,
             source,
+            doc,
         })
+    }
+
+    /// Where this type is declared.
+    #[allow(dead_code)] // consumed by the M4 goto-definition facade; see DeclSite
+    pub(crate) fn decl_site(&self) -> Option<DeclSite> {
+        let name = self.node.child_by_field_name("name")?;
+        Some(DeclSite::new(self.doc, name, self.node))
     }
 
     /// The body node containing this type's members.
@@ -148,6 +209,7 @@ impl<'t> TypeDecl<'t> {
                                 node: p,
                                 is_static: false,
                                 source: self.source,
+                                doc: self.doc,
                             });
                         }
                     }
@@ -155,7 +217,7 @@ impl<'t> TypeDecl<'t> {
             }
         }
         if let Some(body) = self.body() {
-            collect_body_members(body, self.source, &mut out);
+            collect_body_members(body, self.source, self.doc, &mut out);
         }
         out
     }
@@ -192,7 +254,12 @@ fn push_base_name<'t>(ty: Node<'t>, source: &'t str, out: &mut Vec<&'t str>) {
 }
 
 /// Walk a type body, pushing each declared member.
-fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Member<'t>>) {
+fn collect_body_members<'t>(
+    body: Node<'t>,
+    source: &'t str,
+    doc: usize,
+    out: &mut Vec<Member<'t>>,
+) {
     for child in named_children(body) {
         match child.kind() {
             // `constant_declaration` is how `interface`/`@interface` bodies hold
@@ -209,6 +276,7 @@ fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Membe
                                 node: declarator,
                                 is_static,
                                 source,
+                                doc,
                             });
                         }
                     }
@@ -224,6 +292,7 @@ fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Membe
                         node: child,
                         is_static: has_modifier(child, source, "static"),
                         source,
+                        doc,
                     });
                 }
             }
@@ -235,11 +304,12 @@ fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Membe
                         node: child,
                         is_static: true,
                         source,
+                        doc,
                     });
                 }
             }
             // Methods/fields inside an enum live under this wrapper.
-            "enum_body_declarations" => collect_body_members(child, source, out),
+            "enum_body_declarations" => collect_body_members(child, source, doc, out),
             _ => {
                 if let Some(kind) = TypeKind::from_kind(child.kind()) {
                     if let Some(name) = child.child_by_field_name("name") {
@@ -249,6 +319,7 @@ fn collect_body_members<'t>(body: Node<'t>, source: &'t str, out: &mut Vec<Membe
                             node: child,
                             is_static: has_modifier(child, source, "static"),
                             source,
+                            doc,
                         });
                     }
                 }
@@ -310,7 +381,7 @@ impl<'t> TypeTable<'t> {
         let order = std::iter::once(current).chain((0..docs.len()).filter(|&i| i != current));
         for i in order {
             let Some(doc) = docs.get(i) else { continue };
-            collect_type_decls(doc.tree.root_node(), doc.source, &mut by_name);
+            collect_type_decls(doc.tree.root_node(), doc.source, i, &mut by_name);
         }
         TypeTable { by_name }
     }
@@ -402,11 +473,12 @@ impl<'t> TypeTable<'t> {
 fn collect_type_decls<'t>(
     root: Node<'t>,
     source: &'t str,
+    doc: usize,
     by_name: &mut HashMap<&'t str, TypeDecl<'t>>,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if let Some(decl) = TypeDecl::from_node(node, source) {
+        if let Some(decl) = TypeDecl::from_node(node, source, doc) {
             by_name.entry(decl.name).or_insert(decl);
         }
         stack.extend(children(node));

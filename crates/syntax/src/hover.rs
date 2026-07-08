@@ -36,6 +36,7 @@ pub fn hover(
     let imports = Imports::parse(doc.tree, doc.source);
     let ctx = Ctx {
         doc,
+        current,
         table: &table,
         imports: &imports,
         symbols,
@@ -108,6 +109,7 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
                         ty: ResolvedType::InProject(resolve::enclosing_typedecl(
                             name_node,
                             ctx.doc.source,
+                            ctx.current,
                         )?),
                         static_only: false,
                     },
@@ -135,6 +137,7 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
         name_node.start_byte(),
         name,
         ctx.table,
+        ctx.current,
     ) {
         return Some(Target::InProject(binding.decl_node, binding.source));
     }
