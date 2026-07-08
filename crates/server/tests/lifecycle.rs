@@ -912,3 +912,535 @@ fn references_skips_target_directory() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M4 (4.4): `textDocument/rename` end-to-end — a local variable's
+/// declaration and both outer occurrences are edited in the one open
+/// document; a same-named variable in a *shadowed* inner block is untouched
+/// (no edit at line 5, where the shadow's declaration/uses live).
+#[test]
+fn rename_local_variable_in_one_doc_shadow_untouched() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"renameProvider\"") && init.contains("\"prepareProvider\":true"),
+        "missing renameProvider (prepareProvider) capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // class Sample {
+    //   void m() {
+    //     int count = 0;             (line 2, char 8: "count")
+    //     count = 1;                 (line 3, char 4)
+    //     print(count);              (line 4, char 10)
+    //     { int count = 2; count = 3; print(count); }   (line 5 — shadow)
+    //   }
+    // }
+    let text = "class Sample {\\n  void m() {\\n    int count = 0;\\n    count = 1;\\n    \
+                print(count);\\n    { int count = 2; count = 3; print(count); }\\n  }\\n}\\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///RenameLocal.java","languageId":"java","version":1,"text":"{text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///RenameLocal.java"},"position":{"line":2,"character":8},"newName":"total"}}"#,
+    );
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        !result.contains("\"error\""),
+        "rename must succeed: {result}"
+    );
+    assert_eq!(
+        result.matches(r#""newText":"total""#).count(),
+        3,
+        "expected exactly 3 edits (declaration + 2 outer uses): {result}"
+    );
+    assert!(
+        result.contains(r#""start":{"character":8,"line":2}"#),
+        "missing declaration edit: {result}"
+    );
+    assert!(
+        result.contains(r#""start":{"character":4,"line":3}"#),
+        "missing first outer use edit: {result}"
+    );
+    assert!(
+        result.contains(r#""start":{"character":10,"line":4}"#),
+        "missing second outer use edit: {result}"
+    );
+    assert!(
+        !result.contains(r#""line":5"#),
+        "shadowed inner `count` (line 5) must not be touched: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// M4 (4.4): `textDocument/prepareRename` end-to-end — an external (JDK)
+/// symbol and a keyword/literal are both refused (`result: null`), never an
+/// error (the client should simply not offer rename UI for these).
+#[test]
+fn prepare_rename_refuses_external_symbol_and_keyword_and_literal() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///PrepExt.java","languageId":"java","version":1,"text":"import java.util.List;\nclass C { List l; }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `List` in `List l;` (line 1, char 10) — external (JDK) symbol.
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file:///PrepExt.java"},"position":{"line":1,"character":10}}}"#,
+    );
+    let ext = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        ext.contains("\"result\":null"),
+        "external symbol must be refused with a null result: {ext}"
+    );
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///PrepKw.java","languageId":"java","version":1,"text":"class C { void m() { boolean b = true; } }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `boolean` (line 0, char 21) — a keyword/primitive type token.
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file:///PrepKw.java"},"position":{"line":0,"character":21}}}"#,
+    );
+    let kw = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        kw.contains("\"result\":null"),
+        "keyword must be refused with a null result: {kw}"
+    );
+
+    // Cursor on `true` (line 0, char 33) — a literal.
+    send(
+        r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file:///PrepKw.java"},"position":{"line":0,"character":33}}}"#,
+    );
+    let lit = read_until(&mut reader, "\"id\":4", &mut seen);
+    assert!(
+        lit.contains("\"result\":null"),
+        "literal must be refused with a null result: {lit}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":5", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// M4 (4.4): `textDocument/rename` end-to-end — an invalid new name
+/// ("123abc": leading digit; "class": a reserved word) is refused with an
+/// LSP error, never a (partial) edit.
+#[test]
+fn rename_rejects_invalid_new_name() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///InvalidName.java","languageId":"java","version":1,"text":"class C { void m() { int count = 0; count++; } }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `count` at its declaration (line 0, char 25 — "int count = 0").
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///InvalidName.java"},"position":{"line":0,"character":25},"newName":"123abc"}}"#,
+    );
+    let digit = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        digit.contains("\"error\""),
+        "leading-digit new name must be refused: {digit}"
+    );
+
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///InvalidName.java"},"position":{"line":0,"character":25},"newName":"class"}}"#,
+    );
+    let reserved = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        reserved.contains("\"error\""),
+        "reserved-word new name must be refused: {reserved}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// M4 (4.4): `textDocument/rename` end-to-end — the same-name collision
+/// guard refuses renaming local `a` to `b` when `b` already exists in the
+/// same enclosing scope.
+#[test]
+fn rename_refuses_same_scope_collision() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Collide.java","languageId":"java","version":1,"text":"class C { void m() { int b = 0; int a = 1; print(a); } }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `a` at its declaration (line 0, char 36 — "int a = 1").
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///Collide.java"},"position":{"line":0,"character":36},"newName":"b"}}"#,
+    );
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        result.contains("\"error\"") && result.contains("already in scope"),
+        "renaming into a name already bound in the same scope must be refused: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// M4 (4.4): `textDocument/rename` end-to-end — a workspace with more
+/// `.java` files under the source root than the hardcoded 500-file scan cap
+/// refuses the rename outright (never a partial edit), with a message
+/// mentioning full confirmation, per the task brief's wording.
+#[test]
+fn rename_refuses_when_scan_truncated() {
+    let root = temp_root("rename-truncation");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    for i in 0..510 {
+        std::fs::write(
+            src_dir.join(format!("Filler{i}.java")),
+            format!("package p;\nclass Filler{i} {{}}\n"),
+        )
+        .expect("write filler file");
+    }
+    let target_path = src_dir.join("Trigger.java");
+    let target_text = "package p;\n\npublic class Trigger {\n}\n";
+    std::fs::write(&target_path, target_text).expect("write Trigger.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let target_uri = format!("file://{}", target_path.display());
+    let escaped_text = target_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{target_uri}","languageId":"java","version":1,"text":"{escaped_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Trigger` in `public class Trigger` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{{"textDocument":{{"uri":"{target_uri}"}},"position":{{"line":2,"character":13}},"newName":"Renamed"}}}}"#
+    ));
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        result.contains("\"error\"") && result.contains("full confirmation"),
+        "truncated scan must refuse the rename, mentioning full confirmation: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M4 (4.4): `textDocument/rename` end-to-end — renaming a `public`
+/// top-level type whose file name matches it, across three files (one open,
+/// two on disk), when the client advertises
+/// `workspace.workspaceEdit.resourceOperations` including `"rename"`:
+/// expects text edits in all three files AND a `RenameFile` resource op
+/// renaming the declaring file to match.
+#[test]
+fn rename_public_class_includes_file_rename_when_capability_advertised() {
+    let root = temp_root("rename-file-op");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("UseB.java"),
+        "package p;\nclass UseB {\n  Foo f;\n}\n",
+    )
+    .expect("write UseB.java");
+    std::fs::write(
+        src_dir.join("UseC.java"),
+        "package p;\nclass UseC {\n  Foo f;\n}\n",
+    )
+    .expect("write UseC.java");
+    let foo_path = src_dir.join("Foo.java");
+    let foo_text = "package p;\n\npublic class Foo {\n}\n";
+    std::fs::write(&foo_path, foo_text).expect("write Foo.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{"workspace":{{"workspaceEdit":{{"resourceOperations":["rename"]}}}}}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let foo_uri = format!("file://{}", foo_path.display());
+    let use_b_uri = format!("file://{}", src_dir.join("UseB.java").display());
+    let use_c_uri = format!("file://{}", src_dir.join("UseC.java").display());
+    let bar_uri = format!("file://{}", src_dir.join("Bar.java").display());
+
+    let escaped_foo_text = foo_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"{escaped_foo_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Foo` in `public class Foo` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":2,"character":13}},"newName":"Bar"}}}}"#
+    ));
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        !result.contains("\"error\""),
+        "rename must succeed: {result}"
+    );
+    assert!(
+        result.contains(&foo_uri) && result.contains(&use_b_uri) && result.contains(&use_c_uri),
+        "expected text edits in all three files: {result}"
+    );
+    assert!(
+        result.matches(r#""newText":"Bar""#).count() >= 3,
+        "expected at least 3 occurrences renamed to Bar: {result}"
+    );
+    assert!(
+        result.contains("\"kind\":\"rename\""),
+        "expected a RenameFile resource op: {result}"
+    );
+    assert!(
+        result.contains(&bar_uri),
+        "expected the RenameFile op's newUri to be {bar_uri}: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M4 (4.4): `textDocument/rename` end-to-end — the same scenario as
+/// [`rename_public_class_includes_file_rename_when_capability_advertised`]
+/// but the client does NOT advertise
+/// `workspace.workspaceEdit.resourceOperations` including `"rename"`: the
+/// text edits must still succeed, but no `RenameFile` op may be present.
+#[test]
+fn rename_public_class_skips_file_rename_without_capability() {
+    let root = temp_root("rename-no-file-op");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("UseB.java"),
+        "package p;\nclass UseB {\n  Foo f;\n}\n",
+    )
+    .expect("write UseB.java");
+    std::fs::write(
+        src_dir.join("UseC.java"),
+        "package p;\nclass UseC {\n  Foo f;\n}\n",
+    )
+    .expect("write UseC.java");
+    let foo_path = src_dir.join("Foo.java");
+    let foo_text = "package p;\n\npublic class Foo {\n}\n";
+    std::fs::write(&foo_path, foo_text).expect("write Foo.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let foo_uri = format!("file://{}", foo_path.display());
+    let use_b_uri = format!("file://{}", src_dir.join("UseB.java").display());
+    let use_c_uri = format!("file://{}", src_dir.join("UseC.java").display());
+
+    let escaped_foo_text = foo_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"{escaped_foo_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Foo` in `public class Foo` (line 2, char 13).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":2,"character":13}},"newName":"Bar"}}}}"#
+    ));
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        !result.contains("\"error\""),
+        "rename must succeed: {result}"
+    );
+    assert!(
+        result.contains(&foo_uri) && result.contains(&use_b_uri) && result.contains(&use_c_uri),
+        "expected text edits in all three files: {result}"
+    );
+    assert!(
+        !result.contains("\"kind\":\"rename\""),
+        "no RenameFile op must be present without the client capability: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

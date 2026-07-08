@@ -16,8 +16,10 @@ use crate::resolve::{self, Binding, BindingKind, Ctx, HierMember, Resolved, Reso
 use crate::signature::{javadoc, signature};
 use crate::{LineIndex, OpenDoc};
 
-/// Java reserved words + literals offered in scope completion.
-const KEYWORDS: &[&str] = &[
+/// Java reserved words + literals offered in scope completion. `pub(crate)`
+/// (M4.4) so `rename.rs` can refuse a rename's new name when it's one of
+/// these, rather than duplicating the list.
+pub(crate) const KEYWORDS: &[&str] = &[
     "abstract",
     "assert",
     "boolean",

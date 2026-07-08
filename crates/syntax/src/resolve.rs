@@ -109,7 +109,11 @@ pub(crate) fn node_at<'t>(tree: &'t Tree, byte: usize) -> Node<'t> {
         .unwrap_or(root)
 }
 
-fn is_type_decl(kind: &str) -> bool {
+/// Whether a tree-sitter node kind is one of Java's five type-declaration
+/// shapes. `pub(crate)` (M4.4) so `rename.rs` can walk past a nested type's
+/// immediate declaration to find its *outer* enclosing type, the same way
+/// [`enclosing_type_node`] finds the innermost one.
+pub(crate) fn is_type_decl(kind: &str) -> bool {
     matches!(
         kind,
         "class_declaration"

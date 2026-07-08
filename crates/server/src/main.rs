@@ -29,7 +29,7 @@ use jvl_syntax::tree_sitter::{Parser, Tree};
 use jvl_syntax::{Definition, LineIndex, PositionEncoding};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
@@ -62,10 +62,13 @@ struct CachedProjectFile {
 }
 
 /// A single open document: its current text and the parse tree kept in sync
-/// with it.
+/// with it, plus its LSP version (M4.4: `rename`'s `WorkspaceEdit` prefers
+/// versioned `TextDocumentEdit`s for open documents over the client's
+/// `documentChanges` capability — see `Backend::rename`).
 struct Document {
     text: String,
     tree: Tree,
+    version: i32,
 }
 
 struct Backend {
@@ -107,6 +110,10 @@ struct Backend {
     /// Whether [`workspace_index`]'s cap-truncation has already been logged
     /// to the client — logged once, not on every subsequent query.
     workspace_index_truncation_logged: std::sync::atomic::AtomicBool,
+    /// M4.4: whether the client's `workspace.workspaceEdit.resourceOperations`
+    /// includes `"rename"` — gates whether `rename`'s `WorkspaceEdit` may
+    /// include a `RenameFile` resource op (text edits are emitted either way).
+    supports_rename_file: OnceLock<bool>,
 }
 
 impl Backend {
@@ -125,6 +132,7 @@ impl Backend {
             external_stub_cache: StdMutex::new(HashMap::new()),
             workspace_index: workspace_index::WorkspaceIndex::new(),
             workspace_index_truncation_logged: std::sync::atomic::AtomicBool::new(false),
+            supports_rename_file: OnceLock::new(),
         }
     }
 
@@ -137,6 +145,13 @@ impl Backend {
 
     fn snippet_support(&self) -> bool {
         self.snippet_support.get().copied().unwrap_or(false)
+    }
+
+    /// M4.4: whether the client advertised `resourceOperations` including
+    /// `"rename"` — see [`supports_rename_file_op`], negotiated in
+    /// `initialize`.
+    fn supports_rename_file(&self) -> bool {
+        self.supports_rename_file.get().copied().unwrap_or(false)
     }
 
     /// The imported-type symbol source, built on first use from the user's JDK
@@ -367,11 +382,18 @@ impl Backend {
 
     /// Parse a freshly opened (or fully replaced) document from scratch, store
     /// it, and publish its diagnostics.
-    async fn open_document(&self, uri: Uri, text: String) {
+    async fn open_document(&self, uri: Uri, version: i32, text: String) {
         let tree = self.parse(&text, None);
         let diagnostics = {
             let mut docs = self.documents.lock().await;
-            docs.insert(uri.as_str().to_string(), Document { text, tree });
+            docs.insert(
+                uri.as_str().to_string(),
+                Document {
+                    text,
+                    tree,
+                    version,
+                },
+            );
             self.compute_diagnostics(&docs, uri.as_str())
         };
         self.client
@@ -566,6 +588,20 @@ fn supports_snippets(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// M4.4: whether the client's `workspace.workspaceEdit.resourceOperations`
+/// includes `"rename"` — gates `rename`'s `RenameFile` resource op (per the
+/// task brief: skip the file op, but still emit the text edits, when
+/// unsupported).
+fn supports_rename_file_op(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.workspace_edit.as_ref())
+        .and_then(|we| we.resource_operations.as_ref())
+        .is_some_and(|ops| ops.contains(&ResourceOperationKind::Rename))
+}
+
 /// Pick UTF-8 if the client advertises support (lets tree-sitter byte offsets
 /// pass through unconverted); otherwise the LSP default, UTF-16.
 fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
@@ -582,6 +618,247 @@ fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
     }
 }
 
+/// Everything a two-tier reference/rename scan needs, snapshotted from the
+/// documents lock before the (possibly slow, Tier-2-only) workspace scan —
+/// mirrors `workspace_index::ensure_built`'s own pattern of never holding the
+/// lock across a directory walk. Shared by `references()` (M4.3) and
+/// `rename()`/`prepare_rename()` (M4.4), which all resolve the cursor to the
+/// same `jvl_syntax::ReferenceTarget` first.
+struct TargetSnapshot {
+    target: jvl_syntax::ReferenceTarget,
+    target_uri: String,
+    target_text: String,
+    target_tree: Tree,
+    /// The declaring document's own LSP version, for `rename`'s versioned
+    /// `TextDocumentEdit` (this document is always open — resolution only
+    /// ever targets an open document).
+    target_version: i32,
+    roots: Vec<PathBuf>,
+    project_root: Option<PathBuf>,
+    /// Currently-open documents' live text/tree/version, keyed by
+    /// canonicalized path (falling back to the raw path when
+    /// canonicalization fails) — a Tier-2 hit file that is itself open is
+    /// read from here instead of disk, so unsaved edits are reflected.
+    open_snapshot: HashMap<PathBuf, (i32, String, Tree)>,
+}
+
+/// One scanned file's confirmed occurrences of the target — the shared unit
+/// `references()` turns into `Location`s and `rename()` turns into a
+/// `TextDocumentEdit`.
+struct ScanHit {
+    uri: Uri,
+    text: Arc<String>,
+    /// `Some` when this file is a currently-open document (its LSP version,
+    /// for a versioned rename edit); `None` for an on-disk/unopened file.
+    version: Option<i32>,
+    ranges: Vec<StdRange<usize>>,
+}
+
+/// Aggregate result of the two-tier reference scan shared by
+/// `textDocument/references` (M4.3) and `textDocument/rename` (M4.4).
+struct ScanOutcome {
+    hits: Vec<ScanHit>,
+    /// Textual matches that could not be confirmed by resolution (aggregate
+    /// across every scanned file) — `references` reports these as a
+    /// best-effort notice; `rename` must refuse outright (any one of them
+    /// could be a real, unconfirmed occurrence).
+    possible: usize,
+    /// Whether the Tier-2 workspace prefilter hit its file/byte cap.
+    truncated: bool,
+    /// Tier::Workspace only: how many prefiltered candidate files could not
+    /// be read/parsed at all. `references` silently skips these (best
+    /// effort); `rename` must refuse whenever this is nonzero, since an
+    /// occurrence could be hiding in one of them.
+    unparsed_hit_files: usize,
+}
+
+impl Backend {
+    /// Resolve the cursor (in the currently open `uri`) to a
+    /// `jvl_syntax::ReferenceTarget` and snapshot everything the two-tier
+    /// scan needs — `None` for the same reasons
+    /// `jvl_syntax::reference_target` itself returns `None` (an external/JDK
+    /// symbol, `this`/`super`, a non-identifier, or a document that isn't
+    /// currently open).
+    async fn target_snapshot(&self, uri: &str, position: Position) -> Option<TargetSnapshot> {
+        let docs = self.documents.lock().await;
+        let (open, uris) = open_docs_and_uris(&docs, uri)?;
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        let target = jvl_syntax::reference_target(&open, 0, &index, position, &symbols)?;
+
+        let target_uri = uris[target.doc].to_string();
+        let target_doc = docs.get(&target_uri)?;
+        let target_text = target_doc.text.clone();
+        let target_tree = target_doc.tree.clone();
+        let target_version = target_doc.version;
+
+        let project_root = self.project_root();
+        let roots = project_root
+            .as_deref()
+            .map(|root| self.source_roots(&docs, root))
+            .unwrap_or_default();
+
+        let mut open_snapshot = HashMap::new();
+        for (doc_uri, doc) in docs.iter() {
+            if let Some(path) = open_doc_path(doc_uri) {
+                let key = std::fs::canonicalize(&path).unwrap_or(path);
+                open_snapshot.insert(key, (doc.version, doc.text.clone(), doc.tree.clone()));
+            }
+        }
+
+        Some(TargetSnapshot {
+            target,
+            target_uri,
+            target_text,
+            target_tree,
+            target_version,
+            roots,
+            project_root,
+            open_snapshot,
+        })
+    }
+
+    /// Run the bounded, two-tier reference scan for `target` (see
+    /// `references()`'s doc comment for the tier semantics) — the shared
+    /// orchestration `references()`/`rename()` both build on. Never holds
+    /// the documents lock (everything it reads is already snapshotted).
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_references(
+        &self,
+        target: &jvl_syntax::ReferenceTarget,
+        target_uri: &str,
+        target_text: &str,
+        target_tree: &Tree,
+        target_version: i32,
+        roots: &[PathBuf],
+        project_root: Option<&Path>,
+        open_snapshot: &HashMap<PathBuf, (i32, String, Tree)>,
+        include_declaration: bool,
+    ) -> ScanOutcome {
+        let symbols = ClasspathSymbols(self.classpath());
+        let empty = || ScanOutcome {
+            hits: Vec::new(),
+            possible: 0,
+            truncated: false,
+            unparsed_hit_files: 0,
+        };
+        let Some(target_uri_parsed) = target_uri.parse::<Uri>().ok() else {
+            return empty();
+        };
+
+        let mut hits = Vec::new();
+
+        // The declaring file's own occurrences are always in scope — Tier 1
+        // stops here entirely; Tier 2 also always checks it directly
+        // (self-references), whether or not it happens to lie under a
+        // discovered source root.
+        let self_target = jvl_syntax::ReferenceTarget {
+            doc: 0,
+            ..target.clone()
+        };
+        let target_open = jvl_syntax::OpenDoc {
+            source: target_text,
+            tree: target_tree,
+        };
+        let own_hits = jvl_syntax::references_in_doc(
+            std::slice::from_ref(&target_open),
+            0,
+            &self_target,
+            include_declaration,
+            &symbols,
+        );
+        // Textual hits that could not be confirmed by resolution (receiver
+        // type unresolved — e.g. an unknown supertype) are conservatively
+        // OMITTED from the results; aggregate their count across every
+        // scanned file so the caller can be told the list may be incomplete
+        // (`references`) or must refuse outright (`rename`).
+        let mut possible = own_hits.possible;
+        let mut truncated = false;
+        let mut unparsed_hit_files = 0usize;
+        if !own_hits.ranges.is_empty() {
+            hits.push(ScanHit {
+                uri: target_uri_parsed.clone(),
+                text: Arc::new(target_text.to_string()),
+                version: Some(target_version),
+                ranges: own_hits.ranges,
+            });
+        }
+
+        if target.tier == jvl_syntax::Tier::Workspace {
+            let scan = references::prefilter(roots, project_root, &target.name).await;
+
+            let target_path = open_doc_path(target_uri);
+            let target_canon = target_path
+                .as_ref()
+                .and_then(|p| std::fs::canonicalize(p).ok());
+
+            for hit_path in scan.files {
+                let hit_canon = std::fs::canonicalize(&hit_path).ok();
+                let is_target_file = target_path.as_ref() == Some(&hit_path)
+                    || (hit_canon.is_some() && hit_canon == target_canon);
+                if is_target_file {
+                    continue; // already handled above
+                }
+
+                let cached_open = hit_canon.as_ref().and_then(|c| open_snapshot.get(c));
+                let cached = cached_open
+                    .map(|(_, text, tree)| (Arc::new(text.clone()), tree.clone()))
+                    .or_else(|| self.parsed_project_file(&hit_path));
+                let Some((hit_text, hit_tree)) = cached else {
+                    unparsed_hit_files += 1;
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                let version = cached_open.map(|(v, _, _)| *v);
+
+                let docs_for_scan = [
+                    jvl_syntax::OpenDoc {
+                        source: &hit_text,
+                        tree: &hit_tree,
+                    },
+                    jvl_syntax::OpenDoc {
+                        source: target_text,
+                        tree: target_tree,
+                    },
+                ];
+                let remapped = jvl_syntax::ReferenceTarget {
+                    doc: 1,
+                    ..target.clone()
+                };
+                let scan_hits = jvl_syntax::references_in_doc(
+                    &docs_for_scan,
+                    0,
+                    &remapped,
+                    include_declaration,
+                    &symbols,
+                );
+                possible += scan_hits.possible;
+                if !scan_hits.ranges.is_empty() {
+                    if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
+                        hits.push(ScanHit {
+                            uri: hit_uri,
+                            text: hit_text,
+                            version,
+                            ranges: scan_hits.ranges,
+                        });
+                    }
+                }
+
+                tokio::task::yield_now().await;
+            }
+
+            truncated = scan.truncated;
+        }
+
+        ScanOutcome {
+            hits,
+            possible,
+            truncated,
+            unparsed_hit_files,
+        }
+    }
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let encoding = negotiate_encoding(&params);
@@ -591,6 +868,9 @@ impl LanguageServer for Backend {
         let _ = self
             .unresolved_member_diagnostics
             .set(unresolved_member_diagnostics_opt(&params));
+        let _ = self
+            .supports_rename_file
+            .set(supports_rename_file_op(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
@@ -617,6 +897,13 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // M4.4: `prepareRename` support advertised so the client
+                // validates/positions the rename before sending
+                // `textDocument/rename`.
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     // `.` requests member completion; identifier/keyword
                     // completion is requested explicitly (Ctrl-Space) or by the
@@ -669,8 +956,12 @@ impl LanguageServer for Backend {
                 .project_root_hint
                 .set(derive_project_root(&params.text_document.uri));
         }
-        self.open_document(params.text_document.uri, params.text_document.text)
-            .await;
+        self.open_document(
+            params.text_document.uri,
+            params.text_document.version,
+            params.text_document.text,
+        )
+        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -685,6 +976,7 @@ impl LanguageServer for Backend {
                 let Some(doc) = docs.get_mut(uri.as_str()) else {
                     return; // change for a document we never opened
                 };
+                doc.version = params.text_document.version;
 
                 let mut from_scratch = false;
                 for change in params.content_changes {
@@ -1010,201 +1302,59 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
 
-        // Resolve the target and snapshot everything the (possibly slow,
-        // Tier-2-only) workspace scan below needs, then release the
-        // documents lock before it — mirrors `workspace_index::ensure_built`'s
-        // own pattern of never holding the lock across a directory walk.
-        struct Snapshot {
-            target: jvl_syntax::ReferenceTarget,
-            target_uri: String,
-            target_text: String,
-            target_tree: Tree,
-            roots: Vec<PathBuf>,
-            project_root: Option<PathBuf>,
-            /// Currently-open documents' live text/tree, keyed by
-            /// canonicalized path (falling back to the raw path when
-            /// canonicalization fails) — a Tier-2 hit file that is itself
-            /// open is read from here instead of disk, so unsaved edits are
-            /// reflected.
-            open_snapshot: HashMap<PathBuf, (String, Tree)>,
-        }
-
-        let snapshot = {
-            let docs = self.documents.lock().await;
-            let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
-                return Ok(None);
-            };
-            let index = LineIndex::new(open[0].source, self.encoding());
-            let symbols = ClasspathSymbols(self.classpath());
-            let Some(target) = jvl_syntax::reference_target(&open, 0, &index, position, &symbols)
-            else {
-                return Ok(None);
-            };
-
-            let target_uri = uris[target.doc].to_string();
-            let Some(target_doc) = docs.get(&target_uri) else {
-                return Ok(None);
-            };
-            let target_text = target_doc.text.clone();
-            let target_tree = target_doc.tree.clone();
-
-            let project_root = self.project_root();
-            let roots = project_root
-                .as_deref()
-                .map(|root| self.source_roots(&docs, root))
-                .unwrap_or_default();
-
-            let mut open_snapshot = HashMap::new();
-            for (doc_uri, doc) in docs.iter() {
-                if let Some(path) = open_doc_path(doc_uri) {
-                    let key = std::fs::canonicalize(&path).unwrap_or(path);
-                    open_snapshot.insert(key, (doc.text.clone(), doc.tree.clone()));
-                }
-            }
-
-            Snapshot {
-                target,
-                target_uri,
-                target_text,
-                target_tree,
-                roots,
-                project_root,
-                open_snapshot,
-            }
-        };
-
-        let symbols = ClasspathSymbols(self.classpath());
-        let target_index = LineIndex::new(&snapshot.target_text, self.encoding());
-        let target_open = jvl_syntax::OpenDoc {
-            source: &snapshot.target_text,
-            tree: &snapshot.target_tree,
-        };
-        let Some(target_uri_parsed) = snapshot.target_uri.parse::<Uri>().ok() else {
+        let Some(snapshot) = self.target_snapshot(uri.as_str(), position).await else {
             return Ok(None);
         };
 
-        let mut locations = Vec::new();
-
-        // The declaring file's own occurrences are always in scope — Tier 1
-        // stops here entirely; Tier 2 also always checks it directly
-        // (self-references), whether or not it happens to lie under a
-        // discovered source root.
-        let self_target = jvl_syntax::ReferenceTarget {
-            doc: 0,
-            ..snapshot.target.clone()
-        };
-        let own_hits = jvl_syntax::references_in_doc(
-            std::slice::from_ref(&target_open),
-            0,
-            &self_target,
-            include_declaration,
-            &symbols,
-        );
-        // Textual hits that could not be confirmed by resolution (receiver
-        // type unresolved — e.g. an unknown supertype) are conservatively
-        // OMITTED from the results; aggregate their count across every
-        // scanned file so the user can be told the list may be incomplete.
-        let mut possible = own_hits.possible;
-        let mut truncated = false;
-        locations.extend(own_hits.ranges.into_iter().map(|range| Location {
-            uri: target_uri_parsed.clone(),
-            range: byte_range_to_lsp(&target_index, range),
-        }));
-
-        if snapshot.target.tier == jvl_syntax::Tier::Workspace {
-            let scan = references::prefilter(
+        let outcome = self
+            .scan_references(
+                &snapshot.target,
+                &snapshot.target_uri,
+                &snapshot.target_text,
+                &snapshot.target_tree,
+                snapshot.target_version,
                 &snapshot.roots,
                 snapshot.project_root.as_deref(),
-                &snapshot.target.name,
+                &snapshot.open_snapshot,
+                include_declaration,
             )
             .await;
 
-            let target_path = open_doc_path(&snapshot.target_uri);
-            let target_canon = target_path
-                .as_ref()
-                .and_then(|p| std::fs::canonicalize(p).ok());
-
-            for hit_path in scan.files {
-                let hit_canon = std::fs::canonicalize(&hit_path).ok();
-                let is_target_file = target_path.as_ref() == Some(&hit_path)
-                    || (hit_canon.is_some() && hit_canon == target_canon);
-                if is_target_file {
-                    continue; // already handled above
-                }
-
-                let cached = hit_canon
-                    .as_ref()
-                    .and_then(|c| snapshot.open_snapshot.get(c))
-                    .map(|(text, tree)| (Arc::new(text.clone()), tree.clone()))
-                    .or_else(|| self.parsed_project_file(&hit_path));
-                let Some((hit_text, hit_tree)) = cached else {
-                    tokio::task::yield_now().await;
-                    continue;
-                };
-
-                let docs_for_scan = [
-                    jvl_syntax::OpenDoc {
-                        source: &hit_text,
-                        tree: &hit_tree,
-                    },
-                    jvl_syntax::OpenDoc {
-                        source: &snapshot.target_text,
-                        tree: &snapshot.target_tree,
-                    },
-                ];
-                let remapped = jvl_syntax::ReferenceTarget {
-                    doc: 1,
-                    ..snapshot.target.clone()
-                };
-                let hits = jvl_syntax::references_in_doc(
-                    &docs_for_scan,
-                    0,
-                    &remapped,
-                    include_declaration,
-                    &symbols,
-                );
-                possible += hits.possible;
-                if !hits.ranges.is_empty() {
-                    if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
-                        let hit_index = LineIndex::new(&hit_text, self.encoding());
-                        locations.extend(hits.ranges.into_iter().map(|range| Location {
-                            uri: hit_uri.clone(),
-                            range: byte_range_to_lsp(&hit_index, range),
-                        }));
-                    }
-                }
-
-                tokio::task::yield_now().await;
-            }
-
-            truncated = scan.truncated;
+        let mut locations = Vec::new();
+        for hit in &outcome.hits {
+            let hit_index = LineIndex::new(&hit.text, self.encoding());
+            locations.extend(hit.ranges.iter().cloned().map(|range| Location {
+                uri: hit.uri.clone(),
+                range: byte_range_to_lsp(&hit_index, range),
+            }));
         }
 
         // One informational notice per request at most, covering both
         // incompleteness signals: the scan hit its cap, and/or textual hits
         // were omitted because they couldn't be confirmed by resolution.
-        if possible > 0 {
+        if outcome.possible > 0 {
             self.client
                 .log_message(
                     MessageType::INFO,
                     format!(
-                        "references: {possible} textual match(es) for `{}` could not be \
+                        "references: {} textual match(es) for `{}` could not be \
                          confirmed by resolution and were omitted",
-                        snapshot.target.name
+                        outcome.possible, snapshot.target.name
                     ),
                 )
                 .await;
         }
         let mut notice_parts: Vec<String> = Vec::new();
-        if truncated {
+        if outcome.truncated {
             notice_parts.push(format!(
                 "References search truncated at {} files; results may be incomplete.",
                 references::MAX_FILES_SCANNED
             ));
         }
-        if possible > 0 {
+        if outcome.possible > 0 {
             notice_parts.push(format!(
-                "{possible} possible additional match(es) could not be confirmed."
+                "{} possible additional match(es) could not be confirmed.",
+                outcome.possible
             ));
         }
         if !notice_parts.is_empty() {
@@ -1214,6 +1364,184 @@ impl LanguageServer for Backend {
         }
 
         Ok((!locations.is_empty()).then_some(locations))
+    }
+
+    /// M4 (4.4): `textDocument/prepareRename` — `Some` only when the cursor
+    /// resolves to an in-project declaration (see
+    /// `jvl_syntax::prepare_rename`'s doc comment for the full refusal
+    /// list: external/JDK symbols, keywords, literals, `this`/`super`, and
+    /// non-identifiers all yield `None`, never an error — the client should
+    /// simply not offer rename UI for these).
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let docs = self.documents.lock().await;
+        let Some(current) = docs.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let open = open_docs(&docs, uri.as_str(), current);
+        let index = LineIndex::new(&current.text, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        let Some(prep) = jvl_syntax::prepare_rename(&open, 0, &index, position, &symbols) else {
+            return Ok(None);
+        };
+        Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: byte_range_to_lsp(&index, prep.range),
+            placeholder: prep.placeholder,
+        }))
+    }
+
+    /// M4 (4.4): `textDocument/rename` — conservative: refuse rather than
+    /// corrupt. Reuses the M4.3 find-references orchestration
+    /// (`target_snapshot`/`scan_references`) to collect every occurrence
+    /// (declaration included — rename always renames it too), then applies
+    /// every refusal guard from the task brief, in order:
+    ///
+    /// 1. `new_name` must be a syntactically valid Java identifier and not
+    ///    a reserved word/literal (`jvl_syntax::is_valid_new_name`).
+    /// 2. The cursor must resolve to an in-project declaration (same as
+    ///    `prepareRename`).
+    /// 3. The declaring scope must not already bind `new_name` to a sibling
+    ///    of the same kind (`jvl_syntax::collides_with_existing`).
+    /// 4. The scan must not have hit its file cap (`outcome.truncated`).
+    /// 5. Every textual hit must have been confirmed by resolution
+    ///    (`outcome.possible == 0`).
+    /// 6. For a `Tier::Workspace` target, every prefiltered candidate file
+    ///    must have parsed (`outcome.unparsed_hit_files == 0`) — an
+    ///    occurrence could be hiding in one that didn't.
+    ///
+    /// Only once all of these pass is a `WorkspaceEdit` assembled: one
+    /// `TextDocumentEdit` per file (versioned when the file is open), plus —
+    /// when renaming a `public` top-level type whose file name matches it,
+    /// and the client's `workspace.workspaceEdit.resourceOperations`
+    /// includes `"rename"` — a trailing `RenameFile` resource op (text edits
+    /// come first in the array, addressed by the OLD uri, which is still
+    /// valid at that point in document-change application order).
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        if !jvl_syntax::is_valid_new_name(&new_name) {
+            return Err(Error::invalid_params(format!(
+                "`{new_name}` is not a valid Java identifier (or is a reserved word/literal)"
+            )));
+        }
+
+        let Some(snapshot) = self.target_snapshot(uri.as_str(), position).await else {
+            return Err(Error::invalid_params(
+                "rename is only supported for in-project declarations (locals, fields, \
+                 methods, types) — external symbols, keywords, and literals cannot be renamed",
+            ));
+        };
+
+        let target_open_doc = [jvl_syntax::OpenDoc {
+            source: &snapshot.target_text,
+            tree: &snapshot.target_tree,
+        }];
+        let remapped_target = jvl_syntax::ReferenceTarget {
+            doc: 0,
+            ..snapshot.target.clone()
+        };
+        if jvl_syntax::collides_with_existing(&target_open_doc, &remapped_target, &new_name) {
+            return Err(Error::invalid_params("target name already in scope"));
+        }
+
+        let outcome = self
+            .scan_references(
+                &snapshot.target,
+                &snapshot.target_uri,
+                &snapshot.target_text,
+                &snapshot.target_tree,
+                snapshot.target_version,
+                &snapshot.roots,
+                snapshot.project_root.as_deref(),
+                &snapshot.open_snapshot,
+                true, // rename always includes (and renames) the declaration
+            )
+            .await;
+
+        if outcome.truncated {
+            return Err(Error::invalid_params(format!(
+                "rename requires full confirmation; the reference search was truncated at {} \
+                 files",
+                references::MAX_FILES_SCANNED
+            )));
+        }
+        if outcome.possible > 0 {
+            return Err(Error::invalid_params(format!(
+                "rename requires full confirmation; {} occurrence(s) could not be verified",
+                outcome.possible
+            )));
+        }
+        if snapshot.target.tier == jvl_syntax::Tier::Workspace && outcome.unparsed_hit_files > 0 {
+            return Err(Error::invalid_params(format!(
+                "rename requires full confirmation; {} candidate file(s) could not be parsed",
+                outcome.unparsed_hit_files
+            )));
+        }
+        if outcome.hits.is_empty() {
+            // Never a no-op/empty WorkspaceEdit — the declaration itself is
+            // always a hit when resolution succeeded at all.
+            return Ok(None);
+        }
+
+        let mut document_changes = Vec::with_capacity(outcome.hits.len() + 1);
+        for hit in &outcome.hits {
+            let index = LineIndex::new(&hit.text, self.encoding());
+            let edits = hit
+                .ranges
+                .iter()
+                .cloned()
+                .map(|range| {
+                    OneOf::Left(TextEdit {
+                        range: byte_range_to_lsp(&index, range),
+                        new_text: new_name.clone(),
+                    })
+                })
+                .collect();
+            document_changes.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: hit.uri.clone(),
+                    version: hit.version,
+                },
+                edits,
+            }));
+        }
+
+        if self.supports_rename_file() {
+            if let Some(old_path) = open_doc_path(&snapshot.target_uri) {
+                let old_name_matches_file = old_path.file_stem().and_then(|s| s.to_str())
+                    == Some(snapshot.target.name.as_str());
+                if old_name_matches_file
+                    && jvl_syntax::is_public_top_level_type(&target_open_doc, &remapped_target)
+                {
+                    let new_path = old_path.with_file_name(format!("{new_name}.java"));
+                    if let (Some(old_uri), Some(new_uri)) = (
+                        Uri::from_file_path(&old_path),
+                        Uri::from_file_path(&new_path),
+                    ) {
+                        document_changes.push(DocumentChangeOperation::Op(ResourceOp::Rename(
+                            RenameFile {
+                                old_uri,
+                                new_uri,
+                                options: None,
+                                annotation_id: None,
+                            },
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(document_changes)),
+            change_annotations: None,
+        }))
     }
 }
 
