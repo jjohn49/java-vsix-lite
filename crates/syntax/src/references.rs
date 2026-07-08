@@ -13,12 +13,14 @@
 //!   and only ever sees documents the caller hands it).
 //!
 //! Both tiers use the same confirm-by-resolution substrate as goto-definition
-//! (`lookup_binding`, `member_receiver`/`resolve_receiver_type`/
-//! `find_member_hier`) — this module adds no new resolution logic beyond one
-//! local refinement: a bare type name is only accepted as a match when the
-//! *scanned file's own* imports/package would actually resolve that name to
-//! the candidate's real package (see [`bare_type_site`]). Without that check,
-//! two same-simple-name types from different packages would be conflated
+//! (`lookup_binding`, `resolve_receiver_type`, and the namespace-aware
+//! `find_member_hier_of_kind` — fields and methods are separate namespaces in
+//! Java, so a field and a same-named method must never conflate) — this
+//! module adds no new resolution logic beyond one local refinement: a bare
+//! type name is only accepted as a match when the *scanned file's own*
+//! imports/package would actually resolve that name to the candidate's real
+//! package (see [`bare_type_site`]). Without that check, two
+//! same-simple-name types from different packages would be conflated
 //! whenever only one of them is present in the small per-file confirm slice
 //! (see the module's `different_package_import_is_not_confirmed` test).
 //!
@@ -40,7 +42,9 @@ use crate::imports::{dotted_path, Imports};
 use crate::model::{
     has_modifier, named_children, DeclSite, Member, MemberKind, TypeDecl, TypeTable,
 };
-use crate::resolve::{self, Binding, BindingKind, Ctx, HierMember, Resolved, ResolvedType};
+use crate::resolve::{
+    self, Binding, BindingKind, Ctx, HierMember, MemberNamespace, Resolved, ResolvedType,
+};
 use crate::{node_text, LineIndex, OpenDoc};
 
 /// How far a declaration's references can reach.
@@ -153,7 +157,13 @@ pub fn references_in_doc(
     let mut possible = 0usize;
     let mut stack = vec![doc.tree.root_node()];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "identifier" | "type_identifier") {
+        // Only identifiers spelled exactly like the target can reference it
+        // (Java has no aliasing) — everything else is skipped before any
+        // resolution work, which both keeps the walk cheap and scopes the
+        // `possible` counter to *this target's* unconfirmable textual hits.
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && node_text(node, doc.source) == target.name
+        {
             match classify(node, &ctx) {
                 Occurrence::Site(site) => {
                     if let Some(site_decl) = site.decl_site() {
@@ -268,11 +278,19 @@ fn type_tier(td: &TypeDecl) -> Tier {
 }
 
 /// Resolve one identifier-like node the same way goto-definition's ladder
-/// does (mirrors `definition::resolve_definition`'s branching), except a bare
-/// type name goes through [`bare_type_site`]'s package-aware gate instead of
-/// a blind `TypeTable` lookup, and a method declaration's own name — the one
-/// shape goto-definition never needs to resolve *from* — is resolved via its
-/// enclosing type's members so its own declaration counts as an occurrence.
+/// does (mirrors `definition::resolve_definition`'s branching), with three
+/// reference-specific differences:
+///
+/// - a bare type name goes through [`bare_type_site`]'s package-aware gate
+///   instead of a blind `TypeTable` lookup;
+/// - a method declaration's own name — the one shape goto-definition never
+///   resolves *from* — is its own declaration site directly (no lookup: the
+///   node in hand IS the declaration, so a same-named field can't hijack it);
+/// - member lookups are namespace-aware (JLS §6.5: fields and methods live
+///   in separate namespaces): a `method_invocation`'s name resolves against
+///   METHODS only, a `field_access` field / bare expression identifier
+///   against FIELDS only — a field and a same-named method must never
+///   conflate (see `resolve::MemberNamespace`).
 fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     if !matches!(name_node.kind(), "identifier" | "type_identifier") {
         return Occurrence::None;
@@ -280,23 +298,18 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
-        // A method's own declaration name: not reachable via any binding or
-        // type-table lookup (methods are neither), so resolve it via its
-        // enclosing type's members — the one case goto-definition's ladder
-        // never has to handle (it starts from a *use*, never a method's own
-        // declaring name).
+        // A method's own declaration name resolves to ITS OWN declaration —
+        // the node in hand is the declaration, so no member lookup is needed
+        // (and a name-only lookup could wrongly land on a same-named field).
         if parent.kind() == "method_declaration" && field_is(parent, "name", name_node) {
-            return match resolve::enclosing_typedecl(parent, ctx.doc.source, ctx.current) {
-                Some(td) => member_occurrence(
-                    &Resolved {
-                        ty: ResolvedType::InProject(td),
-                        static_only: false,
-                    },
-                    ctx,
-                    name,
-                ),
-                None => Occurrence::None,
-            };
+            return Occurrence::Site(ResolvedSite::Member(Member {
+                name,
+                kind: MemberKind::Method,
+                node: parent,
+                is_static: has_modifier(parent, ctx.doc.source, "static"),
+                source: ctx.doc.source,
+                doc: ctx.current,
+            }));
         }
         match parent.kind() {
             "field_access" if field_is(parent, "field", name_node) => {
@@ -304,7 +317,9 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
                     return Occurrence::None;
                 };
                 return match resolve::resolve_receiver_type(object, ctx) {
-                    Some(resolved) => member_occurrence(&resolved, ctx, name),
+                    Some(resolved) => {
+                        member_occurrence(&resolved, ctx, name, MemberNamespace::Field)
+                    }
                     None => Occurrence::UnresolvedReceiver,
                 };
             }
@@ -318,17 +333,22 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
                         }),
                 };
                 return match resolved {
-                    Some(resolved) => member_occurrence(&resolved, ctx, name),
+                    Some(resolved) => {
+                        member_occurrence(&resolved, ctx, name, MemberNamespace::Method)
+                    }
                     None => Occurrence::UnresolvedReceiver,
                 };
             }
             // Mid-edit `recv.member` (no trailing `;`) parses as a scoped
-            // path; same treatment as goto-definition/hover.
+            // path; same treatment as goto-definition/hover. Field-shaped
+            // (no argument list yet), so the field namespace.
             "scoped_type_identifier" | "scoped_identifier" => {
                 let segments = named_children(parent);
                 if segments.len() >= 2 && segments.last() == Some(&name_node) {
                     return match resolve::resolve_receiver_type(segments[0], ctx) {
-                        Some(resolved) => member_occurrence(&resolved, ctx, name),
+                        Some(resolved) => {
+                            member_occurrence(&resolved, ctx, name, MemberNamespace::Field)
+                        }
                         None => Occurrence::UnresolvedReceiver,
                     };
                 }
@@ -337,8 +357,9 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
         }
     }
 
-    // Plain reference: a local/param/field binding, else a bare in-project
-    // type name.
+    // Plain reference: a local/param/field binding (a bare identifier in
+    // expression position can only be a variable or field, never a method —
+    // methods require an argument list), else a bare in-project type name.
     if let Some(binding) = resolve::lookup_binding(
         ctx.doc.tree,
         ctx.doc.source,
@@ -352,8 +373,13 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     bare_type_site(name, ctx)
 }
 
-fn member_occurrence<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> Occurrence<'t> {
-    match resolve::find_member_hier(resolved, ctx, name) {
+fn member_occurrence<'t>(
+    resolved: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+    name: &str,
+    namespace: MemberNamespace,
+) -> Occurrence<'t> {
+    match resolve::find_member_hier_of_kind(resolved, ctx, name, namespace) {
         Some(HierMember::InProject(m)) => Occurrence::Site(ResolvedSite::Member(m)),
         // External (no `DeclSite`) or no such member on an otherwise-resolved
         // receiver: genuinely not our target, not a receiver-resolution
@@ -583,5 +609,121 @@ mod tests {
         assert_eq!(hits.ranges.len(), 1, "{hits:?}");
         let this_name = src.find("this.name").unwrap() + "this.".len();
         assert_eq!(hits.ranges[0], this_name..this_name + "name".len());
+    }
+
+    /// M4.3 fix round 1 (Critical): a field and a method with the SAME name
+    /// in the same class (Java keeps them in separate namespaces) must not
+    /// conflate — references on the field find only field occurrences
+    /// (declaration + `c.foo`), references on the method only method
+    /// occurrences (declaration + `c.foo()`), from every cursor position.
+    #[test]
+    fn field_and_method_with_same_name_do_not_conflate() {
+        let src = "class C {\n\
+                   int foo;\n\
+                   void foo() {}\n\
+                   void m(C c) { int a = c.foo + 1; c.foo(); }\n\
+                   }\n";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+
+        let field_decl = src.find("foo;").unwrap();
+        let method_decl = src.find("foo() {}").unwrap();
+        let field_use = src.find("foo + 1").unwrap();
+        let call = src.find("foo();").unwrap();
+
+        // All four cursor positions resolve, and to exactly two distinct
+        // targets: {field decl, field use} -> the field's DeclSite;
+        // {method decl, call} -> the method's DeclSite.
+        let t_field_decl = target_at(&docs, 0, "foo;");
+        let t_method_decl = target_at(&docs, 0, "foo() {}");
+        let t_field_use = target_at(&docs, 0, "foo + 1");
+        let t_call = target_at(&docs, 0, "foo();");
+        assert_eq!(
+            t_field_decl.name_range,
+            field_decl..field_decl + 3,
+            "field decl cursor must target the field"
+        );
+        assert_eq!(
+            t_field_use.name_range, t_field_decl.name_range,
+            "field use cursor must target the field"
+        );
+        assert_eq!(
+            t_method_decl.name_range,
+            method_decl..method_decl + 3,
+            "method decl cursor must target the method"
+        );
+        assert_eq!(
+            t_call.name_range, t_method_decl.name_range,
+            "call cursor must target the method"
+        );
+        assert_ne!(t_field_decl.name_range, t_method_decl.name_range);
+
+        // Field references: its declaration + the `c.foo` use — NOT the
+        // method's declaration or the `c.foo()` call.
+        let field_hits = references_in_doc(&docs, 0, &t_field_decl, true, &NoSymbols);
+        assert_eq!(field_hits.ranges.len(), 2, "{field_hits:?}");
+        assert!(field_hits.ranges.contains(&(field_decl..field_decl + 3)));
+        assert!(field_hits.ranges.contains(&(field_use..field_use + 3)));
+
+        // Method references: its declaration + the `c.foo()` call — NOT the
+        // field's declaration or the `c.foo` use.
+        let method_hits = references_in_doc(&docs, 0, &t_method_decl, true, &NoSymbols);
+        assert_eq!(method_hits.ranges.len(), 2, "{method_hits:?}");
+        assert!(method_hits.ranges.contains(&(method_decl..method_decl + 3)));
+        assert!(method_hits.ranges.contains(&(call..call + 3)));
+    }
+
+    /// M4.3 fix round 1 (Critical): cross-kind through the hierarchy — a
+    /// field `foo` in the superclass (another doc) and a method `foo()` in
+    /// the subclass must stay separate: `b.foo` resolves to the inherited
+    /// field, `b.foo()` to the subclass method, and neither's references
+    /// include the other's occurrences.
+    #[test]
+    fn cross_kind_same_name_through_hierarchy_does_not_conflate() {
+        let doc_a = "class A { int foo; }\n";
+        let doc_b = "class B extends A {\n\
+                     void foo() {}\n\
+                     void m(B b) { int x = b.foo + 1; b.foo(); }\n\
+                     }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+
+        // `b.foo` (field position) resolves through the hierarchy to A's
+        // field, skipping B's same-named method.
+        let t_field = target_at(&docs, 0, "foo + 1");
+        assert_eq!(t_field.doc, 1, "field target is declared in doc A");
+        let a_field = doc_a.find("foo").unwrap();
+        assert_eq!(t_field.name_range, a_field..a_field + 3);
+
+        // `b.foo()` (call position) resolves to B's own method.
+        let t_method = target_at(&docs, 0, "foo();");
+        assert_eq!(t_method.doc, 0, "method target is declared in doc B");
+        let b_method = doc_b.find("foo() {}").unwrap();
+        assert_eq!(t_method.name_range, b_method..b_method + 3);
+
+        // Scanning B for the field finds only the `b.foo` use; for the
+        // method, only its declaration + the `b.foo()` call.
+        let field_hits = references_in_doc(&docs, 0, &t_field, false, &NoSymbols);
+        let field_use = doc_b.find("foo + 1").unwrap();
+        assert_eq!(field_hits.ranges, vec![field_use..field_use + 3]);
+
+        let method_hits = references_in_doc(&docs, 0, &t_method, true, &NoSymbols);
+        let call = doc_b.find("foo();").unwrap();
+        assert_eq!(method_hits.ranges.len(), 2, "{method_hits:?}");
+        assert!(method_hits.ranges.contains(&(b_method..b_method + 3)));
+        assert!(method_hits.ranges.contains(&(call..call + 3)));
     }
 }

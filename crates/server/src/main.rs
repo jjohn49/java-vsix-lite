@@ -34,13 +34,23 @@ use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefi
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-/// Bound on the step-(c) parse-on-demand cache (an unopened project source
-/// file referenced by an open one) and the step-(d) external stub/source
-/// cache: cleared wholesale past this many entries rather than tracking LRU —
-/// both paths are rare enough (cold, one-off lookups) that eviction pressure
-/// is low and a simple bound is not worth extra bookkeeping.
+/// Bound on the step-(d) external stub/source cache: cleared wholesale past
+/// this many entries rather than tracking LRU — the path is rare enough
+/// (cold, one-off lookups) that eviction pressure is low and a simple bound
+/// is not worth extra bookkeeping.
 const EXTERNAL_CACHE_CAP: usize = 32;
-const PROJECT_FILE_CACHE_CAP: usize = 32;
+
+/// Bound on the parse-on-demand project-file cache, shared by goto-definition
+/// ladder step (c) (one file per request) and M4.3 find-references' Tier-2
+/// confirm (up to `references::MAX_FILES_SCANNED` = 500 hit files in a single
+/// request). Same clear-wholesale-on-overflow policy as
+/// [`EXTERNAL_CACHE_CAP`], but sized so a typical references request's hit
+/// set survives within one request *and* is still warm for a follow-up
+/// request on the same symbol (500 hit files is the pathological cap;
+/// real hit sets are far smaller). ~256 parsed small-to-medium `.java` files
+/// is a few tens of MB at worst — bounded, and cleared rather than grown when
+/// exceeded.
+const PROJECT_FILE_CACHE_CAP: usize = 256;
 
 /// A single project source file parsed on demand for ladder step (c),
 /// invalidated by `mtime` so an on-disk edit is picked up without an explicit
@@ -215,10 +225,9 @@ impl Backend {
         if !fresh {
             let text = std::fs::read_to_string(path).ok()?;
             let tree = self.parse(&text, None);
-            if cache.len() >= PROJECT_FILE_CACHE_CAP {
-                cache.clear();
-            }
-            cache.insert(
+            insert_bounded_project_file(
+                &mut cache,
+                PROJECT_FILE_CACHE_CAP,
                 path.to_path_buf(),
                 CachedProjectFile {
                     mtime,
@@ -504,6 +513,23 @@ fn render_stub(info: &jvl_classpath::ClassInfo) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// Insert into the bounded project-file cache, clearing it wholesale when
+/// the cap is reached (the same simple bound-not-LRU policy as the external
+/// stub cache — see [`PROJECT_FILE_CACHE_CAP`]'s doc comment for sizing).
+/// A free function (not a `Backend` method) so the overflow behavior is
+/// directly unit-testable without constructing a `Client`.
+fn insert_bounded_project_file(
+    cache: &mut HashMap<PathBuf, CachedProjectFile>,
+    cap: usize,
+    path: PathBuf,
+    file: CachedProjectFile,
+) {
+    if cache.len() >= cap {
+        cache.clear();
+    }
+    cache.insert(path, file);
 }
 
 /// Convert a byte range (from `jvl-syntax`) into an LSP `Range` via `index`.
@@ -1074,6 +1100,12 @@ impl LanguageServer for Backend {
             include_declaration,
             &symbols,
         );
+        // Textual hits that could not be confirmed by resolution (receiver
+        // type unresolved — e.g. an unknown supertype) are conservatively
+        // OMITTED from the results; aggregate their count across every
+        // scanned file so the user can be told the list may be incomplete.
+        let mut possible = own_hits.possible;
+        let mut truncated = false;
         locations.extend(own_hits.ranges.into_iter().map(|range| Location {
             uri: target_uri_parsed.clone(),
             range: byte_range_to_lsp(&target_index, range),
@@ -1131,6 +1163,7 @@ impl LanguageServer for Backend {
                     include_declaration,
                     &symbols,
                 );
+                possible += hits.possible;
                 if !hits.ranges.is_empty() {
                     if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
                         let hit_index = LineIndex::new(&hit_text, self.encoding());
@@ -1144,17 +1177,40 @@ impl LanguageServer for Backend {
                 tokio::task::yield_now().await;
             }
 
-            if scan.truncated {
-                self.client
-                    .show_message(
-                        MessageType::INFO,
-                        format!(
-                            "References search truncated at {} files; results may be incomplete.",
-                            references::MAX_FILES_SCANNED
-                        ),
-                    )
-                    .await;
-            }
+            truncated = scan.truncated;
+        }
+
+        // One informational notice per request at most, covering both
+        // incompleteness signals: the scan hit its cap, and/or textual hits
+        // were omitted because they couldn't be confirmed by resolution.
+        if possible > 0 {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "references: {possible} textual match(es) for `{}` could not be \
+                         confirmed by resolution and were omitted",
+                        snapshot.target.name
+                    ),
+                )
+                .await;
+        }
+        let mut notice_parts: Vec<String> = Vec::new();
+        if truncated {
+            notice_parts.push(format!(
+                "References search truncated at {} files; results may be incomplete.",
+                references::MAX_FILES_SCANNED
+            ));
+        }
+        if possible > 0 {
+            notice_parts.push(format!(
+                "{possible} possible additional match(es) could not be confirmed."
+            ));
+        }
+        if !notice_parts.is_empty() {
+            self.client
+                .show_message(MessageType::INFO, notice_parts.join(" "))
+                .await;
         }
 
         Ok((!locations.is_empty()).then_some(locations))
@@ -1383,5 +1439,35 @@ mod tests {
             ..Default::default()
         };
         assert!(unresolved_member_diagnostics_opt(&params));
+    }
+
+    /// M4.3 fix round 1: the project-file cache never exceeds its cap — at
+    /// the cap it clears wholesale and keeps accepting inserts (a Tier-2
+    /// references request can push up to 500 files through it in one go).
+    #[test]
+    fn project_file_cache_clears_at_cap_and_stays_bounded() {
+        let mut parser = jvl_syntax::new_parser();
+        let tree = jvl_syntax::parse(&mut parser, "class X {}\n", None).expect("parse");
+        let mut cache: HashMap<PathBuf, CachedProjectFile> = HashMap::new();
+        let cap = 8; // small stand-in; the policy is cap-independent
+        for i in 0..cap * 3 {
+            insert_bounded_project_file(
+                &mut cache,
+                cap,
+                PathBuf::from(format!("/proj/F{i}.java")),
+                CachedProjectFile {
+                    mtime: SystemTime::now(),
+                    text: Arc::new("class X {}\n".to_string()),
+                    tree: tree.clone(),
+                },
+            );
+            assert!(
+                cache.len() <= cap,
+                "cache must never exceed its cap (len {} > cap {cap})",
+                cache.len()
+            );
+        }
+        // After a clear the newest entry is always present.
+        assert!(cache.contains_key(Path::new(&format!("/proj/F{}.java", cap * 3 - 1))));
     }
 }

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Tree};
 
-use crate::external::{ExternalMember, SymbolSource};
+use crate::external::{ExternalMember, ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
 use crate::model::{
     base_type_name, named_children, DeclSite, Member, MemberKind, TypeDecl, TypeTable,
@@ -471,6 +471,53 @@ pub(crate) fn find_member_hier<'t>(
     collect_members(resolved, ctx)
         .into_iter()
         .find(|m| m.name() == name)
+}
+
+/// Which Java member namespace a reference occupies. Java resolves fields
+/// and methods in *separate* namespaces (JLS §6.5): `recv.foo()` can only
+/// mean a method; `recv.foo` / a bare `foo` in expression position can only
+/// mean a field (or enum constant). [`find_member_hier`] is namespace-blind
+/// (first name match wins), which is fine for hover/completion's
+/// display-oriented lookups; reference confirmation must not conflate a
+/// field with a same-named method, so it goes through
+/// [`find_member_hier_of_kind`] instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MemberNamespace {
+    Method,
+    Field,
+}
+
+impl MemberNamespace {
+    fn matches(self, member: &HierMember) -> bool {
+        match member {
+            HierMember::InProject(m) => match self {
+                MemberNamespace::Method => matches!(m.kind, MemberKind::Method),
+                MemberNamespace::Field => {
+                    matches!(m.kind, MemberKind::Field | MemberKind::EnumConstant)
+                }
+            },
+            HierMember::External(m) => match self {
+                MemberNamespace::Method => m.kind == ExternalMemberKind::Method,
+                MemberNamespace::Field => m.kind == ExternalMemberKind::Field,
+            },
+        }
+    }
+}
+
+/// The member named `name` in the given [`MemberNamespace`], on a resolved
+/// type or any supertype. A kind-aware variant of [`find_member_hier`] — a
+/// deliberately separate function rather than a behavior change to that one,
+/// which hover/completion consume and whose name-only semantics must not
+/// shift underneath them (M4.3 fix round 1).
+pub(crate) fn find_member_hier_of_kind<'t>(
+    resolved: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+    name: &str,
+    namespace: MemberNamespace,
+) -> Option<HierMember<'t>> {
+    collect_members(resolved, ctx)
+        .into_iter()
+        .find(|m| m.name() == name && namespace.matches(m))
 }
 
 fn walk_members<'t>(
