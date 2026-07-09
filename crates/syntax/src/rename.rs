@@ -76,9 +76,16 @@ pub fn prepare_rename(
     })
 }
 
+/// Reserved words a rename must refuse that `completion::KEYWORDS` (a
+/// completion-offer list, not a validity list) deliberately omits: `goto`
+/// and `const` are JLS §3.9 reserved-but-unusable keywords (`int goto = 1;`
+/// does not compile, so completion never offers them), and a lone `_` is a
+/// reserved identifier since Java 9 (JLS §3.8).
+const RENAME_RESERVED: &[&str] = &["goto", "const", "_"];
+
 /// Whether `name` is a syntactically valid Java identifier (starts with a
 /// letter/`_`/`$`, continues with letters/digits/`_`/`$`) and not a reserved
-/// word or literal (`class`, `true`, …).
+/// word or literal (`class`, `true`, `goto`, a lone `_`, …).
 pub fn is_valid_new_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -90,7 +97,7 @@ pub fn is_valid_new_name(name: &str) -> bool {
     if !chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
         return false;
     }
-    !KEYWORDS.contains(&name)
+    !KEYWORDS.contains(&name) && !RENAME_RESERVED.contains(&name)
 }
 
 /// Cheap, conservative same-scope collision guard: does the scope that
@@ -187,7 +194,10 @@ enum MemberNamespace {
 }
 
 /// Does the enclosing type already declare another member named `new_name`
-/// in the same namespace as the one being renamed?
+/// in the same namespace as the one being renamed? The target itself is
+/// excluded (same `!= target.name` style as [`type_sibling_collision`]), so
+/// renaming a member to its own current name isn't misreported as a
+/// collision.
 fn member_collision(
     doc: &OpenDoc,
     target: &ReferenceTarget,
@@ -200,7 +210,7 @@ fn member_collision(
     };
     td.own_members()
         .into_iter()
-        .any(|m| m.name == new_name && kind_matches_namespace(m.kind, ns))
+        .any(|m| m.name == new_name && m.name != target.name && kind_matches_namespace(m.kind, ns))
 }
 
 /// Does a sibling type already use `new_name` — another nested type of the
@@ -296,6 +306,19 @@ mod tests {
         assert!(!is_valid_new_name("true"));
     }
 
+    /// M4.4 fix round 1: `goto`/`const` are JLS §3.9 reserved-but-unusable
+    /// keywords and a lone `_` is reserved since Java 9 — none appear in the
+    /// completion-oriented `KEYWORDS` list, but a rename must refuse all
+    /// three (while `_`-prefixed and `_`-containing names stay legal).
+    #[test]
+    fn is_valid_new_name_rejects_jls_reserved_and_lone_underscore() {
+        assert!(!is_valid_new_name("goto"));
+        assert!(!is_valid_new_name("const"));
+        assert!(!is_valid_new_name("_"));
+        assert!(is_valid_new_name("_x"));
+        assert!(is_valid_new_name("go_to"));
+    }
+
     #[test]
     fn is_valid_new_name_rejects_empty_and_invalid_chars() {
         assert!(!is_valid_new_name(""));
@@ -385,6 +408,31 @@ mod tests {
             "field/method are separate namespaces"
         );
         assert!(!collides_with_existing(&docs, &target, "d"));
+    }
+
+    /// M4.4 fix round 1: renaming a member to its own current name must not
+    /// be misreported as a same-scope collision — the target itself is
+    /// excluded from the sibling scan (fields and methods alike).
+    #[test]
+    fn member_renamed_to_its_own_name_is_not_a_collision() {
+        let src = "class C { int a; void foo() {} }\n";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+
+        let field_at = src.find("a;").unwrap();
+        let field_target = reference_target(&docs, 0, &index, index.position(field_at), &NoSymbols)
+            .expect("field target resolved");
+        assert!(!collides_with_existing(&docs, &field_target, "a"));
+
+        let method_at = src.find("foo()").unwrap();
+        let method_target =
+            reference_target(&docs, 0, &index, index.position(method_at), &NoSymbols)
+                .expect("method target resolved");
+        assert!(!collides_with_existing(&docs, &method_target, "foo"));
     }
 
     /// M4.4: a `public` top-level type is recognized as such; a nested type

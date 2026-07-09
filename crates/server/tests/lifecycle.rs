@@ -1125,8 +1125,23 @@ fn rename_rejects_invalid_new_name() {
         "reserved-word new name must be refused: {reserved}"
     );
 
-    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
-    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    // M4.4 fix round 1: `goto`/`const` (JLS §3.9 reserved-but-unusable
+    // keywords) and a lone `_` (reserved since Java 9) are absent from the
+    // completion-oriented keyword list but must still be refused, with the
+    // invalid-name error specifically.
+    for (id, name) in [(4, "goto"), (5, "const"), (6, "_")] {
+        send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"textDocument/rename","params":{{"textDocument":{{"uri":"file:///InvalidName.java"}},"position":{{"line":0,"character":25}},"newName":"{name}"}}}}"#
+        ));
+        let refused = read_until(&mut reader, &format!("\"id\":{id}"), &mut seen);
+        assert!(
+            refused.contains("\"error\"") && refused.contains("not a valid Java identifier"),
+            "reserved `{name}` must be refused with the invalid-name error: {refused}"
+        );
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":7,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":7", &mut seen);
     send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
     drop(stdin);
     let mut rest = String::new();
@@ -1343,6 +1358,18 @@ fn rename_public_class_includes_file_rename_when_capability_advertised() {
     assert!(
         result.contains(&bar_uri),
         "expected the RenameFile op's newUri to be {bar_uri}: {result}"
+    );
+    // M4.4 fix round 1: versioned TextDocumentEdits — the open declaring
+    // file carries its LSP version (1, from didOpen); the two on-disk-only
+    // files carry an explicit null version.
+    assert!(
+        result.contains("\"version\":1"),
+        "expected the open Foo.java edit to carry version 1: {result}"
+    );
+    assert_eq!(
+        result.matches("\"version\":null").count(),
+        2,
+        "expected exactly the two unopened files' edits to carry a null version: {result}"
     );
 
     send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
