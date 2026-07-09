@@ -20,6 +20,17 @@ fn frame(payload: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", payload.len(), payload)
 }
 
+/// Escape a Java source string for embedding as a JSON string literal's
+/// contents inside one of this file's hand-written request bodies —
+/// backslashes and quotes (`"hello"` literals are common in real source),
+/// then newlines. Order matters: backslashes first, so escaping quotes and
+/// newlines doesn't get double-escaped.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 /// Read a single `Content-Length`-framed message body, or `None` on EOF.
 fn read_frame(reader: &mut BufReader<ChildStdout>) -> Option<String> {
     let mut content_length: Option<usize> = None;
@@ -1885,4 +1896,158 @@ fn did_change_watched_files_ignores_unrelated_file() {
     let _ = reader.read_to_string(&mut rest);
     let status = child.wait().expect("wait for server exit");
     assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// The JDK's home directory for M5.4's `checkProject` end-to-end test,
+/// which needs a *real* `javac` to invoke — unlike the JDK-gated
+/// definition/hover round trips above (which only need `jvl-classpath`'s
+/// broader `best_jdk()` probing, i.e. jmods on disk), `javac::locate_javac`
+/// deliberately only checks `$JAVA_HOME`/an explicit override (per the task
+/// brief — never a PATH search), so this test sets `JAVA_HOME` explicitly
+/// on the spawned server's environment rather than relying on the ambient
+/// one (which may well be unset even where a JDK is otherwise
+/// discoverable, e.g. via `/usr/libexec/java_home` on macOS or a `java` on
+/// PATH). Still filesystem/OS-tool probing only, never a network fetch.
+fn discover_java_home() -> Option<String> {
+    if let Ok(existing) = std::env::var("JAVA_HOME") {
+        if !existing.is_empty() {
+            return Some(existing);
+        }
+    }
+    if let Ok(output) = Command::new("/usr/libexec/java_home").output() {
+        if output.status.success() {
+            let home = String::from_utf8(output.stdout).ok()?.trim().to_string();
+            if !home.is_empty() {
+                return Some(home);
+            }
+        }
+    }
+    None
+}
+
+/// M5 (5.4): the one-shot `javac` check command, end to end.
+/// Workspace-Trust gating lives entirely in `editors/vscode` (out of scope
+/// for a server-only test — the server has no notion of it and just does
+/// what it's told); this drives `workspace/executeCommand` directly, as the
+/// extension would after confirming trust. Covers: a broken and a good file
+/// on disk (neither ever opened) → `checkProject` → a `javac`-sourced
+/// diagnostic published against the broken file's URI and *no*
+/// `publishDiagnostics` at all for the good one; opening the broken file
+/// still shows its stale `javac` diagnostic (merged in, not clobbered); and
+/// editing it clears that diagnostic immediately (stale after edit), well
+/// before any second `checkProject` run. Skips gracefully (like the JDK
+/// round trips above) if no JDK is discoverable in this environment.
+#[test]
+fn check_project_javac_round_trip() {
+    let Some(java_home) = discover_java_home() else {
+        eprintln!("skipping check_project_javac_round_trip: no JDK discoverable");
+        return;
+    };
+
+    let root = temp_root("javac-check");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let good_path = src_dir.join("Good.java");
+    std::fs::write(
+        &good_path,
+        "package demo;\n\npublic class Good {\n    void ok() {\n        System.out.println(\"fine\");\n    }\n}\n",
+    )
+    .expect("write Good.java");
+    let broken_path = src_dir.join("Broken.java");
+    let broken_text = "package demo;\n\npublic class Broken {\n    void m() {\n        int x = \"hello\";\n    }\n}\n";
+    std::fs::write(&broken_path, broken_text).expect("write Broken.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("JAVA_HOME", &java_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"executeCommandProvider\"") && init.contains("java-vsix-lite.checkProject"),
+        "missing executeCommandProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let good_uri = format!("file://{}", good_path.display());
+    let broken_uri = format!("file://{}", broken_path.display());
+
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"java-vsix-lite.checkProject","arguments":[]}}"#,
+    );
+    // Notifications the handler sends (the javac diagnostics publish) land
+    // on the wire *before* its own response — `read_until` for "id":2
+    // sweeps them into `seen` along the way, so they're inspected there
+    // rather than via a further `read_until` (which would just block: no
+    // more frames are coming until the next request).
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        result.contains("\"status\":\"ok\""),
+        "expected checkProject to run successfully: {result}"
+    );
+    assert!(
+        result.contains("\"errorCount\":1"),
+        "expected exactly one javac error (Broken.java): {result}"
+    );
+
+    assert!(
+        seen.iter()
+            .any(|f| f.contains(&broken_uri) && f.contains("\"source\":\"javac\"")),
+        "expected a javac-sourced diagnostic published for Broken.java: {seen:#?}"
+    );
+    assert!(
+        !seen.iter().any(|f| f.contains(&good_uri)),
+        "Good.java compiled clean — it must never receive a publishDiagnostics notification: {seen:#?}"
+    );
+
+    // Opening the broken file still shows its stale javac diagnostic —
+    // merged with (here, zero) syntax diagnostics, not clobbered.
+    let escaped_broken_text = json_escape(broken_text);
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{broken_uri}","languageId":"java","version":1,"text":"{escaped_broken_text}"}}}}}}"#
+    ));
+    let opened_diags = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        opened_diags.contains("\"source\":\"javac\""),
+        "opening the file should still show its stale javac diagnostic: {opened_diags}"
+    );
+
+    // Editing it clears the javac diagnostic immediately (stale after
+    // edit), before any second checkProject run.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{broken_uri}","version":2}},"contentChanges":[{{"text":"{escaped_broken_text}// edited\n"}}]}}}}"#
+    ));
+    let after_edit = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        !after_edit.contains("\"source\":\"javac\""),
+        "javac diagnostic must clear on didChange, before any new checkProject run: {after_edit}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
 }

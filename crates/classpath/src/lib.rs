@@ -97,6 +97,14 @@ pub struct Classpath {
     /// local cache, or a resolution bound was hit) — e.g. for surfacing
     /// "IntelliSense partial: N unresolved deps" to the user.
     degraded: Vec<String>,
+    /// M5.4: every dependency jar path added via [`Classpath::add_jar`], in
+    /// the order added — a record of what was already resolved, not a new
+    /// resolution path. This is the only external caller of this crate that
+    /// needs real filesystem paths rather than bytecode lookups: the one-shot
+    /// `javac` check command builds its `-cp` argument from these (JDK jmods
+    /// are deliberately excluded — javac's own installation already supplies
+    /// its bootclasspath, and jmods aren't valid `-cp` entries anyway).
+    entries: Vec<PathBuf>,
 }
 
 impl Classpath {
@@ -110,6 +118,7 @@ impl Classpath {
             source_cache: RwLock::new(HashMap::new()),
             source_roots: Vec::new(),
             degraded: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -171,6 +180,13 @@ impl Classpath {
         &self.source_roots
     }
 
+    /// Dependency jar paths added via [`Classpath::add_jar`] (JDK jmods are
+    /// not included — see the field doc on `entries`). M5.4: the one-shot
+    /// `javac` check command's `-cp` argument.
+    pub fn entries(&self) -> &[PathBuf] {
+        &self.entries
+    }
+
     /// Dependency coordinates that could not be fully resolved from the local
     /// cache (missing pom/jar, or a resolution bound was hit), e.g. to
     /// surface "IntelliSense partial: N unresolved deps" to the user.
@@ -183,6 +199,7 @@ impl Classpath {
     pub fn add_jar(&mut self, path: &Path) {
         if let Some(zip) = ZipArchive::open(path, 0) {
             self.archives.push(Archive { zip, prefix: "" });
+            self.entries.push(path.to_path_buf());
         }
         if let Some(sources) = sources_jar_path(path) {
             if let Some(zip) = ZipArchive::open(&sources, 0) {

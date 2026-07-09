@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod javac;
 mod references;
 mod workspace_index;
 
@@ -149,6 +150,16 @@ impl RebuildCoalescer {
     }
 }
 
+/// RAII guard releasing `Backend::javac_running` on drop — see
+/// `Backend::execute_command`.
+struct JavacRunningGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for JavacRunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct Backend {
     client: Client,
     /// Reused across parses; held only for synchronous parse calls, never across
@@ -211,6 +222,29 @@ struct Backend {
     /// includes `"rename"` — gates whether `rename`'s `WorkspaceEdit` may
     /// include a `RenameFile` resource op (text edits are emitted either way).
     supports_rename_file: OnceLock<bool>,
+    /// M5.4: an explicit override for the JDK home to find `javac` under
+    /// (`java-vsix-lite.jdk.home` initialization option), tried before
+    /// `$JAVA_HOME` — see `javac::locate_javac`.
+    jdk_home_override: OnceLock<Option<PathBuf>>,
+    /// M5.4: the `javac` check's timeout, already clamped to
+    /// `[10, 600]` seconds (`javacTimeoutSecs` initialization option,
+    /// default 120) — see `javac::clamp_timeout_secs`.
+    javac_timeout_secs: OnceLock<u64>,
+    /// M5.4: one `checkProject` run at a time — `true` while a run is in
+    /// flight; a concurrent `executeCommand` sees `true` and returns
+    /// "already running" instead of starting a second `javac`.
+    javac_running: std::sync::atomic::AtomicBool,
+    /// M5.4: the currently-running `javac` child (if any), shared with
+    /// `javac::run`'s polling loop so `shutdown` can kill+reap it — see
+    /// `javac::kill_running_child`.
+    javac_child: javac::SharedChild,
+    /// M5.4: diagnostics from the last `checkProject` run, keyed by URI
+    /// string, merged into `compute_diagnostics`'s result for that file.
+    /// Cleared for a file on its next `didChange` (stale after edit) and
+    /// wholesale-replaced (with a publish to clear anything that dropped
+    /// out) on every new `checkProject` run — see
+    /// `Backend::publish_javac_diagnostics`.
+    javac_diagnostics: StdMutex<HashMap<String, Vec<Diagnostic>>>,
 }
 
 impl Backend {
@@ -233,6 +267,11 @@ impl Backend {
             workspace_index: workspace_index::WorkspaceIndex::new(),
             workspace_index_truncation_logged: std::sync::atomic::AtomicBool::new(false),
             supports_rename_file: OnceLock::new(),
+            jdk_home_override: OnceLock::new(),
+            javac_timeout_secs: OnceLock::new(),
+            javac_running: std::sync::atomic::AtomicBool::new(false),
+            javac_child: Arc::new(StdMutex::new(None)),
+            javac_diagnostics: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -572,17 +611,33 @@ impl Backend {
     }
 
     /// Syntax diagnostics for a document already stored under `uri`, plus
-    /// unresolved-member diagnostics unless that setting has been turned off.
+    /// unresolved-member diagnostics unless that setting has been turned
+    /// off, plus (M5.4) any `javac` diagnostics still on file for `uri` —
+    /// merged in, never clobbering either set. Unlike the first two, the
+    /// `javac` diagnostics don't require `uri` to be an open document: a
+    /// checked file the editor never opened still gets its diagnostics
+    /// published (see `Backend::publish_javac_diagnostics`).
     fn compute_diagnostics(&self, docs: &HashMap<String, Document>, uri: &str) -> Vec<Diagnostic> {
-        let Some(doc) = docs.get(uri) else {
-            return Vec::new();
+        let mut diagnostics = match docs.get(uri) {
+            Some(doc) => {
+                let index = LineIndex::new(&doc.text, self.encoding());
+                let mut d = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
+                if self.unresolved_member_diagnostics.get().copied() == Some(true) {
+                    let open = open_docs(docs, uri, doc);
+                    let symbols = ClasspathSymbols(self.classpath());
+                    d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
+                }
+                d
+            }
+            None => Vec::new(),
         };
-        let index = LineIndex::new(&doc.text, self.encoding());
-        let mut diagnostics = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
-        if self.unresolved_member_diagnostics.get().copied() == Some(true) {
-            let open = open_docs(docs, uri, doc);
-            let symbols = ClasspathSymbols(self.classpath());
-            diagnostics.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
+        if let Some(javac_diags) = self
+            .javac_diagnostics
+            .lock()
+            .expect("javac diagnostics poisoned")
+            .get(uri)
+        {
+            diagnostics.extend(javac_diags.clone());
         }
         diagnostics
     }
@@ -606,6 +661,131 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+    }
+
+    /// The `javacTimeoutSecs` initialization option, already clamped.
+    fn javac_timeout(&self) -> Duration {
+        Duration::from_secs(self.javac_timeout_secs.get().copied().unwrap_or(120))
+    }
+
+    /// M5.4: `java-vsix-lite.checkProject` — see the module doc comment on
+    /// `javac` for the security invariants this must never violate.
+    /// Concurrency (one run at a time) is enforced by the caller
+    /// (`execute_command`), which claims `javac_running` before calling this
+    /// and releases it afterward; this method assumes that's already done.
+    async fn run_check_project(&self) -> serde_json::Value {
+        let Some(project_root) = self.project_root() else {
+            return serde_json::json!({
+                "status": "error",
+                "message": "no project root (open a workspace folder or a file under a Maven/Gradle project)",
+            });
+        };
+
+        let javac_path = match javac::locate_javac(
+            self.jdk_home_override.get().and_then(|o| o.as_deref()),
+        ) {
+            Some(path) => path,
+            None => {
+                return serde_json::json!({
+                    "status": "javac-not-found",
+                    "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
+                });
+            }
+        };
+
+        let classpath = self.classpath();
+        let roots = {
+            let docs = self.documents.lock().await;
+            let mut roots = self.source_roots(&docs, &project_root);
+            roots.extend(classpath.source_roots().iter().cloned());
+            roots
+        };
+        let source_files = javac::collect_source_files(&roots);
+        if source_files.is_empty() {
+            return serde_json::json!({
+                "status": "error",
+                "message": "no .java source files found under the discovered source roots",
+            });
+        }
+
+        let config = javac::RunConfig {
+            javac_path,
+            source_files,
+            classpath_entries: classpath.entries().to_vec(),
+            timeout: self.javac_timeout(),
+        };
+        let slot = Arc::clone(&self.javac_child);
+        let outcome = tokio::task::spawn_blocking(move || javac::run(config, &slot))
+            .await
+            .unwrap_or_else(|err| {
+                javac::RunOutcome::SpawnError(format!("javac task panicked: {err}"))
+            });
+
+        match outcome {
+            javac::RunOutcome::TimedOut => serde_json::json!({
+                "status": "timeout",
+                "message": format!("javac timed out after {}s and was killed", self.javac_timeout().as_secs()),
+            }),
+            javac::RunOutcome::Cancelled => serde_json::json!({
+                "status": "cancelled",
+                "message": "javac was killed by server shutdown",
+            }),
+            javac::RunOutcome::SpawnError(message) => serde_json::json!({
+                "status": "spawn-error",
+                "message": message,
+            }),
+            javac::RunOutcome::Completed { stderr } => {
+                let raw = javac::parse_stderr(&stderr);
+                let (error_count, warning_count) = javac::count_severities(&raw);
+                let grouped = javac::group_diagnostics(raw);
+                self.publish_javac_diagnostics(grouped).await;
+                serde_json::json!({
+                    "status": "ok",
+                    "errorCount": error_count,
+                    "warningCount": warning_count,
+                })
+            }
+        }
+    }
+
+    /// M5.4: replace the javac-diagnostics set wholesale with `new_diags`
+    /// (keyed by filesystem path, as `javac` echoed it) and (re)publish
+    /// every affected URI — both newly (or still) diagnosed files and any
+    /// file that had javac diagnostics before this run but doesn't anymore
+    /// (which must be published empty-of-javac to actually clear in the
+    /// client's Problems panel; LSP has no "leave unchanged" — an omitted
+    /// publish just means "nothing changed", not "clear"). Merges with each
+    /// file's other diagnostics via `compute_diagnostics`, never clobbering.
+    async fn publish_javac_diagnostics(&self, new_diags: HashMap<String, Vec<Diagnostic>>) {
+        let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
+            .into_iter()
+            .filter_map(|(path, diags)| {
+                Uri::from_file_path(Path::new(&path)).map(|uri| (uri.as_str().to_string(), diags))
+            })
+            .collect();
+
+        let affected: Vec<String> = {
+            let mut map = self
+                .javac_diagnostics
+                .lock()
+                .expect("javac diagnostics poisoned");
+            let mut affected: HashSet<String> = map.keys().cloned().collect();
+            affected.extend(new_map.keys().cloned());
+            *map = new_map;
+            affected.into_iter().collect()
+        };
+
+        for uri_str in affected {
+            let diagnostics = {
+                let docs = self.documents.lock().await;
+                self.compute_diagnostics(&docs, &uri_str)
+            };
+            if let Ok(uri) = uri_str.parse::<Uri>() {
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+            }
+        }
     }
 }
 
@@ -806,6 +986,32 @@ fn classpath_debounce_ms_opt(params: &InitializeParams) -> u64 {
         .and_then(|opts| opts.get("classpathDebounceMs"))
         .and_then(|value| value.as_u64())
         .unwrap_or(2000)
+}
+
+/// The `jdkHome` field from `initializationOptions` (the
+/// `java-vsix-lite.jdk.home` VS Code setting) — an explicit override for
+/// where to find `javac`, tried before `$JAVA_HOME`. `None` (the default)
+/// when unset or empty.
+fn jdk_home_opt(params: &InitializeParams) -> Option<PathBuf> {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.get("jdkHome"))
+        .and_then(|value| value.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The `javacTimeoutSecs` field from `initializationOptions` — how long
+/// M5.4's `checkProject` run waits before killing `javac`. Clamped to
+/// `[10, 600]` seconds (default 120) via `javac::clamp_timeout_secs`.
+fn javac_timeout_secs_opt(params: &InitializeParams) -> u64 {
+    let raw = params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.get("javacTimeoutSecs"))
+        .and_then(|value| value.as_u64());
+    javac::clamp_timeout_secs(raw)
 }
 
 /// Whether the client declared dynamic-registration support for
@@ -1333,6 +1539,8 @@ impl LanguageServer for Backend {
         let _ = self
             .classpath_debounce_ms
             .set(classpath_debounce_ms_opt(&params));
+        let _ = self.jdk_home_override.set(jdk_home_opt(&params));
+        let _ = self.javac_timeout_secs.set(javac_timeout_secs_opt(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
@@ -1395,6 +1603,14 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                // M5.4: the one-shot, trust-gated `javac` check command. The
+                // extension only sends this after confirming Workspace
+                // Trust; see `javac`'s module doc comment for the rest of
+                // the security invariants.
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![javac::CHECK_PROJECT_COMMAND.to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -1441,6 +1657,9 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        // M5.4: a `checkProject` run in flight must never survive the
+        // server as a zombie or an orphaned process — kill and reap it.
+        javac::kill_running_child(&self.javac_child);
         Ok(())
     }
 
@@ -1464,6 +1683,15 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
+
+        // M5.4: an edit invalidates any javac diagnostics for this file —
+        // they're stale the instant the source they were computed from
+        // changes. Cleared here (rather than left to the next checkProject
+        // run) so they disappear from Problems immediately on edit.
+        self.javac_diagnostics
+            .lock()
+            .expect("javac diagnostics poisoned")
+            .remove(uri.as_str());
 
         // Apply edits to the cached text + tree under the lock (all synchronous),
         // reparse, then drop the lock before the async publish.
@@ -1546,6 +1774,32 @@ impl LanguageServer for Backend {
         if become_driver {
             self.drive_classpath_rebuild().await;
         }
+    }
+
+    /// M5.4: `workspace/executeCommand` — currently only
+    /// `javac::CHECK_PROJECT_COMMAND`. Explicit, one-shot, never automatic;
+    /// the extension only sends this after confirming Workspace Trust (the
+    /// server itself has no notion of that and just does what it's told —
+    /// see `javac`'s module doc comment).
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command != javac::CHECK_PROJECT_COMMAND {
+            return Err(Error::method_not_found());
+        }
+        if self
+            .javac_running
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(serde_json::json!({ "status": "already-running" })));
+        }
+        // RAII: releases `javac_running` on every exit path (including an
+        // unexpected panic unwinding through here), so a single bad run can
+        // never wedge every future `checkProject` invocation.
+        let _guard = JavacRunningGuard(&self.javac_running);
+        let result = self.run_check_project().await;
+        Ok(Some(result))
     }
 
     async fn document_symbol(

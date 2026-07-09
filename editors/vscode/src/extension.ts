@@ -12,12 +12,27 @@ import * as path from "path";
 import * as util from "util";
 import * as vscode from "vscode";
 import {
+  ExecuteCommandRequest,
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
   State,
   TransportKind,
 } from "vscode-languageclient/node";
+
+// M5.4: the one-shot javac check command. The result shape mirrors the
+// server's `checkProject` executeCommand response (see `crates/server/src/
+// main.rs`'s `run_check_project` and `javac.rs`'s module doc comment for the
+// security invariants — `-proc:none` mandatory, JDK discovered never
+// downloaded, explicit invocation only).
+interface CheckProjectResult {
+  status: string;
+  message?: string;
+  errorCount?: number;
+  warningCount?: number;
+}
+
+const CHECK_PROJECT_COMMAND = "java-vsix-lite.checkProject";
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
@@ -49,6 +64,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand("java-vsix-lite.restartServer", async () => {
       await restart(context);
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CHECK_PROJECT_COMMAND, async () => {
+      await checkProject();
     }),
   );
 
@@ -161,6 +182,12 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
       unresolvedMemberDiagnostics: vscode.workspace
         .getConfiguration("java-vsix-lite")
         .get<boolean>("diagnostics.unresolvedMembers", true),
+      // M5.4: an explicit override for where to find `javac`, tried before
+      // $JAVA_HOME (empty string means "unset" — the server falls back).
+      jdkHome: vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home", ""),
+      javacTimeoutSecs: vscode.workspace
+        .getConfiguration("java-vsix-lite")
+        .get<number>("javac.timeoutSecs", 120),
     },
   };
 
@@ -189,6 +216,81 @@ async function restart(context: vscode.ExtensionContext): Promise<void> {
   await client?.stop();
   client = undefined;
   await start(context);
+}
+
+// M5.4: the one-shot, trust-gated javac check command. Spawning javac is
+// build-adjacent (it compiles project code), so — per the threat model —
+// this refuses outright in an untrusted workspace, same as the (still
+// unimplemented) Gradle/Maven build commands. This is the *only* place that
+// gate is enforced on the extension side; the server has no notion of
+// Workspace Trust and just does what it's told, so this check is load-
+// bearing, not decorative.
+async function checkProject(): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: Check Project (javac) is disabled in an untrusted workspace — it spawns the JDK's javac compiler. Trust this workspace to enable it.",
+    );
+    return;
+  }
+  if (!client) {
+    void vscode.window.showErrorMessage("java-vsix-lite: the language server is not running.");
+    return;
+  }
+
+  const previousText = statusBar.text;
+  const previousTooltip = statusBar.tooltip;
+  statusBar.text = "$(loading~spin) Java Lite";
+  statusBar.tooltip = "java-vsix-lite: checking project (javac)…";
+  try {
+    const result = await client.sendRequest(ExecuteCommandRequest.type, {
+      command: CHECK_PROJECT_COMMAND,
+      arguments: [],
+    });
+    reportCheckProjectResult(result as CheckProjectResult);
+  } catch (err) {
+    void vscode.window.showErrorMessage(`java-vsix-lite: Check Project failed: ${String(err)}`);
+  } finally {
+    statusBar.text = previousText;
+    statusBar.tooltip = previousTooltip;
+  }
+}
+
+function reportCheckProjectResult(result: CheckProjectResult): void {
+  switch (result.status) {
+    case "ok": {
+      const errors = result.errorCount ?? 0;
+      const warnings = result.warningCount ?? 0;
+      if (errors > 0) {
+        void vscode.window.showErrorMessage(
+          `java-vsix-lite: Check Project found ${errors} error(s), ${warnings} warning(s). See Problems.`,
+        );
+      } else {
+        void vscode.window.showInformationMessage(
+          `java-vsix-lite: Check Project passed (${warnings} warning(s)).`,
+        );
+      }
+      break;
+    }
+    case "already-running":
+      void vscode.window.showInformationMessage(
+        "java-vsix-lite: Check Project is already running.",
+      );
+      break;
+    case "javac-not-found":
+      void vscode.window.showErrorMessage(
+        `java-vsix-lite: could not locate javac (${result.message ?? "not found"}). Set $JAVA_HOME or the java-vsix-lite.jdk.home setting.`,
+      );
+      break;
+    case "timeout":
+      void vscode.window.showErrorMessage(
+        `java-vsix-lite: Check Project timed out. ${result.message ?? ""}`,
+      );
+      break;
+    default:
+      void vscode.window.showErrorMessage(
+        `java-vsix-lite: Check Project failed: ${result.message ?? result.status}`,
+      );
+  }
 }
 
 function updateStatus(state: State): void {

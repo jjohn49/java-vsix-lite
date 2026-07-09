@@ -56,6 +56,18 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics). On by default; disable if you hit a false positive on a hierarchy the resolver can't fully see."
+        },
+        "java-vsix-lite.jdk.home": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a JDK home to use for `Check Project (javac)` (M5.4), tried before `$JAVA_HOME`. Leave empty to use `$JAVA_HOME`. Never downloaded — if neither resolves to a real `javac`, the check fails with a clear error."
+        },
+        "java-vsix-lite.javac.timeoutSecs": {
+          "type": "number",
+          "default": 120,
+          "minimum": 10,
+          "maximum": 600,
+          "markdownDescription": "How long `Check Project (javac)` (M5.4) waits before killing `javac`, in seconds. Clamped to 10–600."
         }
       }
     },
@@ -63,6 +75,11 @@
       {
         "command": "java-vsix-lite.restartServer",
         "title": "Restart Language Server",
+        "category": "java-vsix-lite"
+      },
+      {
+        "command": "java-vsix-lite.checkProject",
+        "title": "Check Project (javac)",
         "category": "java-vsix-lite"
       }
     ]
