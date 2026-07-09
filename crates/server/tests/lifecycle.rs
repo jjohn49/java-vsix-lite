@@ -2233,6 +2233,115 @@ fn completion_resolve_lazy_documentation_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
+/// M6 (6.3) fix round 1: with TWO open documents declaring the same type
+/// simple name AND the same member name (different Javadoc), resolve returns
+/// the doc from the ORIGINATING document — the item's `data.uri`, stamped at
+/// completion time — never whichever same-named type an unordered all-docs
+/// scan happens to find first. And once the originating document is closed
+/// (stale URI), resolve returns the item with no documentation, without
+/// erroring.
+#[test]
+fn completion_resolve_same_named_types_uses_originating_document() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // The decoy first: same `class Box`, same `int width`, different Javadoc.
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///DocB.java","languageId":"java","version":1,"text":"class Box { /** From B. */ int width; }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///DocA.java","languageId":"java","version":1,"text":"class Box {\n  /** From A. */\n  int width;\n  void m() { this.w }\n}\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Completion in DocA, cursor right after `this.w` (line 3, char 19).
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///DocA.java"},"position":{"line":3,"character":19}}}"#,
+    );
+    let completion = read_until(&mut reader, "\"id\":2", &mut seen);
+    let completion_json: Value =
+        serde_json::from_str(&completion).expect("parse completion response");
+    let width_item = completion_json["result"]
+        .as_array()
+        .expect("completion result array")
+        .iter()
+        .find(|i| i["label"] == "width")
+        .expect("width item present")
+        .clone();
+    assert_eq!(
+        width_item["data"]["uri"], "file:///DocA.java",
+        "data must name the originating document: {width_item:?}"
+    );
+
+    let resolve_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "completionItem/resolve",
+        "params": width_item,
+    });
+    send(&resolve_request.to_string());
+    let resolved = read_until(&mut reader, "\"id\":3", &mut seen);
+    let resolved_json: Value = serde_json::from_str(&resolved).expect("parse resolve response");
+    assert_eq!(
+        resolved_json["result"]["documentation"]["value"]
+            .as_str()
+            .expect("documentation.value string"),
+        "From A.",
+        "must be the ORIGINATING document's Javadoc, not the decoy's: {resolved_json:?}"
+    );
+
+    // Stale URI: close the originating document, resolve the same item again
+    // — no documentation, no error.
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///DocA.java"}}}"#,
+    );
+    let stale_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "completionItem/resolve",
+        "params": resolve_request["params"],
+    });
+    send(&stale_request.to_string());
+    let stale = read_until(&mut reader, "\"id\":4", &mut seen);
+    let stale_json: Value = serde_json::from_str(&stale).expect("parse stale resolve response");
+    assert!(
+        stale_json.get("error").is_none(),
+        "stale resolve must not error: {stale_json:?}"
+    );
+    assert!(
+        stale_json["result"].get("documentation").is_none(),
+        "stale URI must yield no documentation, never a guess: {stale_json:?}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":5", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
 /// M6 (6.3): the same lazy-resolve round trip for an *external* member —
 /// `String.length`'s Javadoc, recovered from the JDK's `src.zip` only when
 /// `completionItem/resolve` is actually invoked. Skips gracefully (like the

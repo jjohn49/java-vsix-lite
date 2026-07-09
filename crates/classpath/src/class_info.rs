@@ -210,11 +210,13 @@ fn render_field(descriptor: &FieldDescriptor) -> String {
 /// be deliberately malformed to test the fallback path).
 #[cfg(test)]
 mod fixture {
-    /// A method or field to include, plus its optional `Signature` attribute.
+    /// A method or field to include, plus its optional `Signature` attribute
+    /// and access flags (`ACC_PUBLIC` unless a test overrides them).
     pub(super) struct MemberSpec {
         pub name: &'static str,
         pub descriptor: &'static str,
         pub signature: Option<&'static str>,
+        pub flags: u16,
     }
 
     fn member(name: &'static str, descriptor: &'static str) -> MemberSpec {
@@ -222,11 +224,25 @@ mod fixture {
             name,
             descriptor,
             signature: None,
+            flags: 0x0001, // ACC_PUBLIC
         }
     }
 
     pub(super) fn method(name: &'static str, descriptor: &'static str) -> MemberSpec {
         member(name, descriptor)
+    }
+
+    /// A method with explicit access flags (e.g. `0x0002` = ACC_PRIVATE,
+    /// `0x0000` = package-private), for visibility-gate tests.
+    pub(super) fn method_flags(
+        name: &'static str,
+        descriptor: &'static str,
+        flags: u16,
+    ) -> MemberSpec {
+        MemberSpec {
+            flags,
+            ..member(name, descriptor)
+        }
     }
 
     pub(super) fn method_sig(
@@ -298,7 +314,7 @@ mod fixture {
         let name_idx = cp.utf8(m.name);
         let desc_idx = cp.utf8(m.descriptor);
         let mut out = Vec::new();
-        out.extend_from_slice(&0x0001u16.to_be_bytes()); // access_flags: ACC_PUBLIC
+        out.extend_from_slice(&m.flags.to_be_bytes()); // access_flags
         out.extend_from_slice(&name_idx.to_be_bytes());
         out.extend_from_slice(&desc_idx.to_be_bytes());
         match m.signature {
@@ -366,7 +382,7 @@ mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{build, field_sig, method, method_sig};
+    use super::fixture::{build, field_sig, method, method_flags, method_sig};
     use super::*;
 
     #[test]
@@ -553,5 +569,36 @@ mod tests {
         let bytes = build("test/HasClinit", None, &[], &[method("<clinit>", "()V")]);
         let info = parse(&bytes).expect("parses");
         assert!(info.members.is_empty(), "{:?}", info.members);
+    }
+
+    /// M6.3 fix round 1: private and package-private `<init>` methods go
+    /// through the same `method_visible` gate as regular methods — only
+    /// public/protected constructors are surfaced as `Constructor` members.
+    #[test]
+    fn non_visible_constructors_are_excluded() {
+        let bytes = build(
+            "test/Vis",
+            None,
+            &[],
+            &[
+                method_flags("<init>", "()V", 0x0002),  // ACC_PRIVATE
+                method_flags("<init>", "(I)V", 0x0000), // package-private
+                method_flags("<init>", "(J)V", 0x0004), // ACC_PROTECTED
+                method_flags("<init>", "(D)V", 0x0001), // ACC_PUBLIC
+            ],
+        );
+        let info = parse(&bytes).expect("parses");
+        let ctor_sigs: Vec<_> = info
+            .members
+            .iter()
+            .filter(|m| matches!(m.kind, MemberKind::Constructor))
+            .map(|m| m.signature.as_str())
+            .collect();
+        assert_eq!(
+            ctor_sigs,
+            vec!["Vis(long)", "Vis(double)"],
+            "only protected/public constructors survive: {:?}",
+            info.members
+        );
     }
 }

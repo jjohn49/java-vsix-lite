@@ -155,14 +155,27 @@ fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
 /// Lazy-resolve key for an in-project member's Javadoc: the *declaring*
 /// type's own simple name (found by walking up from the member's node, not
 /// the resolved receiver's — precise even for an inherited member, and needs
-/// no inheritance walk to re-find at resolve time) plus the member's name.
-/// `None` if the member somehow isn't inside any type declaration (never
-/// true for a `Member` built from `TypeDecl::own_members`, but resolution
-/// never panics on a shape it didn't expect).
+/// no inheritance walk to re-find at resolve time) plus the member's name,
+/// plus the index (`"doc"`) of the declaring document in the `&[OpenDoc]`
+/// slice this request ran against. The index is meaningless across requests
+/// (document maps have no stable order); the caller — the server, the only
+/// party that knows URIs (this crate is deliberately URI-free) — must
+/// translate it into the originating document's URI before the item goes on
+/// the wire, so `completionItem/resolve` can re-find *that exact document*
+/// rather than scanning all open documents, where a same-simple-name type
+/// declared elsewhere could win the lookup and yield the wrong member's
+/// Javadoc. `None` if the member somehow isn't inside any type declaration
+/// (never true for a `Member` built from `TypeDecl::own_members`, but
+/// resolution never panics on a shape it didn't expect).
 fn inproject_data(member: &Member) -> Option<Value> {
     let type_node = resolve::enclosing_type_node(member.node)?;
     let type_name = node_text(type_node.child_by_field_name("name")?, member.source);
-    Some(json!({ "kind": "inproject", "type": type_name, "member": member.name }))
+    Some(json!({
+        "kind": "inproject",
+        "type": type_name,
+        "member": member.name,
+        "doc": member.doc,
+    }))
 }
 
 fn external_item(member: &ExternalMember, resolved: &Resolved, snippets: bool) -> CompletionItem {
@@ -208,6 +221,16 @@ fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> 
 /// hover uses (`javadoc` + [`markdown`]). `None` on any missing/unrecognized
 /// key, or when the member no longer resolves (e.g. edited away since the
 /// completion request) — never a panic.
+///
+/// For an `"inproject"` key, `docs` must contain **only the originating
+/// document** (the one the item's `"doc"` index — translated by the server
+/// into a URI — named at completion time). Passing every open document
+/// instead would re-introduce the wrong-doc collision the index/URI exists
+/// to prevent: with two open files declaring same-named types and members,
+/// the simple-name `TypeTable` lookup could silently return the *other*
+/// file's member and attach the wrong Javadoc. When the originating document
+/// is no longer open, pass an empty slice — this resolves to `None` (no
+/// documentation) rather than guessing.
 pub fn resolve_documentation(
     docs: &[OpenDoc],
     data: &Value,
@@ -827,7 +850,39 @@ mod tests {
             "completion must not eagerly fetch Javadoc: {:?}",
             width.documentation
         );
-        assert!(width.data.is_some(), "expected a lazy-resolve data payload");
+        let data = width.data.as_ref().expect("lazy-resolve data payload");
+        // The payload names the declaring document by slice index (the
+        // server translates it into a URI before the item goes on the wire).
+        assert_eq!(data["doc"], 0, "{data:?}");
+        assert_eq!(data["type"], "Box", "{data:?}");
+        assert_eq!(data["member"], "width", "{data:?}");
+    }
+
+    /// M6.3 fix round 1: the `"doc"` index names the *declaring* document —
+    /// for a member declared in another open file, that file's index, not
+    /// the completion request's current document.
+    #[test]
+    fn inproject_data_doc_index_names_the_declaring_document() {
+        let lib = "class Widget { /** spins */ int spin; }\n";
+        let use_src = "class C { void m() { Widget w; w.x; } }\n";
+        let lib_tree = tree(lib);
+        let use_tree = tree(use_src);
+        let docs = [
+            OpenDoc {
+                source: use_src,
+                tree: &use_tree,
+            },
+            OpenDoc {
+                source: lib,
+                tree: &lib_tree,
+            },
+        ];
+        let index = LineIndex::new(use_src, PositionEncoding::Utf16);
+        let at = use_src.find("w.").unwrap() + 2;
+        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
+        let spin = items.iter().find(|i| i.label == "spin").unwrap();
+        let data = spin.data.as_ref().expect("lazy-resolve data payload");
+        assert_eq!(data["doc"], 1, "declaring doc is docs[1]: {data:?}");
     }
 
     #[test]
@@ -876,6 +931,40 @@ mod tests {
             Documentation::MarkupContent(m) => assert_eq!(m.value, "The width."),
             other => panic!("expected markup, got {other:?}"),
         }
+    }
+
+    /// M6.3 fix round 1: with two files both declaring a `Box.width`, the
+    /// caller narrows `docs` to the originating document — and gets *that*
+    /// document's Javadoc, not whichever same-named type an all-docs scan
+    /// would have found first. An empty slice (originating document closed
+    /// since completion) yields no documentation rather than a guess.
+    #[test]
+    fn resolve_documentation_scoped_to_originating_document_only() {
+        let src_a = "class Box { /** From A. */ int width; }\n";
+        let src_b = "class Box { /** From B. */ int width; }\n";
+        let tree_a = tree(src_a);
+        let tree_b = tree(src_b);
+        let data = serde_json::json!({
+            "kind": "inproject", "type": "Box", "member": "width", "doc": 0,
+        });
+
+        let from = |src, t| {
+            let docs = [OpenDoc {
+                source: src,
+                tree: t,
+            }];
+            resolve_documentation(&docs, &data, &NoSymbols)
+        };
+        match from(src_a, &tree_a).expect("doc resolved") {
+            Documentation::MarkupContent(m) => assert_eq!(m.value, "From A."),
+            other => panic!("expected markup, got {other:?}"),
+        }
+        match from(src_b, &tree_b).expect("doc resolved") {
+            Documentation::MarkupContent(m) => assert_eq!(m.value, "From B."),
+            other => panic!("expected markup, got {other:?}"),
+        }
+        // Originating document gone: no documentation, never a guess.
+        assert!(resolve_documentation(&[], &data, &NoSymbols).is_none());
     }
 
     #[test]
