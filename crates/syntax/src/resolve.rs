@@ -355,7 +355,12 @@ fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
 
 /// The full dotted name of a fully-qualified type node (`java.util.List`), or
 /// `None` for a simple (unqualified) type.
-fn dotted_type_name(type_node: Node, source: &str) -> Option<String> {
+///
+/// `pub(crate)` (M4.6): also used by `implementation.rs`'s per-supertype
+/// confirm, which must match a fully-qualified `extends`/`implements` entry
+/// against the target's real FQN rather than through the scanned file's
+/// imports (a qualified reference bypasses imports entirely).
+pub(crate) fn dotted_type_name(type_node: Node, source: &str) -> Option<String> {
     match type_node.kind() {
         "scoped_type_identifier" => {
             let parts = flatten_scoped(type_node, source);

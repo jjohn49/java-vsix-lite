@@ -18,20 +18,34 @@
 //!   bounded prefilter needle, same convention as
 //!   `ReferenceTarget::name`/`references::prefilter`) plus, for a
 //!   method-level query, the method's own name.
-//! - [`implementations_in_doc`] is the per-file confirm: [`TypeDecl::supers`]
-//!   already merges `extends`+`implements`(+`permits`) simple names, so
-//!   subclassing a concrete class and implementing an interface are the same
-//!   check — a candidate type "implements" the target iff the target's
-//!   simple name appears in its `supers` AND that name, read in the scanned
-//!   file's own import/package context, actually resolves to the target's
-//!   real declaration. That gate is [`crate::references::confirm_bare_type`]
-//!   — the exact same import-aware confirm `references.rs`'s
-//!   `bare_type_site` uses, reused here rather than duplicated (it is
-//!   file-level, not per-type, so it is computed once per scanned document).
-//!   Method-level narrows further: only a type's own (non-inherited) member
-//!   named `method_name` counts — `TypeDecl::own_members` already excludes
-//!   inherited members, so "didn't override, just inherited" falls out for
-//!   free.
+//! - [`implementations_in_doc`] is the per-file confirm, checked *per
+//!   supertype-clause entry* (the raw `extends`/`implements` type nodes via
+//!   `model.rs`'s `super_type_nodes` — the same clause entries
+//!   [`TypeDecl::supers`] erases to simple names, so subclassing a concrete
+//!   class and implementing an interface are the same check). An entry
+//!   confirms iff its base simple name is the target's AND (fix round 1):
+//!   - **unqualified** (`implements Foo`): the name, read in the scanned
+//!     file's own import/package context, actually resolves to the target's
+//!     real declaration — [`crate::references::confirm_bare_type`], the
+//!     exact same import-aware confirm `references.rs`'s `bare_type_site`
+//!     uses, reused rather than duplicated;
+//!   - **fully qualified** (`implements com.example.Foo` — bypasses imports
+//!     entirely, so the import gate must neither vouch for it nor be needed
+//!     by it): the written dotted name equals the target's own real FQN
+//!     (its declaring document's `package` + simple name). A qualified
+//!     entry naming a *different* package's same-simple-name type is
+//!     rejected even when the file separately imports the target.
+//!
+//!   Method-level narrows further: only a type's own (non-inherited),
+//!   non-`static` method named `method_name` counts — `TypeDecl::own_members`
+//!   already excludes inherited members, so "didn't override, just
+//!   inherited" falls out for free, and a `static` same-named method hides
+//!   rather than overrides (fix round 1), so it is skipped too. Overloads
+//!   are matched by NAME only (no arity/parameter-type comparison — the
+//!   codebase's member model doesn't compare signatures structurally), so
+//!   an implementor declaring several same-named overloads is over-included:
+//!   every one of its own non-static `method_name` declarations is reported,
+//!   not just the true JLS override.
 //!
 //! External (JDK/jar) targets are out of scope: [`implementation_target`]
 //! only ever names an in-project type (`ctx.table`/`confirm_bare_type` never
@@ -51,9 +65,11 @@ use tree_sitter::Node;
 use crate::external::{NoSymbols, SymbolSource};
 use crate::hover::{field_is, identifier_at, is_decl_name};
 use crate::imports::Imports;
-use crate::model::{MemberKind, TypeDecl, TypeTable};
-use crate::references::confirm_bare_type;
-use crate::resolve::{self, Ctx, HierMember, MemberNamespace, Resolved, ResolvedType};
+use crate::model::{base_type_name, super_type_nodes, MemberKind, TypeDecl, TypeTable};
+use crate::references::{confirm_bare_type, package_of};
+use crate::resolve::{
+    self, dotted_type_name, Ctx, HierMember, MemberNamespace, Resolved, ResolvedType,
+};
 use crate::{node_text, LineIndex, OpenDoc};
 
 /// What the cursor resolved to: an in-project type (interface/abstract/
@@ -213,25 +229,51 @@ pub fn implementations_in_doc(
         symbols: &no_symbols,
     };
 
-    // File-level (not per-type) import/package confirm that a supertype
-    // reference to `target.type_name` in THIS file actually names the
-    // target's own declaration, not an unrelated same-simple-name type from
-    // a different package (see `confirm_bare_type`'s doc comment).
-    let confirmed =
+    // File-level import/package confirm for UNQUALIFIED supertype entries:
+    // whether a bare `target.type_name`, read in THIS file's own
+    // import/package context, actually names the target's own declaration —
+    // not an unrelated same-simple-name type from a different package (see
+    // `confirm_bare_type`'s doc comment). Computed once per document; only
+    // vouches for unqualified entries (a fully-qualified entry bypasses
+    // imports, so it is confirmed against `target_fqn` below instead).
+    let unqualified_confirmed =
         confirm_bare_type(&target.type_name, &ctx).is_some_and(|td| td.doc == target.type_doc);
-    if !confirmed {
-        return Vec::new();
-    }
+
+    // The target's own real FQN (its declaring document's `package` + simple
+    // name), for confirming FULLY-QUALIFIED supertype entries. `None` for a
+    // default-package target — no qualified reference can name the default
+    // package, so qualified entries then never match.
+    let target_fqn = docs.get(target.type_doc).and_then(|target_doc| {
+        package_of(target_doc.tree.root_node(), target_doc.source)
+            .map(|pkg| format!("{pkg}.{}", target.type_name))
+    });
 
     let mut hits = Vec::new();
     for td in table.iter() {
         // Only types actually declared *in this scanned document* — `table`
         // spans the whole given `docs` slice (which also contains the
         // target's own document when scanning a different file).
-        if td.doc != current || !td.supers.iter().any(|&s| s == target.type_name) {
+        if td.doc != current {
             continue;
         }
-        push_hits_for(td, target, &mut hits);
+        // Per-supertype-entry confirm (fix round 1): an erased simple-name
+        // match alone is not enough — `implements com.other.Foo` must not
+        // pass on the strength of an unrelated `import com.example.Foo`.
+        let implements_target = super_type_nodes(td.node).into_iter().any(|ty| {
+            if base_type_name(ty, td.source) != Some(target.type_name.as_str()) {
+                return false;
+            }
+            match dotted_type_name(ty, td.source) {
+                // Fully qualified: matches iff it names the target's own FQN.
+                Some(written_fqn) => Some(written_fqn) == target_fqn,
+                // Unqualified: matches iff this file's imports/package
+                // resolve the bare name to the target.
+                None => unqualified_confirmed,
+            }
+        });
+        if implements_target {
+            push_hits_for(td, target, &mut hits);
+        }
     }
     hits
 }
@@ -248,7 +290,9 @@ fn push_hits_for(td: &TypeDecl, target: &ImplementationTarget, hits: &mut Vec<Im
         }
         Some(method_name) => {
             for m in td.own_members() {
-                if m.name == method_name && matches!(m.kind, MemberKind::Method) {
+                // Kind-aware (never a same-named field) and non-static only:
+                // a `static` method hides, it does not override (fix round 1).
+                if m.name == method_name && matches!(m.kind, MemberKind::Method) && !m.is_static {
                     if let Some(site) = m.decl_site() {
                         hits.push(ImplementationHit {
                             name_range: site.name_range,
@@ -472,6 +516,127 @@ mod tests {
         assert!(
             hits_c.is_empty(),
             "C doesn't override greet — must not be reported: {hits_c:?}"
+        );
+    }
+
+    /// M4.6 fix round 1 (Important, false positive): a scanned file that
+    /// imports the target (`com.example.Foo`) but whose `implements` clause
+    /// names a *fully-qualified different* type (`com.other.Foo`) must NOT
+    /// be reported — the qualified supertype reference bypasses imports
+    /// entirely, so the file-level import confirm alone must not vouch for
+    /// it.
+    #[test]
+    fn qualified_super_naming_different_fqn_is_not_confirmed() {
+        let doc_a = "package com.example;\npublic interface Foo { void run(); }\n";
+        let doc_c = "package other;\nimport com.example.Foo;\nclass Bar implements com.other.Foo {\n  public void run() {}\n}\n";
+        let tree_a = tree(doc_a);
+        let tree_c = tree(doc_c);
+
+        let docs_for_target = [OpenDoc {
+            source: doc_a,
+            tree: &tree_a,
+        }];
+        let target = target_at(&docs_for_target, 0, "Foo {");
+
+        let scan_docs = [
+            OpenDoc {
+                source: doc_c,
+                tree: &tree_c,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+        let remapped = ImplementationTarget {
+            type_doc: 1,
+            ..target
+        };
+        let hits = implementations_in_doc(&scan_docs, 0, &remapped);
+        assert!(
+            hits.is_empty(),
+            "Bar implements com.other.Foo (fully qualified, different type) — the \
+             import of com.example.Foo must not confirm it: {hits:?}"
+        );
+    }
+
+    /// M4.6 fix round 1 (Important, false negative): a scanned file with NO
+    /// import whose `implements` clause names the target *fully qualified*
+    /// (`implements com.example.Foo`, matching the target's real package)
+    /// IS a confirmed implementor.
+    #[test]
+    fn fully_qualified_super_with_matching_package_is_confirmed() {
+        let doc_a = "package com.example;\npublic interface Foo { void run(); }\n";
+        let doc_b =
+            "package other;\nclass Bar implements com.example.Foo {\n  public void run() {}\n}\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+
+        let docs_for_target = [OpenDoc {
+            source: doc_a,
+            tree: &tree_a,
+        }];
+        let target = target_at(&docs_for_target, 0, "Foo {");
+
+        let scan_docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+        let remapped = ImplementationTarget {
+            type_doc: 1,
+            ..target
+        };
+        let hits = implementations_in_doc(&scan_docs, 0, &remapped);
+        assert_eq!(
+            hits.len(),
+            1,
+            "Bar implements com.example.Foo fully qualified (no import) — must be \
+             confirmed via the target's own package: {hits:?}"
+        );
+        let expected = doc_b.find("Bar").unwrap();
+        assert_eq!(hits[0].name_range, expected..expected + "Bar".len());
+    }
+
+    /// M4.6 fix round 1 (Minor): a `static` method with the same name in a
+    /// subclass hides — it does not override — so a method-level query must
+    /// not report it.
+    #[test]
+    fn static_same_name_method_is_not_an_override() {
+        let doc_a = "package p;\nclass A {\n  void greet() {}\n}\n";
+        let doc_b = "package p;\nclass B extends A {\n  static void greet() {}\n}\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let docs = [OpenDoc {
+            source: doc_a,
+            tree: &tree_a,
+        }];
+        let target = target_at(&docs, 0, "greet() {}");
+        assert_eq!(target.method_name.as_deref(), Some("greet"));
+
+        let scan_docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+        ];
+        let remapped = ImplementationTarget {
+            type_doc: 1,
+            ..target
+        };
+        let hits = implementations_in_doc(&scan_docs, 0, &remapped);
+        assert!(
+            hits.is_empty(),
+            "B's static greet hides (not overrides) — must not be reported: {hits:?}"
         );
     }
 }

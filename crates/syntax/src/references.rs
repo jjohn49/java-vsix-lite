@@ -427,7 +427,11 @@ pub(crate) fn confirm_bare_type<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Option<Typ
 /// the root, independent of any particular file's `Imports` — used to learn
 /// a *candidate* type's actual package, as opposed to the scanned file's
 /// own, which `Imports::parse` already gives us).
-fn package_of(node: Node, source: &str) -> Option<String> {
+///
+/// `pub(crate)` (M4.6): also used by `implementation.rs` to compute the
+/// TARGET type's real FQN for confirming fully-qualified `extends`/
+/// `implements` entries.
+pub(crate) fn package_of(node: Node, source: &str) -> Option<String> {
     let mut root = node;
     while let Some(parent) = root.parent() {
         root = parent;

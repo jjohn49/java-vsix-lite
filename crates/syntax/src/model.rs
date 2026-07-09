@@ -241,7 +241,22 @@ fn collect_constructors<'t>(body: Node<'t>, out: &mut Vec<Node<'t>>) {
 
 /// Extract supertype simple names from `extends`/`implements` clauses.
 fn collect_supers<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
-    let mut supers = Vec::new();
+    super_type_nodes(node)
+        .into_iter()
+        .filter_map(|ty| base_type_name(ty, source))
+        .collect()
+}
+
+/// The raw type NODES of a declaration's `extends`/`implements` clauses —
+/// the same nodes whose base simple names [`collect_supers`] erases into
+/// [`TypeDecl::supers`]. `pub(crate)` for M4.6's go-to-implementation, whose
+/// per-supertype confirm needs the node itself (not just the erased simple
+/// name) to tell a fully-qualified supertype reference
+/// (`implements com.example.Foo` — confirmed against the target's real FQN,
+/// bypassing imports) apart from an unqualified one (`implements Foo` —
+/// confirmed through the scanned file's import/package context).
+pub(crate) fn super_type_nodes<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
     for child in named_children(node) {
         match child.kind() {
             // `extends Base` (class) -> superclass(type); `extends A, B` (interface)
@@ -249,24 +264,16 @@ fn collect_supers<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
             "superclass" | "extends_interfaces" | "super_interfaces" => {
                 for ty in named_children(child) {
                     if ty.kind() == "type_list" {
-                        for t in named_children(ty) {
-                            push_base_name(t, source, &mut supers);
-                        }
+                        out.extend(named_children(ty));
                     } else {
-                        push_base_name(ty, source, &mut supers);
+                        out.push(ty);
                     }
                 }
             }
             _ => {}
         }
     }
-    supers
-}
-
-fn push_base_name<'t>(ty: Node<'t>, source: &'t str, out: &mut Vec<&'t str>) {
-    if let Some(name) = base_type_name(ty, source) {
-        out.push(name);
-    }
+    out
 }
 
 /// Walk a type body, pushing each declared member.
