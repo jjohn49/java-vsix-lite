@@ -36,7 +36,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 /// The `workspace/executeCommand` command name the extension invokes.
-pub(crate) const CHECK_PROJECT_COMMAND: &str = "java-vsix-lite.checkProject";
+///
+/// This is the server-INTERNAL id and must NOT equal any command the
+/// extension contributes in package.json (`java-vsix-lite.checkProject`):
+/// `vscode-languageclient` auto-registers a VS Code command for every id
+/// advertised in `executeCommandProvider`, so a matching id makes
+/// `registerCommand` throw `command '<id>' already exists` during
+/// `initializeFeatures` and the whole client fails with "Server
+/// initialization failed". Guarded by the
+/// `server_commands_do_not_collide_with_extension_commands` lifecycle test.
+pub(crate) const CHECK_PROJECT_COMMAND: &str = "jvl.checkProject.run";
 
 /// Hard cap on how many source files a single check run will feed to
 /// `javac` — bounds both the argfile size and the compile time. A project

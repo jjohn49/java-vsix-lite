@@ -32,7 +32,14 @@ interface CheckProjectResult {
   warningCount?: number;
 }
 
+// The user-facing command (contributed in package.json, trust-gated below).
 const CHECK_PROJECT_COMMAND = "java-vsix-lite.checkProject";
+// The server-internal executeCommand id it forwards to. Deliberately NOT the
+// same id: vscode-languageclient auto-registers a VS Code command for every
+// id the server advertises in `executeCommandProvider`, and a duplicate of a
+// command this extension registers itself would throw
+// `command '<id>' already exists` during client startup.
+const SERVER_CHECK_PROJECT_COMMAND = "jvl.checkProject.run";
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
@@ -243,7 +250,7 @@ async function checkProject(): Promise<void> {
   statusBar.tooltip = "java-vsix-lite: checking project (javac)…";
   try {
     const result = await client.sendRequest(ExecuteCommandRequest.type, {
-      command: CHECK_PROJECT_COMMAND,
+      command: SERVER_CHECK_PROJECT_COMMAND,
       arguments: [],
     });
     reportCheckProjectResult(result as CheckProjectResult);

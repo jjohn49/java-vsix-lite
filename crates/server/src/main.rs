@@ -675,8 +675,10 @@ impl Backend {
         Duration::from_secs(self.javac_timeout_secs.get().copied().unwrap_or(120))
     }
 
-    /// M5.4: `java-vsix-lite.checkProject` — see the module doc comment on
-    /// `javac` for the security invariants this must never violate.
+    /// M5.4: the check-project run (`jvl.checkProject.run`, forwarded by the
+    /// extension's trust-gated `java-vsix-lite.checkProject`) — see the module
+    /// doc comment on `javac` for the security invariants this must never
+    /// violate.
     /// Concurrency (one run at a time) is enforced by the caller
     /// (`execute_command`), which claims `javac_running` before calling this
     /// and releases it afterward; this method assumes that's already done.

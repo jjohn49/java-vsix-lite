@@ -1981,7 +1981,7 @@ fn check_project_javac_round_trip() {
     ));
     let init = read_until(&mut reader, "\"id\":1", &mut seen);
     assert!(
-        init.contains("\"executeCommandProvider\"") && init.contains("java-vsix-lite.checkProject"),
+        init.contains("\"executeCommandProvider\"") && init.contains("jvl.checkProject.run"),
         "missing executeCommandProvider capability: {init}"
     );
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
@@ -1990,7 +1990,7 @@ fn check_project_javac_round_trip() {
     let broken_uri = format!("file://{}", broken_path.display());
 
     send(
-        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"java-vsix-lite.checkProject","arguments":[]}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
     );
     // The handler's diagnostics publish and its own response are written by
     // independent tower-lsp paths, so their wire order is NOT guaranteed
@@ -2056,4 +2056,87 @@ fn check_project_javac_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The VS Code extension registers its user-facing commands itself (with a
+/// Workspace-Trust gate), and `vscode-languageclient` ALSO auto-registers a
+/// VS Code command for every ID the server advertises in
+/// `executeCommandProvider` — so a server-advertised ID that matches an
+/// extension-contributed ID throws `command '<id>' already exists` during
+/// `initializeFeatures` and kills client startup ("Server initialization
+/// failed" in the editor). Raw-LSP tests can't see the VS Code command
+/// registry, so this guards the invariant statically: the two ID sets must
+/// be disjoint.
+#[test]
+fn server_commands_do_not_collide_with_extension_commands() {
+    // The extension's contributed (user-facing) command IDs.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../editors/vscode/package.json"),
+        )
+        .expect("read editors/vscode/package.json"),
+    )
+    .expect("parse editors/vscode/package.json");
+    let contributed: Vec<String> = manifest["contributes"]["commands"]
+        .as_array()
+        .expect("contributes.commands array")
+        .iter()
+        .map(|c| c["command"].as_str().expect("command id").to_string())
+        .collect();
+    assert!(
+        !contributed.is_empty(),
+        "expected at least one contributed command"
+    );
+
+    // The server's advertised executeCommand IDs, from a real initialize.
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    stdin
+        .write_all(
+            frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#)
+                .as_bytes(),
+        )
+        .expect("write initialize");
+    let mut seen: Vec<String> = Vec::new();
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    let init_json: serde_json::Value =
+        serde_json::from_str(&init).expect("parse initialize response");
+    let advertised: Vec<String> = init_json["result"]["capabilities"]["executeCommandProvider"]
+        ["commands"]
+        .as_array()
+        .expect("executeCommandProvider.commands")
+        .iter()
+        .map(|c| c.as_str().expect("command id").to_string())
+        .collect();
+    assert!(
+        !advertised.is_empty(),
+        "expected at least one server-advertised command"
+    );
+
+    for id in &advertised {
+        assert!(
+            !contributed.contains(id),
+            "server-advertised executeCommand id {id:?} collides with an \
+             extension-contributed command — vscode-languageclient would fail \
+             initializeFeatures with `command '{id}' already exists`"
+        );
+    }
+
+    stdin
+        .write_all(frame(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#).as_bytes())
+        .expect("write shutdown");
+    let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    stdin
+        .write_all(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#).as_bytes())
+        .expect("write exit");
+    drop(stdin);
+    let _ = child.wait();
 }
