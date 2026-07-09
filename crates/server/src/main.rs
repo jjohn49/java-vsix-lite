@@ -22,8 +22,8 @@ mod workspace_index;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as StdRange;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use jvl_syntax::tree_sitter::{Parser, Tree};
 use jvl_syntax::{Definition, LineIndex, PositionEncoding};
@@ -74,6 +74,81 @@ struct Document {
     version: i32,
 }
 
+/// M5.2's debounce/coalescing decision state for classpath rebuilds
+/// triggered by watched build-file changes — pure and synchronous, so it's
+/// unit-tested directly with no real timers involved (see the `tests`
+/// module below). The actual timing (the debounce wait, `spawn_blocking`
+/// for the rebuild itself) lives in `Backend::drive_classpath_rebuild`,
+/// which just calls these methods at the right points. `on_event`'s `bool`
+/// return elects exactly one caller as "the driver" for however many
+/// debounce-then-rebuild cycles it takes to settle, so at most one rebuild
+/// ever runs at a time and no unbounded queue of pending rebuilds can build
+/// up — a fresh event always folds into whichever cycle is already running.
+#[derive(Default)]
+struct RebuildCoalescer {
+    /// Some caller already owns driving a debounce-wait-then-maybe-rebuild
+    /// cycle; a later event just needs to mark `dirty` and return.
+    driving: bool,
+    /// A matching change happened since the driver last started waiting (or
+    /// last started a rebuild) that it hasn't accounted for yet.
+    dirty: bool,
+    /// A rebuild is actually running right now, as opposed to still waiting
+    /// out the debounce window — tracked only for clarity/assertions.
+    in_flight: bool,
+}
+
+impl RebuildCoalescer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// A matching build-file change arrived. Returns `true` exactly once per
+    /// debounce-then-rebuild cycle: the caller that gets `true` must drive
+    /// it (wait the debounce window, call `on_debounce_elapsed`, and so on
+    /// until settled); every other concurrent/later caller gets `false` —
+    /// its event has already been folded into the driver's next decision.
+    fn on_event(&mut self) -> bool {
+        if self.driving {
+            // Already being handled by the current debounce-wait-then-maybe-
+            // rebuild cycle; this event just needs to be accounted for.
+            self.dirty = true;
+            false
+        } else {
+            self.driving = true;
+            true
+        }
+    }
+
+    /// The driver's debounce wait elapsed. `true` means proceed straight to
+    /// a rebuild (nothing arrived during the wait); `false` means a fresh
+    /// event reset the window and the driver must wait a full debounce
+    /// window again before re-checking.
+    fn on_debounce_elapsed(&mut self) -> bool {
+        if self.dirty {
+            self.dirty = false;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    /// The in-flight rebuild finished. `true` means at least one event
+    /// arrived during the rebuild and exactly one follow-up debounce/rebuild
+    /// cycle must run (the driver keeps going); `false` means it's fully
+    /// settled and the driver may stop.
+    fn on_rebuild_finished(&mut self) -> bool {
+        self.in_flight = false;
+        if self.dirty {
+            self.dirty = false;
+            true
+        } else {
+            self.driving = false;
+            false
+        }
+    }
+}
+
 struct Backend {
     client: Client,
     /// Reused across parses; held only for synchronous parse calls, never across
@@ -89,8 +164,27 @@ struct Backend {
     snippet_support: OnceLock<bool>,
     /// Bytecode-backed symbols for imported (JDK/dependency) types. Built lazily
     /// on first use so the JDK's jmods aren't scanned until completion/hover needs
-    /// them.
-    classpath: OnceLock<jvl_classpath::Classpath>,
+    /// them. M5.2: now swappable — a watched build-file change triggers a
+    /// debounced rebuild (see `RebuildCoalescer`/`drive_classpath_rebuild`)
+    /// that atomically swaps in a freshly resolved `Classpath`. Every read
+    /// path takes its own `Arc` snapshot via `classpath()` at the start of a
+    /// request and never holds this lock across an `.await`.
+    classpath: StdRwLock<Option<Arc<jvl_classpath::Classpath>>>,
+    /// Whether the client supports dynamic registration of
+    /// `workspace/didChangeWatchedFiles` (negotiated during `initialize`) —
+    /// gates whether `initialized()` bothers registering the build-file
+    /// watch at all; the LSP spec has no static alternative for this
+    /// capability, so a client without it simply never gets watched.
+    classpath_watch_dynamic: OnceLock<bool>,
+    /// Debounce window for a classpath rebuild after a watched build-file
+    /// change (`classpath_debounce_ms_opt`) — 2s by default, overridable via
+    /// `initializationOptions.classpathDebounceMs` so tests aren't forced to
+    /// sleep multiple seconds.
+    classpath_debounce_ms: OnceLock<u64>,
+    /// M5.2's debounce/coalescing decision state (see [`RebuildCoalescer`]),
+    /// guarded by a plain `Mutex` — decisions are synchronous and quick,
+    /// never held across an `.await`.
+    classpath_rebuild: StdMutex<RebuildCoalescer>,
     /// Workspace root (from `initialize`), used to discover project dependencies.
     workspace_root: OnceLock<Option<PathBuf>>,
     /// Fallback project root derived from the first opened document (so deps
@@ -127,7 +221,10 @@ impl Backend {
             documents: Mutex::new(HashMap::new()),
             encoding: OnceLock::new(),
             snippet_support: OnceLock::new(),
-            classpath: OnceLock::new(),
+            classpath: StdRwLock::new(None),
+            classpath_watch_dynamic: OnceLock::new(),
+            classpath_debounce_ms: OnceLock::new(),
+            classpath_rebuild: StdMutex::new(RebuildCoalescer::new()),
             workspace_root: OnceLock::new(),
             project_root_hint: OnceLock::new(),
             unresolved_member_diagnostics: OnceLock::new(),
@@ -160,10 +257,117 @@ impl Backend {
     /// The imported-type symbol source, built on first use from the user's JDK
     /// plus the project's declared dependencies. The project root is the
     /// workspace folder, or (if none) one derived from the first opened file.
-    fn classpath(&self) -> &jvl_classpath::Classpath {
-        self.classpath.get_or_init(|| {
-            jvl_classpath::Classpath::from_jdk_and_project(self.project_root().as_deref())
+    ///
+    /// Returns a snapshot `Arc`: the caller holds its own reference-counted
+    /// handle to whichever `Classpath` was current the moment it asked, so a
+    /// concurrent M5.2 rebuild swap never invalidates work already in
+    /// flight, and this method never holds `self.classpath`'s lock across an
+    /// `.await`.
+    fn classpath(&self) -> Arc<jvl_classpath::Classpath> {
+        if let Some(existing) = self
+            .classpath
+            .read()
+            .expect("classpath lock poisoned")
+            .clone()
+        {
+            return existing;
+        }
+        // Double-checked: the first caller (of possibly several racing here)
+        // builds it; everyone else just reads back what got stored.
+        let mut guard = self.classpath.write().expect("classpath lock poisoned");
+        if let Some(existing) = guard.clone() {
+            return existing;
+        }
+        let built = Arc::new(jvl_classpath::Classpath::from_jdk_and_project(
+            self.project_root().as_deref(),
+        ));
+        *guard = Some(Arc::clone(&built));
+        built
+    }
+
+    /// The debounce window for M5.2 classpath rebuilds (see
+    /// `classpath_debounce_ms_opt`); 2s unless overridden.
+    fn classpath_debounce(&self) -> Duration {
+        Duration::from_millis(self.classpath_debounce_ms.get().copied().unwrap_or(2000))
+    }
+
+    /// Re-resolve the classpath from scratch on the blocking pool — the same
+    /// static, offline resolution the initial lazy build uses (no build tool
+    /// is ever invoked) — and swap it in atomically. Never holds
+    /// `self.classpath`'s lock across the `.await`.
+    async fn rebuild_classpath(&self) {
+        let root = self.project_root();
+        let built = tokio::task::spawn_blocking(move || {
+            jvl_classpath::Classpath::from_jdk_and_project(root.as_deref())
         })
+        .await
+        .unwrap_or_else(|_| jvl_classpath::Classpath::empty());
+        *self.classpath.write().expect("classpath lock poisoned") = Some(Arc::new(built));
+    }
+
+    /// Recompute and republish diagnostics for every currently open
+    /// document — used after a classpath swap (M5.2), since
+    /// unresolved-member diagnostics depend on it and may change once new
+    /// dependency types become resolvable.
+    async fn republish_all_diagnostics(&self) {
+        let uris: Vec<String> = self.documents.lock().await.keys().cloned().collect();
+        for uri_str in uris {
+            let diagnostics = {
+                let docs = self.documents.lock().await;
+                self.compute_diagnostics(&docs, &uri_str)
+            };
+            if let Ok(uri) = uri_str.parse::<Uri>() {
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+            }
+        }
+    }
+
+    /// M5.2: drive one or more debounce-then-rebuild cycles until settled.
+    /// Only the single caller that won `RebuildCoalescer::on_event`'s race
+    /// calls this (see `did_change_watched_files`) — every other concurrent
+    /// or later matching event just folds into the cycle already running
+    /// here, so at most one rebuild is ever in flight and exactly one more
+    /// runs if anything changed while it was.
+    async fn drive_classpath_rebuild(&self) {
+        loop {
+            tokio::time::sleep(self.classpath_debounce()).await;
+            let proceed = {
+                let mut c = self
+                    .classpath_rebuild
+                    .lock()
+                    .expect("classpath rebuild coalescer poisoned");
+                c.on_debounce_elapsed()
+            };
+            if !proceed {
+                continue; // a fresh event arrived during the wait; wait a full window again
+            }
+
+            self.client
+                .log_message(MessageType::INFO, "classpath rebuild: started")
+                .await;
+            let start = Instant::now();
+            self.rebuild_classpath().await;
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("classpath rebuild: finished in {:?}", start.elapsed()),
+                )
+                .await;
+            self.republish_all_diagnostics().await;
+
+            let again = {
+                let mut c = self
+                    .classpath_rebuild
+                    .lock()
+                    .expect("classpath rebuild coalescer poisoned");
+                c.on_rebuild_finished()
+            };
+            if !again {
+                break;
+            }
+        }
     }
 
     /// The workspace folder, or (if none) the root derived from the first
@@ -588,6 +792,60 @@ fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
         .and_then(|opts| opts.get("unresolvedMemberDiagnostics"))
         .and_then(|value| value.as_bool())
         .unwrap_or(true)
+}
+
+/// The `classpathDebounceMs` field from `initializationOptions` — the wait
+/// after the last matching build-file change before M5.2's classpath
+/// rebuild runs. Defaults to 2000ms; tests override it to a few
+/// milliseconds so the watched-build-file E2E round trip doesn't have to
+/// sleep multiple seconds.
+fn classpath_debounce_ms_opt(params: &InitializeParams) -> u64 {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.get("classpathDebounceMs"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(2000)
+}
+
+/// Whether the client declared dynamic-registration support for
+/// `workspace/didChangeWatchedFiles` — if not, M5.2's build-file watch is
+/// simply never registered (graceful fallback; the LSP spec gives servers
+/// no static-capability alternative for this one).
+fn supports_watched_files_registration(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.did_change_watched_files.as_ref())
+        .and_then(|d| d.dynamic_registration)
+        .unwrap_or(false)
+}
+
+/// Whether `uri` names one of M5.2's watched build files: `pom.xml`,
+/// `build.gradle`, `build.gradle.kts`, or `gradle/libs.versions.toml`
+/// (matched by filename, and — for the last, since the filename alone isn't
+/// distinctive — its parent directory too). Checked server-side on receipt
+/// as well as registered client-side, so a client that (like a test driving
+/// the notification directly) sends an unrelated event never triggers a
+/// rebuild.
+fn is_classpath_build_file(uri: &Uri) -> bool {
+    let Some(path) = uri.to_file_path() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match name {
+        "pom.xml" | "build.gradle" | "build.gradle.kts" => true,
+        "libs.versions.toml" => {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some("gradle")
+        }
+        _ => false,
+    }
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.
@@ -1069,6 +1327,12 @@ impl LanguageServer for Backend {
         let _ = self
             .supports_rename_file
             .set(supports_rename_file_op(&params));
+        let _ = self
+            .classpath_watch_dynamic
+            .set(supports_watched_files_registration(&params));
+        let _ = self
+            .classpath_debounce_ms
+            .set(classpath_debounce_ms_opt(&params));
         let position_encoding = Some(match encoding {
             PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
             PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
@@ -1141,6 +1405,39 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "java-vsix-lite server initialized")
             .await;
+
+        // M5.2: watch build files for classpath invalidation, client
+        // permitting. VS Code supports dynamic registration; a client that
+        // doesn't just never gets watched — the LSP spec has no static
+        // alternative for this capability.
+        if self.classpath_watch_dynamic.get().copied().unwrap_or(false) {
+            let watchers = [
+                "**/pom.xml",
+                "**/build.gradle",
+                "**/build.gradle.kts",
+                "**/gradle/libs.versions.toml",
+            ]
+            .into_iter()
+            .map(|pattern| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(pattern.to_string()),
+                kind: None,
+            })
+            .collect();
+            let register_options = DidChangeWatchedFilesRegistrationOptions { watchers };
+            let registration = Registration {
+                id: "jvl-classpath-watch".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: serde_json::to_value(register_options).ok(),
+            };
+            if let Err(err) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to register build-file watch: {err}"),
+                    )
+                    .await;
+            }
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1218,6 +1515,37 @@ impl LanguageServer for Backend {
         self.documents.lock().await.remove(uri.as_str());
         // Clear diagnostics for the closed file.
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    /// M5.2: a watched build file changed. Events that don't actually name
+    /// one of the watched build files (`is_classpath_build_file`) are
+    /// ignored outright — no log message, no coalescer state touched — so
+    /// an unrelated file's change never triggers a rebuild (verified
+    /// end to end via log absence, since a test drives this notification
+    /// directly rather than through a real filesystem watcher).
+    ///
+    /// A matching event either elects this call as the debounce/rebuild
+    /// driver (`RebuildCoalescer::on_event` returning `true`, in which case
+    /// it runs `drive_classpath_rebuild` to completion) or folds into
+    /// whichever call already is.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if !params
+            .changes
+            .iter()
+            .any(|c| is_classpath_build_file(&c.uri))
+        {
+            return;
+        }
+        let become_driver = {
+            let mut c = self
+                .classpath_rebuild
+                .lock()
+                .expect("classpath rebuild coalescer poisoned");
+            c.on_event()
+        };
+        if become_driver {
+            self.drive_classpath_rebuild().await;
+        }
     }
 
     async fn document_symbol(
@@ -1826,10 +2154,12 @@ impl Backend {
 }
 
 /// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
-/// bytecode model into the analysis crate's external-symbol types.
-struct ClasspathSymbols<'a>(&'a jvl_classpath::Classpath);
+/// bytecode model into the analysis crate's external-symbol types. Holds an
+/// owned snapshot `Arc` (from `Backend::classpath()`) rather than a borrow,
+/// so it's unaffected by a concurrent M5.2 rebuild swap mid-request.
+struct ClasspathSymbols(Arc<jvl_classpath::Classpath>);
 
-impl jvl_syntax::SymbolSource for ClasspathSymbols<'_> {
+impl jvl_syntax::SymbolSource for ClasspathSymbols {
     fn class(&self, fqn: &str) -> Option<jvl_syntax::ExternalClass> {
         let info = self.0.class(fqn)?;
         Some(jvl_syntax::ExternalClass {
@@ -2053,5 +2383,152 @@ mod tests {
         }
         // After a clear the newest entry is always present.
         assert!(cache.contains_key(Path::new(&format!("/proj/F{}.java", cap * 3 - 1))));
+    }
+
+    /// M5.2: absent `initializationOptions`, the debounce defaults to 2s.
+    #[test]
+    fn classpath_debounce_defaults_to_2000ms() {
+        let params = InitializeParams::default();
+        assert_eq!(classpath_debounce_ms_opt(&params), 2000);
+    }
+
+    /// The test-only override is honored (so E2E tests don't sleep 2s+).
+    #[test]
+    fn classpath_debounce_respects_override() {
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({ "classpathDebounceMs": 10 })),
+            ..Default::default()
+        };
+        assert_eq!(classpath_debounce_ms_opt(&params), 10);
+    }
+
+    /// No `workspace.didChangeWatchedFiles.dynamicRegistration` capability
+    /// at all -> the build-file watch must not be registered.
+    #[test]
+    fn watched_files_registration_defaults_to_false() {
+        let params = InitializeParams::default();
+        assert!(!supports_watched_files_registration(&params));
+    }
+
+    #[test]
+    fn watched_files_registration_respects_client_capability() {
+        let params = InitializeParams {
+            capabilities: ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                        dynamic_registration: Some(true),
+                        relative_pattern_support: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(supports_watched_files_registration(&params));
+    }
+
+    /// M5.2: only the four documented build-file names/locations match —
+    /// everything else (including an unrelated `.java` file) must not.
+    #[test]
+    fn classpath_build_file_matching() {
+        let matches = |s: &str| is_classpath_build_file(&s.parse::<Uri>().unwrap());
+        assert!(matches("file:///proj/pom.xml"));
+        assert!(matches("file:///proj/sub/pom.xml"));
+        assert!(matches("file:///proj/build.gradle"));
+        assert!(matches("file:///proj/build.gradle.kts"));
+        assert!(matches("file:///proj/gradle/libs.versions.toml"));
+        // `libs.versions.toml` outside a `gradle/` dir doesn't count.
+        assert!(!matches("file:///proj/libs.versions.toml"));
+        assert!(!matches("file:///proj/src/Main.java"));
+        assert!(!matches("file:///proj/pom.xml.bak"));
+    }
+
+    /// M5.2's debounce/coalescing state machine — pure, no real timers.
+    mod rebuild_coalescer {
+        use super::*;
+
+        /// N events arriving before the debounce settles must still yield
+        /// exactly one rebuild: every event after the first is coalesced
+        /// (not a new driver), and the debounce only proceeds to a rebuild
+        /// once nothing further arrived during the wait.
+        #[test]
+        fn n_events_in_one_window_yield_one_rebuild() {
+            let mut c = RebuildCoalescer::new();
+            assert!(c.on_event(), "first event becomes the driver");
+            assert!(!c.on_event(), "second event coalesces into the driver");
+            assert!(!c.on_event(), "third event coalesces into the driver");
+            // The two coalesced events landed during the wait, so the driver
+            // must wait a full debounce window again ("a fresh event resets
+            // the timer") before it may proceed...
+            assert!(
+                !c.on_debounce_elapsed(),
+                "coalesced events reset the window once"
+            );
+            // ...and only then, with nothing further arriving, settles to
+            // exactly one rebuild — not one per event.
+            assert!(
+                c.on_debounce_elapsed(),
+                "settled with nothing new -> proceed to exactly one rebuild"
+            );
+        }
+
+        /// A fresh event during the debounce wait resets it: the driver must
+        /// wait a full window again rather than proceeding immediately.
+        #[test]
+        fn event_during_wait_resets_the_window() {
+            let mut c = RebuildCoalescer::new();
+            assert!(c.on_event());
+            assert!(!c.on_event(), "still just one driver");
+            assert!(
+                !c.on_debounce_elapsed(),
+                "a coalesced event arrived during the wait -> must wait again"
+            );
+            assert!(
+                c.on_debounce_elapsed(),
+                "nothing arrived during the second wait -> now proceed"
+            );
+        }
+
+        /// An event arriving while a rebuild is in flight schedules exactly
+        /// one follow-up rebuild — not one per coalesced event, and no
+        /// overlapping rebuild is ever started.
+        #[test]
+        fn event_during_rebuild_schedules_exactly_one_followup() {
+            let mut c = RebuildCoalescer::new();
+            assert!(c.on_event());
+            assert!(c.on_debounce_elapsed(), "settles into the first rebuild");
+
+            // Several changes land while that rebuild is running.
+            assert!(
+                !c.on_event(),
+                "an event during an in-flight rebuild never starts a second driver"
+            );
+            assert!(!c.on_event(), "neither does another one");
+
+            assert!(
+                c.on_rebuild_finished(),
+                "exactly one follow-up cycle must be scheduled"
+            );
+            assert!(
+                c.on_debounce_elapsed(),
+                "the follow-up settles to a single rebuild, not one per coalesced event"
+            );
+            assert!(
+                !c.on_rebuild_finished(),
+                "nothing pending afterwards -> driving stops"
+            );
+        }
+
+        /// The base case: no events at all -> nothing to do, and a rebuild
+        /// finishing cleanly (no `dirty`) stops driving rather than looping
+        /// forever.
+        #[test]
+        fn quiescent_rebuild_stops_driving() {
+            let mut c = RebuildCoalescer::new();
+            assert!(c.on_event());
+            assert!(c.on_debounce_elapsed());
+            assert!(!c.on_rebuild_finished(), "nothing arrived -> stop driving");
+        }
     }
 }

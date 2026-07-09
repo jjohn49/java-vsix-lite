@@ -1656,3 +1656,233 @@ fn rename_public_class_skips_file_rename_without_capability() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M5.2: classpath invalidation on build-file change, end to end. A Maven
+/// project declares a dependency (`com.example:extlib:1.0`) that isn't yet
+/// present in the (fixture, per-test) local `~/.m2/repository`, so a member
+/// call on it doesn't resolve (`textDocument/hover` -> `null`). The
+/// dependency's real jar (compiled with `javac`/`jar`, not hand-rolled
+/// bytecode) then appears in the fixture repo, `pom.xml` is "touched" by
+/// driving a `workspace/didChangeWatchedFiles` notification directly over
+/// stdio (matching the task brief — no real filesystem watcher is
+/// involved), and — after the debounced rebuild (overridden via
+/// `initializationOptions.classpathDebounceMs` to a few ms so this test
+/// doesn't sleep multiple seconds) swaps in the new classpath and
+/// republishes diagnostics — the same hover now resolves it.
+///
+/// Skips gracefully if `javac`/`jar` aren't on `PATH` (mirrors this suite's
+/// JDK-gated skips elsewhere): there's no fixture dependency to build.
+#[test]
+fn classpath_invalidation_on_build_file_change_round_trip() {
+    if Command::new("javac").arg("-version").output().is_err()
+        || Command::new("jar").arg("--version").output().is_err()
+    {
+        return;
+    }
+
+    let root = temp_root("classpath-invalidation");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        root.join("pom.xml"),
+        "<project><groupId>com.example</groupId><artifactId>proj</artifactId>\
+         <version>1.0</version><dependencies><dependency><groupId>com.example</groupId>\
+         <artifactId>extlib</artifactId><version>1.0</version></dependency>\
+         </dependencies></project>",
+    )
+    .expect("write pom.xml");
+
+    let use_text = "package p;\n\nimport com.example.ExternalDep;\n\npublic class Use {\n  \
+                     void m() {\n    ExternalDep e = new ExternalDep();\n    e.hello();\n  }\n}\n";
+    std::fs::write(src_dir.join("Use.java"), use_text).expect("write Use.java");
+
+    // A fixture `HOME` for the *child server process only* — `~/.m2` under
+    // it is ours to control; the real user's `~/.m2` is never touched.
+    let fixture_home = temp_root("classpath-invalidation-home");
+    std::fs::create_dir_all(&fixture_home).expect("create fixture HOME");
+
+    // Build the dependency jar in a scratch area — not yet installed into
+    // the fixture `~/.m2`, so the first resolution/hover below sees nothing.
+    let build_dir = temp_root("classpath-invalidation-build");
+    let classes_dir = build_dir.join("classes");
+    std::fs::create_dir_all(&classes_dir).expect("create classes dir");
+    let pkg_src_dir = build_dir.join("src/com/example");
+    std::fs::create_dir_all(&pkg_src_dir).expect("create dep src dir");
+    std::fs::write(
+        pkg_src_dir.join("ExternalDep.java"),
+        "package com.example;\npublic class ExternalDep {\n    public void hello() {}\n}\n",
+    )
+    .expect("write ExternalDep.java");
+    let javac_status = Command::new("javac")
+        .arg("-d")
+        .arg(&classes_dir)
+        .arg(pkg_src_dir.join("ExternalDep.java"))
+        .status()
+        .expect("run javac");
+    assert!(
+        javac_status.success(),
+        "javac failed to compile the fixture dependency"
+    );
+    let jar_path = build_dir.join("extlib-1.0.jar");
+    let jar_status = Command::new("jar")
+        .arg("--create")
+        .arg("--file")
+        .arg(&jar_path)
+        .arg("-C")
+        .arg(&classes_dir)
+        .arg(".")
+        .status()
+        .expect("run jar");
+    assert!(
+        jar_status.success(),
+        "jar failed to package the fixture dependency"
+    );
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("HOME", &fixture_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}],"initializationOptions":{{"classpathDebounceMs":20}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let use_uri = format!("file://{}", src_dir.join("Use.java").display());
+    let escaped_use_text = use_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{use_uri}","languageId":"java","version":1,"text":"{escaped_use_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `hello` in `e.hello()` (line 7, char 6). The dependency jar
+    // isn't in the fixture `~/.m2` yet, so this must resolve to nothing.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{use_uri}"}},"position":{{"line":7,"character":6}}}}}}"#
+    ));
+    let before = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        before.contains("\"result\":null"),
+        "expected no hover before the dependency exists: {before}"
+    );
+
+    // The dependency now appears in the fixture `~/.m2/repository`...
+    let artifact_dir = fixture_home.join(".m2/repository/com/example/extlib/1.0");
+    std::fs::create_dir_all(&artifact_dir).expect("create m2 artifact dir");
+    std::fs::copy(&jar_path, artifact_dir.join("extlib-1.0.jar")).expect("install fixture jar");
+
+    // ...and `pom.xml` is (notionally) touched: drive the notification
+    // directly over stdio rather than relying on a real filesystem watcher.
+    let pom_uri = format!("file://{}", root.join("pom.xml").display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{{"changes":[{{"uri":"{pom_uri}","type":2}}]}}}}"#
+    ));
+
+    let _ = read_until(&mut reader, "classpath rebuild: finished", &mut seen);
+    // The rebuild republishes diagnostics for every open document too.
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{use_uri}"}},"position":{{"line":7,"character":6}}}}}}"#
+    ));
+    let after = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        after.contains("hello()"),
+        "expected the dependency to resolve after the classpath rebuild: {after}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&fixture_home);
+    let _ = std::fs::remove_dir_all(&build_dir);
+}
+
+/// M5.2 negative case: a `workspace/didChangeWatchedFiles` notification for
+/// a file that isn't one of the watched build files must never trigger a
+/// classpath rebuild. Verified via log absence: with the debounce
+/// overridden to 20ms, a deliberate (bounded, short) wait comfortably longer
+/// than that gives a wrongly-triggered rebuild time to have logged
+/// "classpath rebuild: started" before a follow-up request/response pair
+/// (used only as a synchronization point) is checked against.
+#[test]
+fn did_change_watched_files_ignores_unrelated_file() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"initializationOptions":{"classpathDebounceMs":20}}}"#,
+    );
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // Not one of the watched build files (a plain `.java` file).
+    send(
+        r#"{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":"file:///Sample.java","type":2}]}}"#,
+    );
+
+    // Give a (hypothetically, wrongly triggered) rebuild time to have
+    // started and logged, well past the 20ms debounce override.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // An unrelated request/response, used only to pull any pending log
+    // messages out of the pipe before the final assertion.
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///Sample.java"}}}"#,
+    );
+    let response = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        response.contains("\"result\":null"),
+        "Sample.java was never opened: {response}"
+    );
+
+    assert!(
+        !seen.iter().any(|f| f.contains("classpath rebuild")),
+        "an unrelated file's change must never trigger a classpath rebuild: {seen:#?}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
