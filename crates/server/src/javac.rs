@@ -498,10 +498,9 @@ pub(crate) fn run(config: RunConfig, slot: &SharedChild, leaked: &LeakedReaders)
             leaked.live_count()
         ));
     }
-    let scratch = unique_scratch_dir();
-    if std::fs::create_dir_all(&scratch).is_err() {
+    let Some(scratch) = create_fresh_scratch_dir() else {
         return RunOutcome::SpawnError("failed to create scratch directory".to_string());
-    }
+    };
     let outcome = run_in_scratch(&config, &scratch, slot, leaked);
     let _ = std::fs::remove_dir_all(&scratch);
     outcome
@@ -659,12 +658,29 @@ fn drain_capped(mut reader: impl Read) -> Vec<u8> {
     buf
 }
 
-fn unique_scratch_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("jvl-javac-{}-{}", std::process::id(), nanos))
+/// Create the `-d` scratch directory with `create_dir` (NOT `create_dir_all`):
+/// on a shared world-writable temp dir, a predictable name that already
+/// exists (or a pre-planted symlink to a directory) would let another local
+/// user redirect javac's class-file output. `create_dir` fails on anything
+/// pre-existing — including a symlink — so each attempt is guaranteed fresh;
+/// a few retries with a varying suffix absorb benign collisions.
+fn create_fresh_scratch_dir() -> Option<PathBuf> {
+    for attempt in 0..8u32 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jvl-javac-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            attempt
+        ));
+        if std::fs::create_dir(&dir).is_ok() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// Write one (double-quoted, backslash/quote-escaped) path per line — a

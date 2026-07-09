@@ -1992,11 +1992,11 @@ fn check_project_javac_round_trip() {
     send(
         r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"java-vsix-lite.checkProject","arguments":[]}}"#,
     );
-    // Notifications the handler sends (the javac diagnostics publish) land
-    // on the wire *before* its own response — `read_until` for "id":2
-    // sweeps them into `seen` along the way, so they're inspected there
-    // rather than via a further `read_until` (which would just block: no
-    // more frames are coming until the next request).
+    // The handler's diagnostics publish and its own response are written by
+    // independent tower-lsp paths, so their wire order is NOT guaranteed
+    // (the same race the references truncation-notice test hit). Read the
+    // response first, then keep reading order-tolerantly until the publish
+    // for Broken.java has also arrived.
     let result = read_until(&mut reader, "\"id\":2", &mut seen);
     assert!(
         result.contains("\"status\":\"ok\""),
@@ -2007,6 +2007,12 @@ fn check_project_javac_round_trip() {
         "expected exactly one javac error (Broken.java): {result}"
     );
 
+    if !seen
+        .iter()
+        .any(|f| f.contains(&broken_uri) && f.contains("\"source\":\"javac\""))
+    {
+        let _ = read_until(&mut reader, "\"source\":\"javac\"", &mut seen);
+    }
     assert!(
         seen.iter()
             .any(|f| f.contains(&broken_uri) && f.contains("\"source\":\"javac\"")),

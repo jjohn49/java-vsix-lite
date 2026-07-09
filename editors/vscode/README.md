@@ -9,11 +9,18 @@ java-vsix-lite provides core Java editing features without the overhead of a JVM
 ## Features
 
 - **Syntax highlighting and semantic tokens** — accurate Java token colouring driven by the Rust parser
-- **Syntax diagnostics** — parse errors and basic structural issues reported inline
-- **Document outline** — class, method, and field structure visible in the Outline panel and breadcrumbs
-- **Folding ranges** — collapse blocks, comments, and imports
-- **Hover with Javadoc** — display attached Javadoc on hover for project symbols and JDK types
-- **Completion** — identifier completion including JDK and dependency signatures
+- **Diagnostics** — parse errors inline, plus unresolved-member errors (`obj.noSuchMethod()`) when the receiver's full type hierarchy resolves — conservative by design, on by default
+- **Completion** — identifier and member completion including JDK and dependency signatures, with generic types rendered (`V get(Object key)` on a `Map<K, V>`)
+- **Hover with Javadoc** — signatures and attached Javadoc for project symbols, JDK types (from `src.zip`), and dependencies (from `-sources.jar`)
+- **Go to definition / type definition** — into project files (open or not) and into JDK/dependency sources shown as read-only virtual documents
+- **Find references** — bounded, confirm-by-resolution workspace search that never reports a match it can't verify
+- **Rename** — conservative by design: refuses (with the reason) rather than producing a partial or wrong edit; renames the file along with a public type
+- **Go to implementation** — from an interface or abstract method to its implementors
+- **Workspace symbols** — jump to any top-level type by name (lazy, bounded index; nothing scans until you ask)
+- **Signature help** — parameter hints with overloads and active-parameter highlighting
+- **Document outline, folding, and selection ranges**
+- **Maven & Gradle awareness** — dependencies resolved statically and offline from `pom.xml` / `build.gradle` / version catalogs, including transitive dependencies, from your local `~/.m2` and `~/.gradle` caches; re-resolved automatically when build files change. Build scripts are **never executed**
+- **Check Project (javac)** — an explicit, workspace-trust-gated command that runs a one-shot `javac` check (annotation processing disabled) and reports real compiler errors in the Problems panel — no resident JVM
 
 ## Security posture
 

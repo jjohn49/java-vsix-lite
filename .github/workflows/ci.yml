@@ -69,9 +69,10 @@ jobs:
       - name: Package dry-run
         # Verifies the VSIX can be assembled without network access; uses the
         # vsce binary installed by npm ci above (--no-install enforces this,
-        # so vsce cannot silently fall back to fetching itself). Packaging
-        # here mirrors the plain (non-platform-specific) package step in
-        # release.yml. --no-dependencies skips vsce's own npm dependency scan,
+        # so vsce cannot silently fall back to fetching itself). Same flags as
+        # release.yml's package step minus its per-platform --target — this is
+        # a packaging-rot check, not a shippable artifact.
+        # --no-dependencies skips vsce's own npm dependency scan,
         # which is unnecessary (and would need network) since node_modules is
         # already excluded from the VSIX via .vscodeignore.
         run: npx --no-install @vscode/vsce package --no-dependencies --out /tmp/java-vsix-lite-ci.vsix
