@@ -238,6 +238,12 @@ struct Backend {
     /// `javac::run`'s polling loop so `shutdown` can kill+reap it — see
     /// `javac::kill_running_child`.
     javac_child: javac::SharedChild,
+    /// M5.4: bounded accounting of the reader threads abandoned by
+    /// timed-out/cancelled runs, so a misbehaving `jdk.home` binary can't
+    /// leak blocked threads without bound — `javac::run` refuses to start
+    /// once the cap is hit. See `javac::LeakedReaders` for the security
+    /// rationale.
+    javac_leaked_readers: javac::LeakedReaders,
     /// M5.4: diagnostics from the last `checkProject` run, keyed by URI
     /// string, merged into `compute_diagnostics`'s result for that file.
     /// Cleared for a file on its next `didChange` (stale after edit) and
@@ -271,6 +277,7 @@ impl Backend {
             javac_timeout_secs: OnceLock::new(),
             javac_running: std::sync::atomic::AtomicBool::new(false),
             javac_child: Arc::new(StdMutex::new(None)),
+            javac_leaked_readers: javac::LeakedReaders::new(),
             javac_diagnostics: StdMutex::new(HashMap::new()),
         }
     }
@@ -715,7 +722,8 @@ impl Backend {
             timeout: self.javac_timeout(),
         };
         let slot = Arc::clone(&self.javac_child);
-        let outcome = tokio::task::spawn_blocking(move || javac::run(config, &slot))
+        let leaked = self.javac_leaked_readers.clone();
+        let outcome = tokio::task::spawn_blocking(move || javac::run(config, &slot, &leaked))
             .await
             .unwrap_or_else(|err| {
                 javac::RunOutcome::SpawnError(format!("javac task panicked: {err}"))

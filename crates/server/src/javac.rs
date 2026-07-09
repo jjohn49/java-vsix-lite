@@ -19,7 +19,9 @@
 //!   inject extra flags or commands.
 //! - The child is **bounded**: a hard timeout (kills and reaps — no zombie),
 //!   and captured stdout/stderr are capped so pathological output can't
-//!   exhaust memory.
+//!   exhaust memory. Reader threads abandoned by timed-out runs (a killed
+//!   child's pipe-holding orphan can block them indefinitely) are counted
+//!   and capped too — see [`LeakedReaders`].
 //! - No network access is implied by anything here (javac itself does none
 //!   for a plain compile).
 
@@ -27,6 +29,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +59,11 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// How often the timeout loop polls the child for exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Cap on leaked (un-joined, still-blocked) output-reader threads before
+/// further runs are refused — see [`LeakedReaders`]'s doc comment for the
+/// security rationale.
+const MAX_LEAKED_READERS: usize = 8;
 
 /// Directory names skipped unconditionally while walking for source files —
 /// the same convention `workspace_index`'s walk uses (build output and VCS
@@ -376,6 +384,88 @@ pub(crate) struct RunConfig {
 /// there is never more than one child here.
 pub(crate) type SharedChild = Arc<StdMutex<Option<Child>>>;
 
+/// Bounds the reader threads deliberately left un-joined by timed-out/
+/// cancelled runs (see [`run`]'s exit-path handling: joining after a kill
+/// can block on a pipe-holding orphan outside our control).
+///
+/// **Security rationale**: per-run, leaving those threads un-joined is
+/// correct — but a misbehaving or outright hostile binary at a
+/// misconfigured `java-vsix-lite.jdk.home` could fork a long-lived,
+/// pipe-holding orphan on *every* invocation, leaking one blocked thread
+/// (well, two: stdout + stderr) per `checkProject` run, unbounded for the
+/// server's lifetime — a slow resource-exhaustion DoS driven by repeated
+/// explicit invocations. The threat model's "resource exhaustion / DoS"
+/// row requires all work to be bounded, so: every leaked reader gets a
+/// completion flag it sets when its pipe finally closes; [`Self::live_count`]
+/// sweeps completed ones out; and when the still-blocked count reaches the
+/// cap, [`run`] refuses to start another `javac` at all (with an error
+/// telling the user to check `jdk.home` and that a server restart resets
+/// the state). Threads unblocking naturally (the orphan exiting) free
+/// capacity again — the refusal is self-healing, not permanent.
+#[derive(Clone)]
+pub(crate) struct LeakedReaders {
+    cap: usize,
+    /// One completion flag per leaked reader thread, set by the thread
+    /// itself when its `drain_capped` finally returns.
+    flags: Arc<StdMutex<Vec<Arc<AtomicBool>>>>,
+}
+
+impl LeakedReaders {
+    pub(crate) fn new() -> Self {
+        Self::with_cap(MAX_LEAKED_READERS)
+    }
+
+    /// A lower cap than [`MAX_LEAKED_READERS`], so the refusal behavior can
+    /// be exercised in a test with one leaky run instead of several.
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self {
+            cap,
+            flags: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    /// Track one more leaked reader thread by its completion flag.
+    fn register(&self, flag: Arc<AtomicBool>) {
+        self.flags
+            .lock()
+            .expect("leaked readers poisoned")
+            .push(flag);
+    }
+
+    /// Sweep out threads that have since completed and return how many are
+    /// still blocked.
+    pub(crate) fn live_count(&self) -> usize {
+        let mut flags = self.flags.lock().expect("leaked readers poisoned");
+        flags.retain(|f| !f.load(Ordering::SeqCst));
+        flags.len()
+    }
+
+    /// Whether the still-blocked count has reached the cap — the signal for
+    /// [`run`] to refuse starting another `javac`.
+    fn at_capacity(&self) -> bool {
+        self.live_count() >= self.cap
+    }
+}
+
+/// A capped pipe-drain thread ([`drain_capped`]) plus the completion flag
+/// it sets on the way out — so a run that must abandon it (timeout/cancel)
+/// can hand the flag to [`LeakedReaders`] instead of blocking on a join.
+struct ReaderThread {
+    handle: std::thread::JoinHandle<Vec<u8>>,
+    done: Arc<AtomicBool>,
+}
+
+fn spawn_reader(stream: impl Read + Send + 'static) -> ReaderThread {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_in_thread = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        let bytes = drain_capped(stream);
+        done_in_thread.store(true, Ordering::SeqCst);
+        bytes
+    });
+    ReaderThread { handle, done }
+}
+
 /// Kill and reap whatever child is currently in `slot`, if any — called on
 /// server shutdown so a check in flight never survives as a zombie or an
 /// orphan past the server's own lifetime.
@@ -392,20 +482,37 @@ pub(crate) fn kill_running_child(slot: &SharedChild) {
 /// (e.g. `tokio::task::spawn_blocking`) — this does real, potentially
 /// long-lived (up to the timeout) blocking I/O.
 ///
+/// Refuses outright (before touching the filesystem or spawning anything)
+/// when `leaked`'s still-blocked reader-thread count has reached its cap —
+/// see [`LeakedReaders`] for the security rationale.
+///
 /// A scratch directory under `std::env::temp_dir()` is created for `-d` and
 /// the `@argfile`, and removed again before returning (best-effort — a
 /// failure to clean up is not itself an error).
-pub(crate) fn run(config: RunConfig, slot: &SharedChild) -> RunOutcome {
+pub(crate) fn run(config: RunConfig, slot: &SharedChild, leaked: &LeakedReaders) -> RunOutcome {
+    if leaked.at_capacity() {
+        return RunOutcome::SpawnError(format!(
+            "javac runs are leaking resources ({} output-reader threads still blocked by \
+             earlier timed-out runs) — check that java-vsix-lite.jdk.home / $JAVA_HOME points \
+             at a real JDK; restart the server to reset",
+            leaked.live_count()
+        ));
+    }
     let scratch = unique_scratch_dir();
     if std::fs::create_dir_all(&scratch).is_err() {
         return RunOutcome::SpawnError("failed to create scratch directory".to_string());
     }
-    let outcome = run_in_scratch(&config, &scratch, slot);
+    let outcome = run_in_scratch(&config, &scratch, slot, leaked);
     let _ = std::fs::remove_dir_all(&scratch);
     outcome
 }
 
-fn run_in_scratch(config: &RunConfig, scratch: &Path, slot: &SharedChild) -> RunOutcome {
+fn run_in_scratch(
+    config: &RunConfig,
+    scratch: &Path,
+    slot: &SharedChild,
+    leaked: &LeakedReaders,
+) -> RunOutcome {
     let argfile_path = scratch.join("sources.argfile");
     if let Err(err) = write_argfile(&argfile_path, &config.source_files) {
         return RunOutcome::SpawnError(format!("failed to write argfile: {err}"));
@@ -421,8 +528,30 @@ fn run_in_scratch(config: &RunConfig, scratch: &Path, slot: &SharedChild) -> Run
         .arg("-d")
         .arg(scratch);
     if !config.classpath_entries.is_empty() {
-        if let Ok(joined) = std::env::join_paths(&config.classpath_entries) {
-            cmd.arg("-cp").arg(joined);
+        match std::env::join_paths(&config.classpath_entries) {
+            Ok(joined) => {
+                cmd.arg("-cp").arg(joined);
+            }
+            // Fail loud, never degrade silently: dropping `-cp` here would
+            // "work" but produce a wall of misleading cannot-find-symbol
+            // diagnostics for every dependency type. Name the offending
+            // entry (the one that itself fails a single-entry join — i.e.
+            // contains the platform's path-list separator) so the user can
+            // actually act on it.
+            Err(_) => {
+                let offender = config
+                    .classpath_entries
+                    .iter()
+                    .find(|p| std::env::join_paths(std::iter::once(*p)).is_err());
+                return RunOutcome::SpawnError(match offender {
+                    Some(p) => format!(
+                        "classpath entry contains the platform path-list separator and cannot \
+                         be passed to javac -cp: {}",
+                        p.display()
+                    ),
+                    None => "classpath entries cannot be joined for javac -cp".to_string(),
+                });
+            }
         }
     }
     cmd.arg(format!("@{}", argfile_path.display()));
@@ -435,10 +564,8 @@ fn run_in_scratch(config: &RunConfig, scratch: &Path, slot: &SharedChild) -> Run
         Err(err) => return RunOutcome::SpawnError(format!("failed to spawn javac: {err}")),
     };
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = stdout.map(|s| std::thread::spawn(move || drain_capped(s)));
-    let stderr_reader = stderr.map(|s| std::thread::spawn(move || drain_capped(s)));
+    let stdout_reader = child.stdout.take().map(spawn_reader);
+    let stderr_reader = child.stderr.take().map(spawn_reader);
 
     *slot.lock().expect("javac child slot poisoned") = Some(child);
 
@@ -453,23 +580,29 @@ fn run_in_scratch(config: &RunConfig, scratch: &Path, slot: &SharedChild) -> Run
         // would then block on something outside our control, defeating the
         // whole point of the timeout. We already killed+reaped the process
         // we actually spawned; its stderr is irrelevant to a `TimedOut`/
-        // `Cancelled` outcome anyway, so the reader threads are simply
-        // dropped (un-joined) rather than awaited — they'll finish
-        // harmlessly on their own once whatever still holds the pipe open
-        // eventually closes it.
+        // `Cancelled` outcome anyway, so the reader threads are abandoned
+        // un-joined — but *counted*, via `leaked` (see [`LeakedReaders`]
+        // for why an unbounded number of these would be a security problem).
         PollResult::Exited => {
             let stderr_bytes = stderr_reader
-                .and_then(|h| h.join().ok())
+                .and_then(|r| r.handle.join().ok())
                 .unwrap_or_default();
             // Stdout is drained (never left to fill the pipe and block the
             // child) but not otherwise used.
-            let _ = stdout_reader.and_then(|h| h.join().ok());
+            let _ = stdout_reader.and_then(|r| r.handle.join().ok());
             RunOutcome::Completed {
                 stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
             }
         }
-        PollResult::TimedOut => RunOutcome::TimedOut,
-        PollResult::Cancelled => RunOutcome::Cancelled,
+        PollResult::TimedOut | PollResult::Cancelled => {
+            for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+                leaked.register(reader.done);
+            }
+            match result {
+                PollResult::TimedOut => RunOutcome::TimedOut,
+                _ => RunOutcome::Cancelled,
+            }
+        }
     }
 }
 
@@ -737,16 +870,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A `sh` fixture standing in for `javac`: sleeps far longer than the
-    /// configured timeout, then (only if it ever gets there) touches
-    /// `marker` — so "the marker never appears" proves the child was
-    /// actually killed, not merely that `run` gave up waiting on it.
-    /// Unix-only (a shell script fixture); the timeout path itself is
-    /// exercised here since racing a real multi-second `javac` invocation
-    /// in CI would be slow and flaky — everything else about process
-    /// hygiene (kill + reap, no zombie) is covered by inspection in
-    /// `poll_until_exit_or_timeout` and this test's own promptness/marker
-    /// assertions.
+    /// A `sh` fixture standing in for `javac`: its *first* statement forks
+    /// a background `sleep 10` that inherits (and keeps holding) the
+    /// stdout/stderr pipes — the "pipe-holding orphan" a killed child can
+    /// leave behind — then sleeps far longer than the configured timeout,
+    /// then (only if it ever gets there) touches `marker` — so "the marker
+    /// never appears" proves the child was actually killed, not merely that
+    /// `run` gave up waiting on it. Backgrounding the pipe-holder first
+    /// thing (rather than relying on the foreground `sleep`'s own fork)
+    /// keeps the leaked-reader assertions deterministic: the kill only has
+    /// to land after the script's very first statement, and the tests give
+    /// that a full second of margin. Unix-only (a shell script fixture);
+    /// the timeout path itself is exercised here since racing a real
+    /// multi-second `javac` invocation in CI would be slow and flaky —
+    /// everything else about process hygiene (kill + reap, no zombie) is
+    /// covered by inspection in `poll_until_exit_or_timeout` and these
+    /// tests' own promptness/marker assertions.
     #[cfg(unix)]
     fn write_slow_fake_javac(dir: &Path, marker: &Path, sleep_secs: u64) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -754,7 +893,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nsleep {sleep_secs}\ntouch \"{}\"\n",
+                "#!/bin/sh\nsleep 10 &\nsleep {sleep_secs}\ntouch \"{}\"\n",
                 marker.display()
             ),
         )
@@ -778,17 +917,25 @@ mod tests {
             javac_path: script,
             source_files: vec![],
             classpath_entries: vec![],
-            timeout: Duration::from_millis(200),
+            timeout: Duration::from_secs(1),
         };
         let slot: SharedChild = Arc::new(StdMutex::new(None));
+        let leaked = LeakedReaders::new();
         let start = Instant::now();
-        let outcome = run(config, &slot);
+        let outcome = run(config, &slot, &leaked);
         let elapsed = start.elapsed();
 
         assert!(matches!(outcome, RunOutcome::TimedOut));
         assert!(
             elapsed < Duration::from_secs(3),
             "should have been killed well before the fake script's 5s sleep: {elapsed:?}"
+        );
+        // The backgrounded `sleep 10` orphan still holds both pipes open,
+        // so both abandoned reader threads must be accounted for.
+        assert_eq!(
+            leaked.live_count(),
+            2,
+            "both abandoned reader threads should be counted as leaked"
         );
         // Give a killed-but-somehow-still-running process a moment, then
         // confirm it never reached the `touch` — i.e. it was truly killed.
@@ -819,7 +966,7 @@ mod tests {
         let slot: SharedChild = Arc::new(StdMutex::new(None));
         let run_slot = Arc::clone(&slot);
         let start = Instant::now();
-        let handle = std::thread::spawn(move || run(config, &run_slot));
+        let handle = std::thread::spawn(move || run(config, &run_slot, &LeakedReaders::new()));
 
         // Give `run` time to spawn the fake javac and store it in `slot`
         // (it sleeps 5s before touching anything, so this is comfortably
@@ -841,5 +988,116 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leaked_readers_sweep_completed_flags() {
+        let leaked = LeakedReaders::with_cap(8);
+        let still_blocked = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        leaked.register(Arc::clone(&still_blocked));
+        leaked.register(Arc::clone(&finished));
+        assert_eq!(leaked.live_count(), 2);
+
+        // A leaked thread finally unblocking (its flag set) frees capacity
+        // on the next sweep — the refusal is self-healing, not permanent.
+        finished.store(true, Ordering::SeqCst);
+        assert_eq!(leaked.live_count(), 1);
+        still_blocked.store(true, Ordering::SeqCst);
+        assert_eq!(leaked.live_count(), 0);
+    }
+
+    /// The refusal half of the bounded-leak invariant, deterministically:
+    /// with the still-blocked count at a (test-lowered) cap, [`run`] must
+    /// refuse outright — before creating the scratch dir or spawning
+    /// anything — with a clear, actionable error, so a hostile `jdk.home`
+    /// binary can't grow blocked threads without bound. The leak-*counting*
+    /// half (a timed-out run registers its abandoned readers) is covered by
+    /// `run_kills_and_reaps_on_timeout`'s `live_count` assertion; here the
+    /// flags are registered by hand instead of racing real processes, which
+    /// keeps the test load-independent.
+    #[test]
+    fn leaked_reader_cap_refuses_further_runs() {
+        let leaked = LeakedReaders::with_cap(2);
+        leaked.register(Arc::new(AtomicBool::new(false)));
+        leaked.register(Arc::new(AtomicBool::new(false)));
+
+        let slot: SharedChild = Arc::new(StdMutex::new(None));
+        let outcome = run(
+            RunConfig {
+                // Never reached: the refusal must precede any spawn attempt.
+                javac_path: PathBuf::from("/nonexistent/javac-never-spawned"),
+                source_files: vec![],
+                classpath_entries: vec![],
+                timeout: Duration::from_millis(200),
+            },
+            &slot,
+            &leaked,
+        );
+        match outcome {
+            RunOutcome::SpawnError(msg) => {
+                assert!(
+                    msg.contains("leaking resources") && msg.contains("jdk.home"),
+                    "refusal message should be clear and actionable: {msg}"
+                );
+            }
+            _ => panic!("expected the run to be refused at the leak cap"),
+        }
+
+        // One leaked thread unblocking frees capacity: cap 2 with only 1
+        // still blocked runs again (and immediately fails to spawn the
+        // nonexistent binary — proving it got *past* the refusal gate).
+        let leaked = LeakedReaders::with_cap(2);
+        leaked.register(Arc::new(AtomicBool::new(false)));
+        let outcome = run(
+            RunConfig {
+                javac_path: PathBuf::from("/nonexistent/javac-never-spawned"),
+                source_files: vec![],
+                classpath_entries: vec![],
+                timeout: Duration::from_millis(200),
+            },
+            &slot,
+            &leaked,
+        );
+        match outcome {
+            RunOutcome::SpawnError(msg) => {
+                assert!(
+                    msg.contains("failed to spawn javac"),
+                    "below the cap the run must proceed to the (failing) spawn: {msg}"
+                );
+            }
+            _ => panic!("expected a spawn failure, not a refusal, below the cap"),
+        }
+    }
+
+    /// Fix round 1 (IMPORTANT 2): an entry `std::env::join_paths` can't
+    /// represent (it contains the platform's path-list separator) must fail
+    /// the run loudly, naming the offending entry — never silently drop
+    /// `-cp` and let the user chase misleading cannot-find-symbol
+    /// diagnostics.
+    #[cfg(unix)]
+    #[test]
+    fn classpath_entry_with_separator_fails_loud() {
+        let config = RunConfig {
+            javac_path: PathBuf::from("/nonexistent/javac-never-spawned"),
+            source_files: vec![],
+            classpath_entries: vec![
+                PathBuf::from("/deps/fine.jar"),
+                PathBuf::from("/deps/evil:name.jar"),
+            ],
+            timeout: Duration::from_secs(10),
+        };
+        let slot: SharedChild = Arc::new(StdMutex::new(None));
+        let outcome = run(config, &slot, &LeakedReaders::new());
+        match outcome {
+            RunOutcome::SpawnError(msg) => {
+                assert!(
+                    msg.contains("/deps/evil:name.jar"),
+                    "the offending entry must be named: {msg}"
+                );
+                assert!(msg.contains("separator"), "the cause must be stated: {msg}");
+            }
+            _ => panic!("expected a loud SpawnError for the unjoinable classpath entry"),
+        }
     }
 }
