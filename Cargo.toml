@@ -14,7 +14,7 @@ publish = false
 # resolves identically. Exact versions are filled in by `cargo add` (committed
 # Cargo.lock is the supply-chain source of truth).
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

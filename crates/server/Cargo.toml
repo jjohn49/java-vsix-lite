@@ -16,12 +16,15 @@ path = "src/main.rs"
 jvl-classpath = { version = "0.0.0", path = "../classpath" }
 jvl-syntax = { version = "0.0.0", path = "../syntax" }
 serde = { version = "1.0.228", features = ["derive"] }
+# M5.2: promoted from dev-dependencies — `initialized()` now serializes
+# `DidChangeWatchedFilesRegistrationOptions` into the `Registration.register_options`
+# JSON value for the build-file watch. Already a transitive dependency (ls-types,
+# tower-lsp-server); this only makes it nameable from non-test code, with no change
+# to the resolved version or Cargo.lock's crate set.
+serde_json = "1.0.150"
 tokio.workspace = true
 tower-lsp-server = "0.23.0"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-serde_json = "1.0.150"
 # tower-lsp-server is added via `cargo add` so the exact version is recorded here
 # and in Cargo.lock.
