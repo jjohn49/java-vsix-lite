@@ -474,25 +474,37 @@ impl Backend {
     /// root). Only a root that is an actual prefix of the file's directory
     /// counts as "confidently containing" it, matching rule (c)'s
     /// conservative gate in the task brief.
-    fn expected_package(&self, docs: &HashMap<String, Document>, uri: &str) -> Option<String> {
+    ///
+    /// Deliberately does NOT reuse [`Self::source_roots`]: that ladder
+    /// includes roots *inferred from other open documents'* package/path
+    /// coincidences (`infer_source_root`), which is fine for best-effort
+    /// navigation but unacceptable for a diagnostic — what error a file gets
+    /// must never depend on which unrelated sibling files happen to be open.
+    /// Only the fixed conventional roots (`src/main/java`, `src/test/java`
+    /// under the workspace root) qualify. The bare workspace root itself is
+    /// also deliberately excluded: a file at `root/tools/Foo.java` is far
+    /// more likely an ad-hoc/unconventional layout than a genuine claim
+    /// that `Foo` belongs to package `tools`, so flagging it would be a
+    /// false positive by construction. Unconventional layouts simply stay
+    /// silent (per the brief: "lone files / unknown roots stay silent").
+    fn expected_package(&self, uri: &str) -> Option<String> {
         let path = open_doc_path(uri)?;
         let dir = path.parent()?;
         let project_root = self.project_root()?;
-        self.source_roots(docs, &project_root)
-            .into_iter()
-            .filter(|root| dir.starts_with(root))
-            // Most specific (longest) matching root wins, so a file under a
-            // nested inferred root isn't miscounted against a shallower
-            // conventional one.
-            .max_by_key(|root| root.components().count())
-            .map(|root| {
-                dir.strip_prefix(&root)
-                    .into_iter()
-                    .flat_map(|rel| rel.components())
-                    .filter_map(|c| c.as_os_str().to_str())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            })
+        [
+            project_root.join("src/main/java"),
+            project_root.join("src/test/java"),
+        ]
+        .into_iter()
+        .find(|root| dir.starts_with(root))
+        .map(|root| {
+            dir.strip_prefix(&root)
+                .into_iter()
+                .flat_map(|rel| rel.components())
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
     }
 
     /// The lazy, bounded workspace symbol index (see `workspace_index`),
@@ -665,7 +677,7 @@ impl Backend {
                     d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
                 }
                 let filename = filename_from_uri(uri);
-                let expected_package = self.expected_package(docs, uri);
+                let expected_package = self.expected_package(uri);
                 d.extend(jvl_syntax::structural_diagnostics(
                     &doc.tree,
                     &doc.text,

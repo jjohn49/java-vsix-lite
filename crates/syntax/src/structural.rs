@@ -950,6 +950,16 @@ mod tests {
     }
 
     #[test]
+    fn repeated_modifier_stays_silent_when_the_declaration_has_a_parse_error() {
+        // The class body is malformed (an incomplete field initializer), so
+        // the whole `class_declaration` node — the relevant region for the
+        // repeated-modifier check — carries the error, despite the
+        // `public public` repetition itself being intact.
+        let msgs = structural("public public class DupMod {\n    int x = ;\n}\n");
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
     fn distinct_modifiers_are_silent() {
         let msgs = structural("public final class C {\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
@@ -962,6 +972,16 @@ mod tests {
             msgs,
             vec!["interface abstract methods cannot have body".to_string()]
         );
+    }
+
+    #[test]
+    fn method_body_shape_stays_silent_when_the_declaration_has_a_parse_error() {
+        // `return }` (no semicolon) leaves an `ERROR` node inside the
+        // method's own `block`, so its `method_declaration` node carries the
+        // error — the body-shape check must not fire despite the genuine
+        // violation (a body on a plain interface method).
+        let msgs = structural("interface I {\n    void m() { return }\n}\n");
+        assert!(msgs.is_empty(), "{msgs:?}");
     }
 
     #[test]

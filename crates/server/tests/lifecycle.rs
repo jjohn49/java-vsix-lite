@@ -2266,3 +2266,82 @@ fn structural_package_mismatch_then_clean_round_trip() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M6 (6.1) fix round 1: the package-vs-directory diagnostic must use only
+/// the fixed conventional source roots — never roots *inferred from other
+/// open documents* (`infer_source_root`), which are fine for best-effort
+/// navigation but would make what error a file gets depend on which
+/// unrelated sibling files happen to be open. Scenario: doc A at
+/// `root/lib/a/b/A.java` declaring `package a.b;` makes `root/lib` an
+/// inferred source root; doc B at `root/lib/c/B.java` declaring an
+/// unrelated `package x.y;` would then have "expected package c" under the
+/// old behavior and get a false mismatch error. It must stay silent.
+#[test]
+fn structural_package_rule_ignores_open_doc_inferred_roots() {
+    let root = temp_root("structural-inferred-root");
+    let a_dir = root.join("lib/a/b");
+    let b_dir = root.join("lib/c");
+    std::fs::create_dir_all(&a_dir).expect("create temp project dirs");
+    std::fs::create_dir_all(&b_dir).expect("create temp project dirs");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // Doc A: its path (`lib/a/b/A.java`) matches its package (`a.b`), so
+    // `infer_source_root` derives `root/lib` from it once it's open.
+    let a_uri = format!("file://{}", a_dir.join("A.java").display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{a_uri}","languageId":"java","version":1,"text":"package a.b;\nclass A {{}}\n"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Doc B: under `root/lib/c/` with an unrelated package. The inferred
+    // `root/lib` root "contains" it, but only conventional roots may drive
+    // the diagnostic — B must publish NO diagnostics at all.
+    let b_uri = format!("file://{}", b_dir.join("B.java").display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{b_uri}","languageId":"java","version":1,"text":"package x.y;\nclass B {{}}\n"}}}}}}"#
+    ));
+    let b_diag = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        b_diag.contains(&b_uri),
+        "expected B's own diagnostics notification: {b_diag}"
+    );
+    assert!(
+        b_diag.contains("\"diagnostics\":[]"),
+        "a file under an open-doc-INFERRED root (not a conventional one) must stay \
+         silent — no package-mismatch diagnostic: {b_diag}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
