@@ -263,6 +263,35 @@ pub(crate) fn param_list_span(label: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Number of parameters in a rendered signature label's parameter list (the
+/// top-level-comma count, plus one; `0` for empty parens or no parens found
+/// at all). Used to pick the arity-matching overload of an *external*
+/// member — no parse-tree node backs one, only its rendered signature
+/// string, so arity is recovered the same way
+/// [`signature_help::external_param_offsets`] recovers per-parameter spans:
+/// splitting the parenthesized parameter list on depth-0 commas (`()[]<>`
+/// tracked so a generic argument's own comma doesn't split).
+pub(crate) fn param_count_in_label(label: &str) -> usize {
+    let Some((open, close)) = param_list_span(label) else {
+        return 0;
+    };
+    let inner = &label[open + 1..close];
+    if inner.trim().is_empty() {
+        return 0;
+    }
+    let mut depth = 0i32;
+    let mut count = 1usize;
+    for b in inner.bytes() {
+        match b {
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => depth -= 1,
+            b',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 fn throws_clause(node: Node, source: &str) -> Option<String> {
     let throws = named_children(node)
         .into_iter()
@@ -429,6 +458,16 @@ mod tests {
         let tree = tree(src);
         let node = find_kind(tree.root_node(), "variable_declarator").unwrap();
         assert_eq!(javadoc(node, src).as_deref(), Some("Line one.\nLine two."));
+    }
+
+    #[test]
+    fn param_count_in_label_counts_top_level_commas() {
+        assert_eq!(param_count_in_label("Foo()"), 0);
+        assert_eq!(param_count_in_label("Foo(int a)"), 1);
+        assert_eq!(param_count_in_label("Foo(int a, String b)"), 2);
+        // A generic argument's own comma must not split the count.
+        assert_eq!(param_count_in_label("Foo(Map<String, Integer> m)"), 1);
+        assert_eq!(param_count_in_label("no parens here"), 0);
     }
 
     #[test]

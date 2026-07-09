@@ -65,6 +65,12 @@ pub struct Member {
 pub enum MemberKind {
     Method,
     Field,
+    /// An `<init>` method, surfaced as `ClassName(paramTypes)` (see
+    /// `class_info::parse`'s `<init>` handling). `Member::name` is the
+    /// declaring class's simple name — also the docsrc lookup key for
+    /// recovering its Javadoc from a source archive (which has no notion of
+    /// `<init>`, only a constructor declaration named after its class).
+    Constructor,
 }
 
 /// An archive on the classpath plus the entry-name prefix for its class files
@@ -400,6 +406,34 @@ mod tests {
         let cp = Classpath::empty();
         assert!(cp.is_empty());
         assert!(cp.class("java.util.List").is_none());
+    }
+
+    /// M6.3: real JDK bytecode surfaces `<init>` methods as `Constructor`
+    /// members named after the class, with both a no-arg and a
+    /// parameterized overload present.
+    #[test]
+    fn arraylist_exposes_constructors() {
+        let Some(cp) = jdk() else { return };
+        let al = cp
+            .class("java.util.ArrayList")
+            .expect("java.util.ArrayList");
+        let ctors: Vec<_> = al
+            .members
+            .iter()
+            .filter(|m| matches!(m.kind, MemberKind::Constructor))
+            .collect();
+        assert!(!ctors.is_empty(), "ArrayList should expose constructors");
+        assert!(ctors.iter().all(|m| m.name == "ArrayList"), "{:?}", ctors);
+        assert!(
+            ctors.iter().any(|m| m.signature == "ArrayList()"),
+            "expected a no-arg constructor: {:?}",
+            ctors
+        );
+        assert!(
+            ctors.iter().any(|m| m.signature != "ArrayList()"),
+            "expected at least one parameterized constructor: {:?}",
+            ctors
+        );
     }
 }
 

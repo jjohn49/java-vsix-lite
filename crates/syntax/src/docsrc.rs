@@ -68,14 +68,21 @@ fn find_type<'t>(root: Node<'t>, source: &str, simple: &str) -> Option<Node<'t>>
     None
 }
 
-/// The method/field declaration named `name` directly in a type's body.
+/// The method/field/constructor declaration named `name` directly in a
+/// type's body. A constructor's declarator `name` field is the class's own
+/// name (Java's rule, not a lookup convention here), so a constructor is
+/// found under the same `name` a caller uses for `type_simple` itself — see
+/// `jvl_classpath::MemberKind::Constructor`, which surfaces external
+/// constructors with `Member::name` set to the class's simple name for
+/// exactly this reason. First declared constructor wins when there are
+/// several overloads — this lookup is name-only, with no notion of arity.
 fn find_member_decl<'t>(type_node: Node<'t>, source: &str, name: &str) -> Option<Node<'t>> {
     let body = named_children(type_node)
         .into_iter()
         .find(|c| c.kind().ends_with("_body"))?;
     for child in named_children(body) {
         match child.kind() {
-            "method_declaration" => {
+            "method_declaration" | "constructor_declaration" => {
                 if named_field(child, source) == Some(name) {
                     return Some(child);
                 }
@@ -130,6 +137,23 @@ mod tests {
         assert_eq!(
             javadoc_in_source(SRC, "MyList", None).as_deref(),
             Some("The list type.")
+        );
+    }
+
+    /// M6.3: a constructor's Javadoc is recovered by the class's own simple
+    /// name — the same name a caller passes as `type_simple` — since a
+    /// source archive has no `<init>`, only a constructor declaration named
+    /// after its class.
+    #[test]
+    fn extracts_constructor_javadoc_by_class_simple_name() {
+        let src = "package p;\n\
+            public class Widget {\n\
+            \x20 /** Builds a Widget. */\n\
+            \x20 public Widget(int a) {}\n\
+            }\n";
+        assert_eq!(
+            javadoc_in_source(src, "Widget", Some("Widget")).as_deref(),
+            Some("Builds a Widget.")
         );
     }
 

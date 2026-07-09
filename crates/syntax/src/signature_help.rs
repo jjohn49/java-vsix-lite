@@ -21,7 +21,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::external::{ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
-use crate::model::{base_type_name, MemberKind, TypeTable};
+use crate::model::{MemberKind, TypeTable};
 use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
 use crate::signature;
 use crate::{node_text, LineIndex, OpenDoc};
@@ -157,27 +157,61 @@ fn member_signature(member: &HierMember) -> Option<SignatureInformation> {
 }
 
 /// Overloads of a `new Type(...)` call: the created type's declared
-/// constructors. In-project only — the external `SymbolSource` seam has no
-/// notion of a constructor (`ExternalMemberKind` is `Method`/`Field` only), so
-/// `new` on an external (JDK/dependency) type yields no signature help; see
-/// the task report.
+/// constructors, in-project or external — resolving the `type` field the
+/// same way any other receiver-type reference does
+/// (`resolve::resolve_object_creation_type`), so a fully-qualified,
+/// generic (`new ArrayList<String>(...)`), or imported-external type-name
+/// all agree with hover and completion on what `new Foo` refers to. M6.3
+/// closes what used to be only an in-project feature: constructors are now
+/// members of the classpath model too (`ExternalMemberKind::Constructor`),
+/// so `new ArrayList<>(|)` lists the JDK's real overloads.
 fn constructor_overloads<'t>(
     call: Node<'t>,
     ctx: &Ctx<'_, 't>,
 ) -> Option<Vec<SignatureInformation>> {
-    let type_node = call.child_by_field_name("type")?;
-    let simple = base_type_name(type_node, ctx.doc.source)?;
-    let td = ctx.table.get(simple)?;
-    let signatures = td
-        .constructors()
-        .into_iter()
-        .filter_map(|node| {
-            let (label, offsets) = signature::signature_with_param_offsets(node, td.source)?;
-            let doc = signature::javadoc(node, td.source);
-            Some(build_signature(label, offsets, doc))
-        })
-        .collect();
-    Some(signatures)
+    match resolve::resolve_object_creation_type(call, ctx)? {
+        ResolvedType::InProject(td) => {
+            let signatures = td
+                .constructors()
+                .into_iter()
+                .filter_map(|node| {
+                    let (label, offsets) =
+                        signature::signature_with_param_offsets(node, td.source)?;
+                    let doc = signature::javadoc(node, td.source);
+                    Some(build_signature(label, offsets, doc))
+                })
+                .collect();
+            Some(signatures)
+        }
+        ResolvedType::External { fqn, args } => {
+            let class = ctx.symbols.class(&fqn)?;
+            let simple = fqn
+                .rsplit('.')
+                .next()
+                .and_then(|s| s.rsplit('$').next())
+                .unwrap_or(&fqn)
+                .to_string();
+            let type_params = class.type_params.clone();
+            let signatures = class
+                .members
+                .into_iter()
+                .filter(|m| m.kind == ExternalMemberKind::Constructor)
+                .map(|m| {
+                    let label = resolve::display_signature(&m, &args, &type_params);
+                    let offsets = external_param_offsets(&label);
+                    // Constructor Javadoc is recovered docsrc-style, by the
+                    // class's simple name (see
+                    // `jvl_classpath::MemberKind::Constructor`) — the same
+                    // first-match-wins lookup hover's external-constructor
+                    // path uses, so all declared overloads share whichever
+                    // constructor's Javadoc the source archive finds first.
+                    let doc = ctx.symbols.doc(&fqn, Some(&simple));
+                    build_signature(label, offsets, doc)
+                })
+                .collect();
+            Some(signatures)
+        }
+    }
 }
 
 /// Assemble a `SignatureInformation` from a rendered label, the parameters'
@@ -379,6 +413,65 @@ mod tests {
             Some(1),
             "only the real comma counts, not the one inside the string"
         );
+    }
+
+    /// M6.3: `new Type(...)` on an *external* (JDK/dependency) type now lists
+    /// its constructor overloads — closing the Task-5 deferred gap the
+    /// module doc used to describe.
+    #[test]
+    fn external_constructor_call_lists_overloads_with_documentation() {
+        let src = "import test.Widget;\nclass C { void m() { Widget w = new Widget(1, 2); } }\n";
+        struct WidgetCtors;
+        impl SymbolSource for WidgetCtors {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                (fqn == "test.Widget").then(|| ExternalClass {
+                    supers: Vec::new(),
+                    type_params: Vec::new(),
+                    members: vec![
+                        ExternalMember {
+                            name: "Widget".to_string(),
+                            kind: ExternalMemberKind::Constructor,
+                            signature: "Widget()".to_string(),
+                            template: None,
+                            is_static: false,
+                        },
+                        ExternalMember {
+                            name: "Widget".to_string(),
+                            kind: ExternalMemberKind::Constructor,
+                            signature: "Widget(int a, int b)".to_string(),
+                            template: None,
+                            is_static: false,
+                        },
+                    ],
+                })
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (fqn == "test.Widget" && member == Some("Widget"))
+                    .then(|| "Builds a Widget.".to_string())
+            }
+        }
+        let at = src.find("new Widget(").unwrap() + "new Widget(".len();
+        let help = help_at(src, at, &WidgetCtors).expect("signature help");
+        assert_eq!(help.signatures.len(), 2, "{help:?}");
+        assert!(help.signatures[0].label.contains("Widget()"));
+        assert!(help.signatures[1].label.contains("Widget(int a, int b)"));
+        assert_eq!(help.active_signature, Some(1), "2-arg overload is active");
+        assert_eq!(help.active_parameter, Some(0));
+        for sig in &help.signatures {
+            match &sig.documentation {
+                Some(Documentation::String(text)) => {
+                    assert_eq!(text, "Builds a Widget.")
+                }
+                other => panic!("expected doc string, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn external_type_with_no_symbols_yields_no_constructor_signature_help() {
+        let src = "import test.Widget;\nclass C { void m() { Widget w = new Widget(1); } }\n";
+        let at = src.find("new Widget(").unwrap() + "new Widget(".len();
+        assert!(help_at(src, at, &NoSymbols).is_none());
     }
 
     #[test]

@@ -5,11 +5,11 @@
 use ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use tree_sitter::{Node, Tree};
 
-use crate::external::SymbolSource;
+use crate::external::{ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
 use crate::model::{named_children, TypeTable};
 use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
-use crate::signature::{javadoc, signature};
+use crate::signature::{javadoc, param_count_in_label, param_labels, signature};
 use crate::{node_text, LineIndex, OpenDoc};
 
 /// What to render: an in-project declaration node (signature + Javadoc from the
@@ -92,6 +92,14 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
         return inproject_target(&resolved);
     }
 
+    // Cursor on the type name inside `new Foo(...)` (or `new ArrayList<String>(...)`
+    // — the `type` field may be wrapped in a `generic_type`/`scoped_type_identifier`):
+    // show the best-matching constructor rather than falling through to a plain
+    // type-name reference (which would just show the class declaration).
+    if let Some(call) = enclosing_object_creation(name_node) {
+        return constructor_target(call, ctx);
+    }
+
     let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
@@ -165,6 +173,115 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
                 ResolvedType::InProject(_) => None,
             };
             Some(Target::External(m.signature, doc))
+        }
+    }
+}
+
+/// Walk up from `name_node` through the type-node shapes that can wrap a
+/// `new` type reference (`generic_type` for `new ArrayList<String>()`,
+/// `scoped_type_identifier`/`annotated_type` for a qualified or annotated
+/// one), returning the enclosing `object_creation_expression` if `name_node`
+/// is (part of) its `type` field — `None` for anything else (e.g. an
+/// argument expression inside the call, whose parent chain never reaches one
+/// of these type-node kinds).
+fn enclosing_object_creation(name_node: Node) -> Option<Node> {
+    let mut node = name_node;
+    loop {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "object_creation_expression" if parent.child_by_field_name("type") == Some(node) => {
+                return Some(parent);
+            }
+            "generic_type" | "scoped_type_identifier" | "annotated_type" => node = parent,
+            _ => return None,
+        }
+    }
+}
+
+/// Number of arguments actually written at a call site (`new Foo(1, 2)` -> 2)
+/// — the direct argument expressions inside the object-creation's own
+/// `argument_list` (a nested call's arguments live in their own
+/// `argument_list` node, so they're never counted here).
+fn call_arg_count(call: Node) -> usize {
+    named_children(call)
+        .into_iter()
+        .find(|c| c.kind() == "argument_list")
+        .map(|args| {
+            named_children(args)
+                .into_iter()
+                .filter(|c| !matches!(c.kind(), "line_comment" | "block_comment"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Hover for the type name inside `new Foo(...)`: the best-matching
+/// constructor's signature + Javadoc. "Best-matching" is an arity match
+/// against the call's argument count (first declared wins a tie — the same
+/// convention `signature_help`'s active-overload heuristic uses), falling
+/// back to the first declared constructor if none matches. When a chosen
+/// constructor has no Javadoc of its own, falls back to the class-level
+/// Javadoc; when the type declares no explicit constructor at all, shows a
+/// synthesized `Foo()` plus the class-level Javadoc (bytecode always carries
+/// at least the compiler-synthesized no-arg `<init>`, so the external path
+/// only takes this branch for a type with no constructors whatsoever, e.g.
+/// an interface — not valid to `new`, but handled gracefully all the same).
+fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
+    let resolved_ty = resolve::resolve_object_creation_type(call, ctx)?;
+    let arg_count = call_arg_count(call);
+    match resolved_ty {
+        ResolvedType::InProject(td) => {
+            let ctors = td.constructors();
+            let (sig, ctor_doc) = if ctors.is_empty() {
+                (format!("{}()", td.name), None)
+            } else {
+                let chosen = ctors
+                    .iter()
+                    .find(|&&n| param_labels(n, td.source).len() == arg_count)
+                    .copied()
+                    .unwrap_or(ctors[0]);
+                (signature(chosen, td.source)?, javadoc(chosen, td.source))
+            };
+            // A constructor with no Javadoc of its own falls back to the
+            // class-level Javadoc (also the only doc a synthesized default
+            // constructor can show, since there's no declaration node to
+            // carry one).
+            let doc = ctor_doc.or_else(|| javadoc(td.node, td.source));
+            Some(Target::External(sig, doc))
+        }
+        ResolvedType::External { fqn, args } => {
+            let class = ctx.symbols.class(&fqn)?;
+            let simple = fqn
+                .rsplit('.')
+                .next()
+                .and_then(|s| s.rsplit('$').next())
+                .unwrap_or(&fqn)
+                .to_string();
+            let ctor_members: Vec<_> = class
+                .members
+                .into_iter()
+                .filter(|m| m.kind == ExternalMemberKind::Constructor)
+                .collect();
+            if ctor_members.is_empty() {
+                let sig = format!("{simple}()");
+                let doc = ctx.symbols.doc(&fqn, None);
+                return Some(Target::External(sig, doc));
+            }
+            let chosen = ctor_members
+                .iter()
+                .find(|m| param_count_in_label(&m.signature) == arg_count)
+                .unwrap_or(&ctor_members[0]);
+            let sig = resolve::display_signature(chosen, &args, &class.type_params);
+            // Constructor Javadoc is recovered docsrc-style, by the class's
+            // simple name (a source archive has no `<init>`, only a
+            // constructor declaration named after its class — see
+            // `jvl_classpath::MemberKind::Constructor`); fall back to the
+            // class-level doc when there's none.
+            let doc = ctx
+                .symbols
+                .doc(&fqn, Some(&simple))
+                .or_else(|| ctx.symbols.doc(&fqn, None));
+            Some(Target::External(sig, doc))
         }
     }
 }
@@ -357,6 +474,112 @@ mod tests {
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find('{').unwrap();
         assert!(hover(&docs, 0, &index, index.position(at), &NoSymbols).is_none());
+    }
+
+    // --- M6.3: hover on the type name inside `new Foo(...)` ---
+
+    #[test]
+    fn hover_on_new_expression_picks_arity_matching_constructor() {
+        let src = "class Foo {\n\
+                   /** No-arg. */\n\
+                   Foo() {}\n\
+                   /** Takes two ints. */\n\
+                   Foo(int a, int b) {}\n\
+                   }\n\
+                   class C { void m() { Foo f = new Foo(1, 2); } }\n";
+        let text = hover_text(src, "Foo(1, 2)").expect("hover");
+        assert!(text.contains("Foo(int a, int b)"), "{text}");
+        assert!(text.contains("Takes two ints."), "{text}");
+        assert!(!text.contains("No-arg."), "{text}");
+    }
+
+    #[test]
+    fn hover_on_new_expression_falls_back_to_class_doc_when_ctor_undocumented() {
+        let src = "/** The Foo type. */\n\
+                   class Foo {\n\
+                   Foo(int a) {}\n\
+                   }\n\
+                   class C { void m() { Foo f = new Foo(1); } }\n";
+        let text = hover_text(src, "Foo(1)").expect("hover");
+        assert!(text.contains("Foo(int a)"), "{text}");
+        assert!(text.contains("The Foo type."), "{text}");
+    }
+
+    #[test]
+    fn hover_on_new_expression_without_explicit_constructor_shows_default_and_class_doc() {
+        let src = "/** The Foo type. */\n\
+                   class Foo {}\n\
+                   class C { void m() { Foo f = new Foo(); } }\n";
+        let text = hover_text(src, "Foo()").expect("hover");
+        assert!(text.contains("Foo()"), "{text}");
+        assert!(text.contains("The Foo type."), "{text}");
+    }
+
+    #[test]
+    fn hover_on_external_new_expression_shows_constructor_signature_and_doc() {
+        let src = "import test.Widget;\nclass C { void m() { Widget w = new Widget(1); } }\n";
+        let symbols = OneClass {
+            fqn: "test.Widget",
+            members: vec![
+                ExternalMember {
+                    name: "Widget".to_string(),
+                    kind: ExternalMemberKind::Constructor,
+                    signature: "Widget()".to_string(),
+                    template: None,
+                    is_static: false,
+                },
+                ExternalMember {
+                    name: "Widget".to_string(),
+                    kind: ExternalMemberKind::Constructor,
+                    signature: "Widget(int)".to_string(),
+                    template: None,
+                    is_static: false,
+                },
+            ],
+        };
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find("Widget(1)").unwrap();
+        let h = hover(&docs, 0, &index, index.position(at), &symbols).expect("hover");
+        let HoverContents::Markup(m) = h.contents else {
+            panic!("markup")
+        };
+        assert!(m.value.contains("Widget(int)"), "{}", m.value);
+    }
+
+    #[test]
+    fn hover_on_external_new_expression_without_constructors_shows_default_and_class_doc() {
+        let src = "import test.Widget;\nclass C { void m() { Widget w = new Widget(); } }\n";
+        struct NoCtorClass;
+        impl SymbolSource for NoCtorClass {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                (fqn == "test.Widget").then(|| ExternalClass {
+                    supers: Vec::new(),
+                    type_params: Vec::new(),
+                    members: Vec::new(),
+                })
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (fqn == "test.Widget" && member.is_none()).then(|| "The Widget type.".to_string())
+            }
+        }
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find("Widget()").unwrap();
+        let h = hover(&docs, 0, &index, index.position(at), &NoCtorClass).expect("hover");
+        let HoverContents::Markup(m) = h.contents else {
+            panic!("markup")
+        };
+        assert!(m.value.contains("Widget()"), "{}", m.value);
+        assert!(m.value.contains("The Widget type."), "{}", m.value);
     }
 
     #[test]

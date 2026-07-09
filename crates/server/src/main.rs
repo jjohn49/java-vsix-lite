@@ -1653,6 +1653,11 @@ impl LanguageServer for Backend {
                     // completion is requested explicitly (Ctrl-Space) or by the
                     // editor as the user types.
                     trigger_characters: Some(vec![".".to_string()]),
+                    // M6.3: Javadoc is fetched lazily, only when the client
+                    // asks via `completionItem/resolve` — never during
+                    // `textDocument/completion` itself. See
+                    // `Backend::completion_resolve`.
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -2085,15 +2090,58 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let docs = self.documents.lock().await;
-        let Some(current) = docs.get(uri.as_str()) else {
+        // `open_docs_and_uris` (not plain `open_docs`) because in-project
+        // items' lazy-resolve `data` payloads carry the declaring document
+        // as a slice index that is meaningless once this request ends —
+        // `stamp_completion_data_uri` translates it into the document's URI
+        // before the items go on the wire.
+        let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
             return Ok(None);
         };
-        let open = open_docs(&docs, uri.as_str(), current);
-        let index = LineIndex::new(&current.text, self.encoding());
+        let index = LineIndex::new(open[0].source, self.encoding());
         let symbols = ClasspathSymbols(self.classpath());
-        let items =
+        let mut items =
             jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
+        for item in &mut items {
+            stamp_completion_data_uri(item, &uris);
+        }
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+    }
+
+    /// M6.3: the strictly-lazy counterpart to `completion` — Javadoc is
+    /// fetched only here, on demand, from whatever key `completion` attached
+    /// to the item's `data` field (see `jvl_syntax::resolve_documentation`).
+    /// A `data`-less item (locals, params, keywords, type names — none of
+    /// which ever carried eager docs) is returned unchanged.
+    ///
+    /// M6.3 fix round 1: an in-project key is re-resolved against the
+    /// **originating document only** (the `data.uri` stamped at completion
+    /// time), never by scanning all open documents — with two open files
+    /// declaring same-named types and members, a simple-name scan could
+    /// silently attach the *other* file's Javadoc. A stale URI (document
+    /// closed since the completion request) resolves to no documentation
+    /// rather than a guess. External keys carry no URI and ignore `open`.
+    async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        let Some(data) = item.data.clone() else {
+            return Ok(item);
+        };
+        let docs = self.documents.lock().await;
+        let open: Vec<jvl_syntax::OpenDoc> = data
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|u| docs.get(u))
+            .map(|d| {
+                vec![jvl_syntax::OpenDoc {
+                    source: &d.text,
+                    tree: &d.tree,
+                }]
+            })
+            .unwrap_or_default();
+        let symbols = ClasspathSymbols(self.classpath());
+        if let Some(doc) = jvl_syntax::resolve_documentation(&open, &data, &symbols) {
+            item.documentation = Some(doc);
+        }
+        Ok(item)
     }
 
     async fn goto_definition(
@@ -2499,6 +2547,9 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
                     kind: match m.kind {
                         jvl_classpath::MemberKind::Method => jvl_syntax::ExternalMemberKind::Method,
                         jvl_classpath::MemberKind::Field => jvl_syntax::ExternalMemberKind::Field,
+                        jvl_classpath::MemberKind::Constructor => {
+                            jvl_syntax::ExternalMemberKind::Constructor
+                        }
                     },
                     signature: m.signature.clone(),
                     template: m.template.clone(),
@@ -2601,6 +2652,37 @@ fn open_docs_and_uris<'a>(
         }
     }
     Some((open, uris))
+}
+
+/// M6.3 fix round 1: translate an in-project completion item's lazy-resolve
+/// `data.doc` (the declaring document's index in the `&[OpenDoc]` slice this
+/// request ran against — `jvl-syntax` is URI-free, so an index is all it can
+/// name) into that document's URI, which stays meaningful across requests.
+/// `completion_resolve` uses it to re-find the exact originating document,
+/// never scanning all open documents (where a same-simple-name type declared
+/// elsewhere could win the lookup and attach the wrong member's Javadoc).
+/// An item whose payload can't be translated (no object, no `doc` index, or
+/// an out-of-range index — none reachable from `jvl-syntax`'s own output,
+/// but a resolve key must never be emitted broken) loses its `data` entirely,
+/// degrading to "no documentation on resolve".
+fn stamp_completion_data_uri(item: &mut CompletionItem, uris: &[&str]) {
+    let Some(obj) = item.data.as_mut().and_then(|d| d.as_object_mut()) else {
+        return;
+    };
+    let Some(idx) = obj.get("doc").and_then(serde_json::Value::as_u64) else {
+        // External keys ({kind, fqn, member}) carry no `doc` and need no URI.
+        return;
+    };
+    obj.remove("doc");
+    match usize::try_from(idx).ok().and_then(|i| uris.get(i)) {
+        Some(uri) => {
+            obj.insert(
+                "uri".to_string(),
+                serde_json::Value::String((*uri).to_string()),
+            );
+        }
+        None => item.data = None,
+    }
 }
 
 /// `jvl-server --version` prints the crate version and exits, with no LSP
