@@ -465,6 +465,36 @@ impl Backend {
             .collect()
     }
 
+    /// M6.1 rule (c): the package a document's own path implies it should
+    /// declare — `None` when no project root is known at all (a lone file
+    /// with no workspace, per the task brief) or the URI isn't a `file:`
+    /// path; otherwise the dotted directory segments between the *most
+    /// specific* containing source root and the file (possibly `""` — the
+    /// unnamed/default package — when the file sits directly under the
+    /// root). Only a root that is an actual prefix of the file's directory
+    /// counts as "confidently containing" it, matching rule (c)'s
+    /// conservative gate in the task brief.
+    fn expected_package(&self, docs: &HashMap<String, Document>, uri: &str) -> Option<String> {
+        let path = open_doc_path(uri)?;
+        let dir = path.parent()?;
+        let project_root = self.project_root()?;
+        self.source_roots(docs, &project_root)
+            .into_iter()
+            .filter(|root| dir.starts_with(root))
+            // Most specific (longest) matching root wins, so a file under a
+            // nested inferred root isn't miscounted against a shallower
+            // conventional one.
+            .max_by_key(|root| root.components().count())
+            .map(|root| {
+                dir.strip_prefix(&root)
+                    .into_iter()
+                    .flat_map(|rel| rel.components())
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+    }
+
     /// The lazy, bounded workspace symbol index (see `workspace_index`),
     /// exposed so another feature in this crate (e.g. a future add-import)
     /// can do "simple name -> paths" lookups without re-walking the
@@ -634,6 +664,15 @@ impl Backend {
                     let symbols = ClasspathSymbols(self.classpath());
                     d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
                 }
+                let filename = filename_from_uri(uri);
+                let expected_package = self.expected_package(docs, uri);
+                d.extend(jvl_syntax::structural_diagnostics(
+                    &doc.tree,
+                    &doc.text,
+                    &index,
+                    filename.as_deref(),
+                    expected_package.as_deref(),
+                ));
                 d
             }
             None => Vec::new(),
@@ -881,6 +920,17 @@ fn extract_package(tree: &Tree, source: &str) -> Option<String> {
 fn open_doc_path(uri: &str) -> Option<PathBuf> {
     let uri: Uri = uri.parse().ok()?;
     Some(uri.to_file_path()?.into_owned())
+}
+
+/// M6.1 rule (a)/(b): the document's own file name (e.g.
+/// `"MavenDemo2.java"`), or `None` for a non-`file:` URI (untitled/in-memory
+/// document) or one whose path doesn't end in `.java`. Derived purely from
+/// the URI — no filesystem access, no workspace/project root needed, so a
+/// lone file with no workspace still gets this check (per the task brief).
+fn filename_from_uri(uri: &str) -> Option<String> {
+    let path = open_doc_path(uri)?;
+    let name = path.file_name()?.to_str()?.to_string();
+    name.ends_with(".java").then_some(name)
 }
 
 /// Whether every dotted segment of a fully-qualified name is a safe, single

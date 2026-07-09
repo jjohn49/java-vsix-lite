@@ -42,6 +42,7 @@ mod rename;
 mod resolve;
 mod signature;
 mod signature_help;
+mod structural;
 
 pub use completion::completion;
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
@@ -58,6 +59,7 @@ pub use rename::{
     PrepareRename,
 };
 pub use signature_help::signature_help;
+pub use structural::structural_diagnostics;
 
 /// A snapshot of one open document the analysis can read: its source text and
 /// the parse tree kept in sync with it. Borrowed for the duration of one request

@@ -79,7 +79,7 @@ impl TypeKind {
         }
     }
 
-    fn from_kind(kind: &str) -> Option<TypeKind> {
+    pub(crate) fn from_kind(kind: &str) -> Option<TypeKind> {
         Some(match kind {
             "class_declaration" => TypeKind::Class,
             "interface_declaration" => TypeKind::Interface,

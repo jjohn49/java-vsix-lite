@@ -2140,3 +2140,129 @@ fn server_commands_do_not_collide_with_extension_commands() {
     drop(stdin);
     let _ = child.wait();
 }
+
+/// M6 (6.1): structural Java-rule diagnostics end to end, rule (a) — a lone
+/// file (no workspace) at `file:///Foo.java` declaring `public class Bar`
+/// gets the javac-worded "should be declared in a file named" error; this is
+/// the user-reported motivating case (`MavenDemo2.java` / `class
+/// MavenDemo3`) reproduced directly.
+#[test]
+fn structural_filename_mismatch_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Foo.java","languageId":"java","version":1,"text":"public class Bar {\n}\n"}}}"#,
+    );
+    let diag = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        diag.contains("class Bar is public, should be declared in a file named Bar.java"),
+        "expected the javac-worded filename-mismatch error: {diag}"
+    );
+    assert!(diag.contains("file:///Foo.java"), "wrong uri: {diag}");
+    assert!(
+        diag.contains("\"severity\":1"),
+        "expected ERROR severity: {diag}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// M6 (6.1): structural Java-rule diagnostics end to end, rule (c) — a
+/// workspace file under `src/main/java/com/x/` declaring `package com.y;`
+/// gets a package/directory mismatch error; the same file with a matching
+/// `package com.x;` is clean.
+#[test]
+fn structural_package_mismatch_then_clean_round_trip() {
+    let root = temp_root("structural-package");
+    let src_dir = root.join("src/main/java/com/x");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let file_uri = format!("file://{}", src_dir.join("Mismatch.java").display());
+
+    // Declared package (`com.y`) doesn't match the directory (`com/x`).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{file_uri}","languageId":"java","version":1,"text":"package com.y;\nclass Mismatch {{}}\n"}}}}}}"#
+    ));
+    let diag = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        diag.contains(
+            "The declared package \\\"com.y\\\" does not match the expected package \\\"com.x\\\""
+        ),
+        "expected a package/directory mismatch error: {diag}"
+    );
+    assert!(
+        diag.contains("\"severity\":1"),
+        "expected ERROR severity: {diag}"
+    );
+
+    // Fix the package to match the directory -> diagnostics clear.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{file_uri}","version":2}},"contentChanges":[{{"text":"package com.x;\nclass Mismatch {{}}\n"}}]}}}}"#
+    ));
+    let cleared = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        cleared.contains("\"diagnostics\":[]"),
+        "diagnostics should clear once the package matches the directory: {cleared}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
