@@ -913,6 +913,191 @@ fn references_skips_target_directory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// M4 (4.6): `textDocument/implementation` end-to-end — an interface (open)
+/// with two same-package files on disk: one implements it (`Bar`), the other
+/// doesn't (`Other`). The request confirms the on-disk implementor and
+/// excludes the unrelated file, exactly like `references`'s bounded
+/// workspace scan.
+#[test]
+fn implementation_cross_file_round_trip() {
+    let root = temp_root("impl-cross-file");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("Bar.java"),
+        "package p;\nclass Bar implements Foo {\n  public void run() {}\n}\n",
+    )
+    .expect("write Bar.java");
+    // Textually mentions `Foo` (so it survives the bounded prefilter's
+    // substring scan) but doesn't `implements` it — the per-file confirm
+    // (not just the prefilter) must exclude it.
+    std::fs::write(
+        src_dir.join("Other.java"),
+        "package p;\nclass Other {\n  Foo f;\n  void run() {}\n}\n",
+    )
+    .expect("write Other.java");
+    let foo_path = src_dir.join("Foo.java");
+    let foo_text = "package p;\n\npublic interface Foo {\n  void run();\n}\n";
+    std::fs::write(&foo_path, foo_text).expect("write Foo.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"implementationProvider\":true"),
+        "missing implementationProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let foo_uri = format!("file://{}", foo_path.display());
+    let bar_uri = format!("file://{}", src_dir.join("Bar.java").display());
+    let other_uri = format!("file://{}", src_dir.join("Other.java").display());
+
+    // Open only Foo.java (the declaring file); Bar/Other stay on disk.
+    let escaped_foo_text = foo_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"{escaped_foo_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Type-level: cursor on `Foo` in `public interface Foo` (line 2, char 17).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":2,"character":17}}}}}}"#
+    ));
+    let type_level = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        type_level.contains(&bar_uri),
+        "expected Bar.java (the implementor): {type_level}"
+    );
+    assert!(
+        !type_level.contains(&other_uri),
+        "Other.java doesn't implement Foo — must be excluded: {type_level}"
+    );
+
+    // Method-level: cursor on `run` in `void run();` (line 3, char 7).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{foo_uri}"}},"position":{{"line":3,"character":7}}}}}}"#
+    ));
+    let method_level = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        method_level.contains(&bar_uri),
+        "expected Bar.java's overriding `run`: {method_level}"
+    );
+    assert!(
+        !method_level.contains(&other_uri),
+        "Other.java's `run` is unrelated (no `implements Foo`) — must be excluded: {method_level}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M4 (4.6): `textDocument/implementation` end-to-end — reuses the exact
+/// same bounded-prefilter cap and truncation notice wording as `references`
+/// (M4.3): a workspace with more `.java` files than the 500-file scan cap
+/// still surfaces the identical `window/showMessage` text.
+#[test]
+fn implementation_truncation_notice_reuses_references_wording() {
+    let root = temp_root("impl-truncation");
+    let src_dir = root.join("src/main/java/p");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    for i in 0..510 {
+        std::fs::write(
+            src_dir.join(format!("Filler{i}.java")),
+            format!("package p;\nclass Filler{i} {{}}\n"),
+        )
+        .expect("write filler file");
+    }
+    let target_path = src_dir.join("Trigger.java");
+    let target_text = "package p;\n\npublic interface Trigger {\n}\n";
+    std::fs::write(&target_path, target_text).expect("write Trigger.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let target_uri = format!("file://{}", target_path.display());
+    let escaped_text = target_text.replace('\n', "\\n");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{target_uri}","languageId":"java","version":1,"text":"{escaped_text}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `Trigger` in `public interface Trigger` (line 2, char 17).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{target_uri}"}},"position":{{"line":2,"character":17}}}}}}"#
+    ));
+    // Same race as `references_truncation_notice_round_trip`: the
+    // notification and the `id:2` response arrive via independent output
+    // paths, so order isn't guaranteed.
+    let notice = read_until(&mut reader, "window/showMessage", &mut seen);
+    assert!(
+        notice.contains("truncated at 500 files") && notice.contains("References search"),
+        "expected the exact same (reused, not new) truncation wording as `references`: {notice}"
+    );
+    if !seen.iter().any(|f| f.contains("\"id\":2")) {
+        let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// M4 (4.4): `textDocument/rename` end-to-end — a local variable's
 /// declaration and both outer occurrences are edited in the one open
 /// document; a same-named variable in a *shadowed* inner block is untouched

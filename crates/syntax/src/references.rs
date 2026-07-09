@@ -398,18 +398,29 @@ fn member_occurrence<'t>(
 /// declared in the *scanned file itself* needs no such check — it is
 /// unambiguously in scope regardless of what it imports.
 fn bare_type_site<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
-    let Some(td) = ctx.table.get(name) else {
-        return Occurrence::None;
-    };
+    match confirm_bare_type(name, ctx) {
+        Some(td) => Occurrence::Site(ResolvedSite::Type(td)),
+        None => Occurrence::None,
+    }
+}
+
+/// The confirm-by-resolution core of [`bare_type_site`], factored out so
+/// M4.6's go-to-implementation (`implementation.rs`) can reuse the exact same
+/// import/package-aware gate for confirming a supertype (`extends`/
+/// `implements`) reference in a scanned file actually names the target type
+/// declaration, not an unrelated same-simple-name type from a different
+/// package. See [`bare_type_site`]'s doc comment for the gate's rationale.
+pub(crate) fn confirm_bare_type<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Option<TypeDecl<'t>> {
+    let td = ctx.table.get(name)?;
     if td.doc != ctx.current {
         let actual_fqn = package_of(td.node, td.source)
             .map(|pkg| format!("{pkg}.{name}"))
             .unwrap_or_else(|| name.to_string());
         if !ctx.imports.candidates(name).contains(&actual_fqn) {
-            return Occurrence::None;
+            return None;
         }
     }
-    Occurrence::Site(ResolvedSite::Type(td.clone()))
+    Some(td.clone())
 }
 
 /// The dotted `package` path declared in `node`'s own document (walked up to

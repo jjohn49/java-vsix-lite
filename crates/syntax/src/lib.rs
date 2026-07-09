@@ -34,6 +34,7 @@ mod diagnostics;
 mod docsrc;
 mod external;
 mod hover;
+mod implementation;
 mod imports;
 mod model;
 mod references;
@@ -48,6 +49,9 @@ pub use diagnostics::member_diagnostics;
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource};
 pub use hover::hover;
+pub use implementation::{
+    implementation_target, implementations_in_doc, ImplementationHit, ImplementationTarget,
+};
 pub use references::{reference_target, references_in_doc, ReferenceHits, ReferenceTarget, Tier};
 pub use rename::{
     collides_with_existing, is_public_top_level_type, is_valid_new_name, prepare_rename,

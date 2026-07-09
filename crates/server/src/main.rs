@@ -30,7 +30,10 @@ use jvl_syntax::{Definition, LineIndex, PositionEncoding};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
+use tower_lsp_server::ls_types::request::{
+    GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
+    GotoTypeDefinitionResponse,
+};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -562,6 +565,17 @@ fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Range {
     }
 }
 
+/// The bounded-prefilter cap-truncation notice text — shared verbatim by
+/// `references()` (M4.3) and `goto_implementation()` (M4.6), which both run
+/// the same `references::prefilter` and must tell the user the same thing
+/// when it hits its file cap.
+fn truncation_notice() -> String {
+    format!(
+        "References search truncated at {} files; results may be incomplete.",
+        references::MAX_FILES_SCANNED
+    )
+}
+
 /// The `unresolvedMemberDiagnostics` flag from `initializationOptions`.
 /// Default-on (M5.6): the diagnostic itself (`member_diagnostics`) is
 /// conservative and stays silent whenever resolution is incomplete, so this
@@ -640,6 +654,40 @@ struct TargetSnapshot {
     /// canonicalization fails) — a Tier-2 hit file that is itself open is
     /// read from here instead of disk, so unsaved edits are reflected.
     open_snapshot: HashMap<PathBuf, (i32, String, Tree)>,
+}
+
+/// M4 (4.6): everything `goto_implementation`'s bounded scan needs,
+/// snapshotted from the documents lock before the (possibly slow)
+/// workspace prefilter — the `textDocument/implementation` analogue of
+/// [`TargetSnapshot`] (references/rename). No `target_version` (unlike
+/// `TargetSnapshot`): go-to-implementation only ever produces `Location`s,
+/// never a versioned edit.
+struct ImplTargetSnapshot {
+    target: jvl_syntax::ImplementationTarget,
+    target_uri: String,
+    target_text: String,
+    target_tree: Tree,
+    roots: Vec<PathBuf>,
+    project_root: Option<PathBuf>,
+    open_snapshot: HashMap<PathBuf, (i32, String, Tree)>,
+}
+
+/// One scanned file's confirmed implementor/override ranges — the
+/// `textDocument/implementation` analogue of [`ScanHit`], minus the open-doc
+/// `version` (never needed for a read-only `Location` result).
+struct ImplScanHit {
+    uri: Uri,
+    text: Arc<String>,
+    ranges: Vec<StdRange<usize>>,
+}
+
+/// Aggregate result of the bounded `textDocument/implementation` scan.
+struct ImplScanOutcome {
+    hits: Vec<ImplScanHit>,
+    /// Whether the workspace prefilter hit its file/byte cap (M4.3's same
+    /// `references::MAX_FILES_SCANNED`/`MAX_BYTES_SCANNED` caps — this
+    /// feature reuses that prefilter outright, not a new one).
+    truncated: bool,
 }
 
 /// One scanned file's confirmed occurrences of the target — the shared unit
@@ -857,6 +905,156 @@ impl Backend {
             unparsed_hit_files,
         }
     }
+
+    /// M4 (4.6): resolve the cursor to a `jvl_syntax::ImplementationTarget`
+    /// and snapshot everything the bounded scan needs — mirrors
+    /// `target_snapshot`, over `jvl_syntax::implementation_target` instead
+    /// of `reference_target`. `None` for the same reasons that returns
+    /// `None`: an external/JDK symbol, a local/param/field, `this`/`super`,
+    /// a non-identifier, or a document that isn't currently open.
+    async fn implementation_target_snapshot(
+        &self,
+        uri: &str,
+        position: Position,
+    ) -> Option<ImplTargetSnapshot> {
+        let docs = self.documents.lock().await;
+        let (open, uris) = open_docs_and_uris(&docs, uri)?;
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let symbols = ClasspathSymbols(self.classpath());
+        let target = jvl_syntax::implementation_target(&open, 0, &index, position, &symbols)?;
+
+        let target_uri = uris[target.type_doc].to_string();
+        let target_doc = docs.get(&target_uri)?;
+        let target_text = target_doc.text.clone();
+        let target_tree = target_doc.tree.clone();
+
+        let project_root = self.project_root();
+        let roots = project_root
+            .as_deref()
+            .map(|root| self.source_roots(&docs, root))
+            .unwrap_or_default();
+
+        let mut open_snapshot = HashMap::new();
+        for (doc_uri, doc) in docs.iter() {
+            if let Some(path) = open_doc_path(doc_uri) {
+                let key = std::fs::canonicalize(&path).unwrap_or(path);
+                open_snapshot.insert(key, (doc.version, doc.text.clone(), doc.tree.clone()));
+            }
+        }
+
+        Some(ImplTargetSnapshot {
+            target,
+            target_uri,
+            target_text,
+            target_tree,
+            roots,
+            project_root,
+            open_snapshot,
+        })
+    }
+
+    /// M4 (4.6): the bounded, single-tier scan behind
+    /// `textDocument/implementation` — reuses the M4.3 references prefilter
+    /// (`references::prefilter`) with the target type's simple name as
+    /// needle (same caps, cancellation, source-root confinement as
+    /// `scan_references`'s Tier 2), then confirms each candidate file with
+    /// `jvl_syntax::implementations_in_doc`. Unlike `scan_references`, there
+    /// is no visibility tier (an interface/class name is always workspace-
+    /// reaching) and no "possible"/unparsed-hit-file refusal bookkeeping —
+    /// this is a read-only, best-effort query, not `rename`'s all-or-nothing
+    /// one.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_implementations(
+        &self,
+        target: &jvl_syntax::ImplementationTarget,
+        target_uri: &str,
+        target_text: &str,
+        target_tree: &Tree,
+        roots: &[PathBuf],
+        project_root: Option<&Path>,
+        open_snapshot: &HashMap<PathBuf, (i32, String, Tree)>,
+    ) -> ImplScanOutcome {
+        let mut hits = Vec::new();
+
+        // The target's own declaring file may itself contain an implementor
+        // (or, for a method-level query, the overriding declaration) — always
+        // checked directly, same as `scan_references`'s `own_hits`.
+        let target_open = jvl_syntax::OpenDoc {
+            source: target_text,
+            tree: target_tree,
+        };
+        let self_target = jvl_syntax::ImplementationTarget {
+            type_doc: 0,
+            ..target.clone()
+        };
+        let own_hits =
+            jvl_syntax::implementations_in_doc(std::slice::from_ref(&target_open), 0, &self_target);
+        if !own_hits.is_empty() {
+            if let Ok(target_uri_parsed) = target_uri.parse::<Uri>() {
+                hits.push(ImplScanHit {
+                    uri: target_uri_parsed,
+                    text: Arc::new(target_text.to_string()),
+                    ranges: own_hits.into_iter().map(|h| h.name_range).collect(),
+                });
+            }
+        }
+
+        let scan = references::prefilter(roots, project_root, &target.type_name).await;
+        let target_path = open_doc_path(target_uri);
+        let target_canon = target_path
+            .as_ref()
+            .and_then(|p| std::fs::canonicalize(p).ok());
+
+        for hit_path in scan.files {
+            let hit_canon = std::fs::canonicalize(&hit_path).ok();
+            let is_target_file = target_path.as_ref() == Some(&hit_path)
+                || (hit_canon.is_some() && hit_canon == target_canon);
+            if is_target_file {
+                continue; // already handled above
+            }
+
+            let cached_open = hit_canon.as_ref().and_then(|c| open_snapshot.get(c));
+            let cached = cached_open
+                .map(|(_, text, tree)| (Arc::new(text.clone()), tree.clone()))
+                .or_else(|| self.parsed_project_file(&hit_path));
+            let Some((hit_text, hit_tree)) = cached else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+
+            let docs_for_scan = [
+                jvl_syntax::OpenDoc {
+                    source: &hit_text,
+                    tree: &hit_tree,
+                },
+                jvl_syntax::OpenDoc {
+                    source: target_text,
+                    tree: target_tree,
+                },
+            ];
+            let remapped = jvl_syntax::ImplementationTarget {
+                type_doc: 1,
+                ..target.clone()
+            };
+            let scan_hits = jvl_syntax::implementations_in_doc(&docs_for_scan, 0, &remapped);
+            if !scan_hits.is_empty() {
+                if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
+                    hits.push(ImplScanHit {
+                        uri: hit_uri,
+                        text: hit_text,
+                        ranges: scan_hits.into_iter().map(|h| h.name_range).collect(),
+                    });
+                }
+            }
+
+            tokio::task::yield_now().await;
+        }
+
+        ImplScanOutcome {
+            hits,
+            truncated: scan.truncated,
+        }
+    }
 }
 
 impl LanguageServer for Backend {
@@ -896,6 +1094,8 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                // M4 (4.6): go-to-implementation.
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 // M4.4: `prepareRename` support advertised so the client
                 // validates/positions the rename before sending
@@ -1276,6 +1476,65 @@ impl LanguageServer for Backend {
         Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
+    /// M4 (4.6): `textDocument/implementation` — bounded, single-tier scan
+    /// (see `scan_implementations`'s doc comment): resolve the cursor to an
+    /// in-project type or method (`jvl_syntax::implementation_target`),
+    /// prefilter the workspace for candidate files by the type's simple
+    /// name (reusing the M4.3 `references::prefilter`), and confirm each
+    /// with `jvl_syntax::implementations_in_doc` (supertype simple-name
+    /// match + import/package-aware resolution — the same confirm-by-
+    /// resolution convention `references.rs`'s `bare_type_site` uses).
+    ///
+    /// Only symbols declared in a currently *open* document are supported
+    /// (open-files-first, like every other feature here) —
+    /// `jvl_syntax::implementation_target` answers `None` for anything else,
+    /// and this handler answers `Ok(None)` in that case.
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let Some(snapshot) = self
+            .implementation_target_snapshot(uri.as_str(), position)
+            .await
+        else {
+            return Ok(None);
+        };
+
+        let outcome = self
+            .scan_implementations(
+                &snapshot.target,
+                &snapshot.target_uri,
+                &snapshot.target_text,
+                &snapshot.target_tree,
+                &snapshot.roots,
+                snapshot.project_root.as_deref(),
+                &snapshot.open_snapshot,
+            )
+            .await;
+
+        let mut locations = Vec::new();
+        for hit in &outcome.hits {
+            let hit_index = LineIndex::new(&hit.text, self.encoding());
+            locations.extend(hit.ranges.iter().cloned().map(|range| Location {
+                uri: hit.uri.clone(),
+                range: byte_range_to_lsp(&hit_index, range),
+            }));
+        }
+
+        // Same truncation notice as `references()` — one bounded prefilter,
+        // one wording (`truncation_notice`).
+        if outcome.truncated {
+            self.client
+                .show_message(MessageType::INFO, truncation_notice())
+                .await;
+        }
+
+        Ok((!locations.is_empty()).then_some(GotoImplementationResponse::Array(locations)))
+    }
+
     /// M4 (4.3): `textDocument/references` — two-tier, bounded, confirm-by-
     /// resolution (see the `jvl_syntax::references` module doc for the full
     /// design). The target's visibility tier (`jvl_syntax::Tier`, read off
@@ -1346,10 +1605,7 @@ impl LanguageServer for Backend {
         }
         let mut notice_parts: Vec<String> = Vec::new();
         if outcome.truncated {
-            notice_parts.push(format!(
-                "References search truncated at {} files; results may be incomplete.",
-                references::MAX_FILES_SCANNED
-            ));
+            notice_parts.push(truncation_notice());
         }
         if outcome.possible > 0 {
             notice_parts.push(format!(
