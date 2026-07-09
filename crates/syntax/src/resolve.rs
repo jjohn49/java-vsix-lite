@@ -237,10 +237,7 @@ fn resolve_receiver_depth<'t>(
             let type_node = field_type_node(member.node)?;
             resolve_type_node(type_node, member.source, ctx).map(instance)
         }
-        "object_creation_expression" => {
-            let ty = recv.child_by_field_name("type")?;
-            resolve_type_node(ty, ctx.doc.source, ctx).map(instance)
-        }
+        "object_creation_expression" => resolve_object_creation_type(recv, ctx).map(instance),
         "scoped_type_identifier" | "scoped_identifier" => resolve_scoped_path(recv, ctx),
         "parenthesized_expression" => resolve_receiver_depth(recv.named_child(0)?, ctx, depth + 1),
         _ => None,
@@ -279,6 +276,19 @@ pub(crate) fn resolve_name_to_type<'t>(
         },
         static_only: true,
     })
+}
+
+/// Resolve a `new Type(...)` expression's type reference to the receiver type
+/// it constructs — in-project or external, same as any other declared-type
+/// resolution. Shared by ordinary receiver resolution (`new Foo().x`),
+/// hover on the type name inside `new Foo(...)`, and constructor signature
+/// help, so all three agree on what `new Foo` refers to.
+pub(crate) fn resolve_object_creation_type<'t>(
+    call: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+) -> Option<ResolvedType<'t>> {
+    let ty = call.child_by_field_name("type")?;
+    resolve_type_node(ty, ctx.doc.source, ctx)
 }
 
 /// Resolve a declared-type node to a receiver type: in-project if the open docs
@@ -585,6 +595,15 @@ fn walk_members<'t>(
                 return;
             };
             for m in class.members {
+                // Constructors are never ordinary members — same as an
+                // in-project type's constructors, which `own_members()`
+                // never lists either (see `TypeDecl::constructors`). A
+                // dedicated lookup (hover on `new Foo(...)`, constructor
+                // signature help) fetches them straight from `SymbolSource`
+                // instead.
+                if m.kind == ExternalMemberKind::Constructor {
+                    continue;
+                }
                 if static_only && !m.is_static {
                     continue;
                 }
@@ -740,7 +759,12 @@ fn diag_walk(
             match ctx.symbols.class(fqn) {
                 Some(class) => {
                     for m in &class.members {
-                        names.insert(m.name.clone());
+                        // A constructor's name (the class's own simple name)
+                        // is never a valid `recv.member` name — same
+                        // exclusion as the ordinary member walk.
+                        if m.kind != ExternalMemberKind::Constructor {
+                            names.insert(m.name.clone());
+                        }
                     }
                     for sup in class.supers {
                         diag_walk(
@@ -765,8 +789,16 @@ fn diag_walk(
 
 /// The signature to show for an external member: its generic template
 /// substituted with the use-site type arguments when present, otherwise the
-/// erased signature.
-fn display_signature(member: &ExternalMember, args: &[String], type_params: &[String]) -> String {
+/// erased signature. `pub(crate)` (M6.3): also used directly by hover and
+/// signature help's dedicated constructor lookups, which bypass
+/// [`collect_members`] (constructors are filtered out of the ordinary member
+/// walk — see [`walk_members`]) but still want the same use-site generic
+/// substitution.
+pub(crate) fn display_signature(
+    member: &ExternalMember,
+    args: &[String],
+    type_params: &[String],
+) -> String {
     match &member.template {
         Some(template) if !args.is_empty() => substitute_template(template, args, type_params),
         _ => member.signature.clone(),

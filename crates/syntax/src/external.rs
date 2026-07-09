@@ -30,6 +30,14 @@ pub struct ExternalMember {
 pub enum ExternalMemberKind {
     Method,
     Field,
+    /// A constructor (`ClassName(paramTypes)`, `name` = the declaring
+    /// class's simple name — see `jvl_classpath::MemberKind::Constructor`).
+    /// Never yielded by [`SymbolSource::class`]'s members through the
+    /// ordinary member-hierarchy walk (`resolve::collect_members` filters it
+    /// out, same as it never lists constructors for in-project types) —
+    /// only a dedicated constructor lookup (hover on `new Foo(...)`,
+    /// constructor signature help) asks for these.
+    Constructor,
 }
 
 /// Provides signature-level symbols for fully-qualified type names. Binary names

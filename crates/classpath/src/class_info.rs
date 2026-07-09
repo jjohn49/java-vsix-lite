@@ -43,6 +43,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         .filter(|args| args.len() == supers.len())
         .unwrap_or_else(|| vec![Vec::new(); supers.len()]);
 
+    // The class's own simple name — a constructor member is displayed as
+    // `ClassName(params)` (there's no method name to reuse, unlike a regular
+    // method) and doubles as the docsrc lookup key for its Javadoc (a source
+    // archive has no `<init>`, only a constructor declaration named after its
+    // class).
+    let this_simple = simple_name(&class.this_class);
+
     let mut members = Vec::new();
     for field in &class.fields {
         if !field_visible(field.access_flags) {
@@ -60,8 +67,36 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         });
     }
     for method in &class.methods {
-        // Skip <init>/<clinit> and compiler-synthesized bridge/synthetic methods.
-        if method.name.starts_with('<') || !method_visible(method.access_flags) {
+        // Compiler-synthesized bridge/synthetic methods are never surfaced,
+        // constructor or otherwise.
+        if !method_visible(method.access_flags) {
+            continue;
+        }
+        if method.name == "<init>" {
+            let template = signature_attr(&method.attributes)
+                .and_then(|sig| generics::method_template(sig, &type_params))
+                .map(|(method_type_params, _ret, params)| {
+                    let prefix = if method_type_params.is_empty() {
+                        String::new()
+                    } else {
+                        format!("<{}> ", method_type_params.join(", "))
+                    };
+                    format!("{prefix}{this_simple}({})", params.join(", "))
+                });
+            members.push(Member {
+                signature: render_constructor(&this_simple, &method.descriptor),
+                template,
+                name: this_simple.clone(),
+                kind: MemberKind::Constructor,
+                is_static: false,
+            });
+            continue;
+        }
+        // Skip <clinit> and any other reserved/synthetic special name — the
+        // JVM spec only defines `<init>`/`<clinit>` as `<`-prefixed method
+        // names, but untrusted bytes could carry anything, so this stays a
+        // blanket exclusion rather than an exact `<clinit>` match.
+        if method.name.starts_with('<') {
             continue;
         }
         let template = signature_attr(&method.attributes)
@@ -138,6 +173,19 @@ fn render_method(name: &str, descriptor: &MethodDescriptor) -> String {
         ReturnDescriptor::Return(field) => render_field(field),
     };
     format!("{ret} {name}({params})")
+}
+
+/// `ClassName(paramTypes)` — a constructor's display shape, the same
+/// parameter rendering as [`render_method`] but with no return type and the
+/// declaring class's simple name standing in for a method name.
+fn render_constructor(name: &str, descriptor: &MethodDescriptor) -> String {
+    let params = descriptor
+        .parameters
+        .iter()
+        .map(render_field)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({params})")
 }
 
 fn render_field(descriptor: &FieldDescriptor) -> String {
@@ -439,5 +487,71 @@ mod tests {
         let size = info.members.iter().find(|m| m.name == "size").unwrap();
         assert_eq!(size.signature, "int size()");
         assert_eq!(size.template, None);
+    }
+
+    /// M6.3: `<init>` methods are surfaced as `Constructor` members named
+    /// after the declaring class (not `<init>`), rendered `ClassName(params)`
+    /// — one plain, one carrying its own generic type parameter (so its
+    /// template renders the type variable by name, same shadow-by-name rule
+    /// a method's own type parameter follows).
+    #[test]
+    fn constructors_become_members_named_after_the_class() {
+        let bytes = build(
+            "test/Foo",
+            None,
+            &[],
+            &[
+                method("<init>", "(I)V"),
+                method_sig(
+                    "<init>",
+                    "(Ljava/util/List;)V",
+                    "<T:Ljava/lang/Object;>(Ljava/util/List<TT;>;)V",
+                ),
+                method("plain", "()V"),
+            ],
+        );
+        let info = parse(&bytes).expect("parses");
+        let ctors: Vec<_> = info
+            .members
+            .iter()
+            .filter(|m| matches!(m.kind, MemberKind::Constructor))
+            .collect();
+        assert_eq!(ctors.len(), 2, "{:?}", info.members);
+        assert!(
+            ctors.iter().all(|m| m.name == "Foo"),
+            "constructor member name must be the class's simple name: {:?}",
+            ctors
+        );
+        assert!(
+            ctors
+                .iter()
+                .any(|m| m.signature == "Foo(int)" && m.template.is_none()),
+            "{:?}",
+            ctors
+        );
+        assert!(
+            ctors
+                .iter()
+                .any(|m| m.signature == "Foo(List)"
+                    && m.template.as_deref() == Some("<T> Foo(List<T>)")),
+            "{:?}",
+            ctors
+        );
+        // `<init>` must never leak through as an ordinary `Method` member.
+        assert!(!info.members.iter().any(|m| m.name == "<init>"));
+        // A regular method alongside the constructors is unaffected.
+        assert!(info
+            .members
+            .iter()
+            .any(|m| m.name == "plain" && matches!(m.kind, MemberKind::Method)));
+    }
+
+    /// `<clinit>` (the static initializer) is never surfaced as a member,
+    /// constructor or otherwise.
+    #[test]
+    fn clinit_is_never_a_member() {
+        let bytes = build("test/HasClinit", None, &[], &[method("<clinit>", "()V")]);
+        let info = parse(&bytes).expect("parses");
+        assert!(info.members.is_empty(), "{:?}", info.members);
     }
 }

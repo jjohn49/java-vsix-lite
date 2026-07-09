@@ -254,6 +254,7 @@ name = "jvl-syntax"
 version = "0.0.0"
 dependencies = [
  "ls-types",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-java",
 ]

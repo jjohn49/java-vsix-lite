@@ -1591,6 +1591,11 @@ impl LanguageServer for Backend {
                     // completion is requested explicitly (Ctrl-Space) or by the
                     // editor as the user types.
                     trigger_characters: Some(vec![".".to_string()]),
+                    // M6.3: Javadoc is fetched lazily, only when the client
+                    // asks via `completionItem/resolve` — never during
+                    // `textDocument/completion` itself. See
+                    // `Backend::completion_resolve`.
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -2034,6 +2039,30 @@ impl LanguageServer for Backend {
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
 
+    /// M6.3: the strictly-lazy counterpart to `completion` — Javadoc is
+    /// fetched only here, on demand, from whatever key `completion` attached
+    /// to the item's `data` field (see `jvl_syntax::resolve_documentation`).
+    /// A `data`-less item (locals, params, keywords, type names — none of
+    /// which ever carried eager docs) is returned unchanged.
+    async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        let Some(data) = item.data.clone() else {
+            return Ok(item);
+        };
+        let docs = self.documents.lock().await;
+        let open: Vec<jvl_syntax::OpenDoc> = docs
+            .values()
+            .map(|d| jvl_syntax::OpenDoc {
+                source: &d.text,
+                tree: &d.tree,
+            })
+            .collect();
+        let symbols = ClasspathSymbols(self.classpath());
+        if let Some(doc) = jvl_syntax::resolve_documentation(&open, &data, &symbols) {
+            item.documentation = Some(doc);
+        }
+        Ok(item)
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -2437,6 +2466,9 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
                     kind: match m.kind {
                         jvl_classpath::MemberKind::Method => jvl_syntax::ExternalMemberKind::Method,
                         jvl_classpath::MemberKind::Field => jvl_syntax::ExternalMemberKind::Field,
+                        jvl_classpath::MemberKind::Constructor => {
+                            jvl_syntax::ExternalMemberKind::Constructor
+                        }
                     },
                     signature: m.signature.clone(),
                     template: m.template.clone(),

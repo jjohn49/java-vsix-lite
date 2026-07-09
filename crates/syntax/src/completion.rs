@@ -7,6 +7,7 @@ use ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
     Position,
 };
+use serde_json::{json, Value};
 use tree_sitter::Node;
 
 use crate::external::{ExternalMember, ExternalMemberKind, SymbolSource};
@@ -14,7 +15,7 @@ use crate::imports::Imports;
 use crate::model::{named_children, Member, MemberKind, TypeDecl, TypeKind, TypeTable};
 use crate::resolve::{self, Binding, BindingKind, Ctx, HierMember, Resolved, ResolvedType};
 use crate::signature::{javadoc, signature};
-use crate::{LineIndex, OpenDoc};
+use crate::{node_text, LineIndex, OpenDoc};
 
 /// Java reserved words + literals offered in scope completion. `pub(crate)`
 /// (M4.4) so `rename.rs` can refuse a rename's new name when it's one of
@@ -122,23 +123,27 @@ fn member_items<'t>(
 ) -> Vec<CompletionItem> {
     resolve::collect_members(resolved, ctx)
         .iter()
-        .map(|m| hier_item(m, snippets))
+        .map(|m| hier_item(m, resolved, snippets))
         .collect()
 }
 
-fn hier_item(member: &HierMember, snippets: bool) -> CompletionItem {
+fn hier_item(member: &HierMember, resolved: &Resolved, snippets: bool) -> CompletionItem {
     match member {
         HierMember::InProject(m) => inproject_item(m, snippets),
-        HierMember::External(m) => external_item(m, snippets),
+        HierMember::External(m) => external_item(m, resolved, snippets),
     }
 }
 
+/// M6.3: no `documentation` here — Javadoc lookup is strictly lazy, deferred
+/// to `completionItem/resolve` (see [`resolve_documentation`]) so a plain
+/// `textDocument/completion` request never pays for it. `data` carries just
+/// enough to re-find the same Javadoc later.
 fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
     let mut item = CompletionItem {
         label: member.name.to_string(),
         kind: Some(member_kind(member.kind)),
         detail: signature(member.node, member.source),
-        documentation: javadoc(member.node, member.source).map(markdown),
+        data: inproject_data(member),
         ..Default::default()
     };
     if member.kind == MemberKind::Method {
@@ -147,15 +152,30 @@ fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
     item
 }
 
-fn external_item(member: &ExternalMember, snippets: bool) -> CompletionItem {
+/// Lazy-resolve key for an in-project member's Javadoc: the *declaring*
+/// type's own simple name (found by walking up from the member's node, not
+/// the resolved receiver's — precise even for an inherited member, and needs
+/// no inheritance walk to re-find at resolve time) plus the member's name.
+/// `None` if the member somehow isn't inside any type declaration (never
+/// true for a `Member` built from `TypeDecl::own_members`, but resolution
+/// never panics on a shape it didn't expect).
+fn inproject_data(member: &Member) -> Option<Value> {
+    let type_node = resolve::enclosing_type_node(member.node)?;
+    let type_name = node_text(type_node.child_by_field_name("name")?, member.source);
+    Some(json!({ "kind": "inproject", "type": type_name, "member": member.name }))
+}
+
+fn external_item(member: &ExternalMember, resolved: &Resolved, snippets: bool) -> CompletionItem {
     let kind = match member.kind {
         ExternalMemberKind::Method => CompletionItemKind::METHOD,
         ExternalMemberKind::Field => CompletionItemKind::FIELD,
+        ExternalMemberKind::Constructor => CompletionItemKind::CONSTRUCTOR,
     };
     let mut item = CompletionItem {
         label: member.name.clone(),
         kind: Some(kind),
         detail: Some(member.signature.clone()),
+        data: external_data(member, resolved),
         ..Default::default()
     };
     if member.kind == ExternalMemberKind::Method {
@@ -163,6 +183,53 @@ fn external_item(member: &ExternalMember, snippets: bool) -> CompletionItem {
         apply_method_insert(&mut item, !member.signature.ends_with("()"), snippets);
     }
     item
+}
+
+/// Lazy-resolve key for an external member's Javadoc: the *receiver's* FQN —
+/// only available when the receiver itself is external. An external member
+/// reached transitively through an in-project receiver (`class Derived
+/// extends ArrayList`) has no FQN on hand here, so it gets no lazy-resolve
+/// key at all — the same limitation hover already accepts (see
+/// `hover::member_target`'s doc comment), not a new regression.
+fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> {
+    match &resolved.ty {
+        ResolvedType::External { fqn, .. } => Some(json!({
+            "kind": "external",
+            "fqn": fqn,
+            "member": member.name,
+        })),
+        ResolvedType::InProject(_) => None,
+    }
+}
+
+/// The `completionItem/resolve` counterpart to [`completion`]'s strictly-lazy
+/// `data` payload: given the JSON a completion item's `data` field carried,
+/// find and render that member's Javadoc through the same markdown pipeline
+/// hover uses (`javadoc` + [`markdown`]). `None` on any missing/unrecognized
+/// key, or when the member no longer resolves (e.g. edited away since the
+/// completion request) — never a panic.
+pub fn resolve_documentation(
+    docs: &[OpenDoc],
+    data: &Value,
+    symbols: &dyn SymbolSource,
+) -> Option<Documentation> {
+    let kind = data.get("kind")?.as_str()?;
+    let member = data.get("member")?.as_str()?;
+    let text = match kind {
+        "inproject" => {
+            let type_name = data.get("type")?.as_str()?;
+            let table = TypeTable::build(docs, 0);
+            let td = table.get(type_name)?;
+            let m = table.find_member(td, member)?;
+            javadoc(m.node, m.source)
+        }
+        "external" => {
+            let fqn = data.get("fqn")?.as_str()?;
+            symbols.doc(fqn, Some(member))
+        }
+        _ => None,
+    }?;
+    Some(markdown(text))
 }
 
 fn method_has_params(method: Node) -> bool {
@@ -220,7 +287,7 @@ fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<Comp
             static_only: false,
         };
         for member in resolve::collect_members(&resolved, ctx) {
-            push(hier_item(&member, snippets), &mut items);
+            push(hier_item(&member, &resolved, snippets), &mut items);
         }
     }
 
@@ -742,6 +809,125 @@ mod tests {
         let src = "import java.util.List;\nclass C { void m() { List xs; xs.x; } }\n";
         let items = complete_ext(src, "xs.", &NoSymbols);
         assert!(items.is_empty(), "{:?}", labels(&items));
+    }
+
+    // --- M6.3: completion docs are strictly lazy (data payload, not eager) ---
+
+    #[test]
+    fn inproject_member_completion_carries_no_eager_documentation() {
+        let src = "class Box {\n\
+                   /** The width. */\n\
+                   int width;\n\
+                   }\n\
+                   class C { void m() { Box b; b.x; } }\n";
+        let items = complete(src, "b.");
+        let width = items.iter().find(|i| i.label == "width").unwrap();
+        assert!(
+            width.documentation.is_none(),
+            "completion must not eagerly fetch Javadoc: {:?}",
+            width.documentation
+        );
+        assert!(width.data.is_some(), "expected a lazy-resolve data payload");
+    }
+
+    #[test]
+    fn external_member_completion_carries_no_documentation_but_has_data_when_receiver_external() {
+        let src = "import java.util.List;\nclass C { void m() { List xs; xs.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.List",
+            ext_class(&[], vec![ext_method("size", "int size()")]),
+        )]);
+        let items = complete_ext(src, "xs.", &symbols);
+        let size = items.iter().find(|i| i.label == "size").unwrap();
+        assert!(size.documentation.is_none(), "{:?}", size.documentation);
+        assert!(size.data.is_some(), "expected a lazy-resolve data payload");
+    }
+
+    #[test]
+    fn external_member_reached_through_inproject_receiver_has_no_lazy_data() {
+        // Same limitation hover already accepts (see `hover::member_target`):
+        // an external member inherited through an *in-project* receiver has
+        // no FQN on hand at the point the item is built, so it gets no lazy
+        // doc key at all (rather than a broken one).
+        let src = "import java.util.ArrayList;\nclass MyList extends ArrayList { void m() { this.x; } }\n";
+        let symbols = mock(vec![(
+            "java.util.ArrayList",
+            ext_class(&[], vec![ext_method("add", "boolean add(Object)")]),
+        )]);
+        let items = complete_ext(src, "this.", &symbols);
+        let add = items.iter().find(|i| i.label == "add").unwrap();
+        assert!(add.data.is_none(), "{:?}", add.data);
+    }
+
+    #[test]
+    fn resolve_documentation_finds_inproject_member_javadoc() {
+        let src = "class Box {\n\
+                   /** The width. */\n\
+                   int width;\n\
+                   }\n";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let data = serde_json::json!({"kind": "inproject", "type": "Box", "member": "width"});
+        let doc = resolve_documentation(&docs, &data, &NoSymbols).expect("doc resolved");
+        match doc {
+            Documentation::MarkupContent(m) => assert_eq!(m.value, "The width."),
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_documentation_finds_external_member_javadoc() {
+        let symbols = mock(vec![]);
+        struct DocStub;
+        impl SymbolSource for DocStub {
+            fn class(&self, _fqn: &str) -> Option<ExternalClass> {
+                None
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (fqn == "java.util.List" && member == Some("size"))
+                    .then(|| "Returns the size.".to_string())
+            }
+        }
+        let _ = symbols; // unused; DocStub carries the fixture instead
+        let src = "";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let data =
+            serde_json::json!({"kind": "external", "fqn": "java.util.List", "member": "size"});
+        let doc = resolve_documentation(&docs, &data, &DocStub).expect("doc resolved");
+        match doc {
+            Documentation::MarkupContent(m) => assert_eq!(m.value, "Returns the size."),
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_documentation_missing_or_unknown_data_is_none() {
+        let src = "class Box { int width; }\n";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        assert!(resolve_documentation(&docs, &serde_json::json!({}), &NoSymbols).is_none());
+        assert!(resolve_documentation(
+            &docs,
+            &serde_json::json!({"kind": "bogus", "member": "x"}),
+            &NoSymbols
+        )
+        .is_none());
+        assert!(resolve_documentation(
+            &docs,
+            &serde_json::json!({"kind": "inproject", "type": "NoSuchType", "member": "width"}),
+            &NoSymbols
+        )
+        .is_none());
     }
 
     #[test]
