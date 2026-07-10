@@ -350,6 +350,14 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
   }
 }
 
+// M6.2: one download invocation at a time — `true` while one is in flight
+// (from the missing-deps query through the end of the download loop). The
+// extension-side mirror of `checkProject`'s single-flight pattern (the server
+// enforces that one via `javac_running`; downloads are driven entirely by
+// this process, so the flag lives here). No queuing: a second invocation is
+// simply told one is already running.
+let downloadInFlight = false;
+
 // M6.2: the consent-gated dependency download command. Trust-gated like
 // `checkProject` (this one performs network I/O and writes into `~/.m2`,
 // both squarely "acts on behalf of this project" territory), then:
@@ -368,10 +376,25 @@ async function downloadDependencies(): Promise<void> {
     void vscode.window.showErrorMessage("java-vsix-lite: the language server is not running.");
     return;
   }
-  // Captured once: `client` is mutable module state (a restart could swap
-  // it out from under an in-flight, possibly long-running, download loop).
-  const activeClient = client;
+  if (downloadInFlight) {
+    void vscode.window.showInformationMessage(
+      "java-vsix-lite: a dependency download is already running.",
+    );
+    return;
+  }
+  downloadInFlight = true;
+  try {
+    await runDownloadDependencies(client);
+  } finally {
+    downloadInFlight = false;
+  }
+}
 
+/** The body of `downloadDependencies`, guarded single-flight by its caller. */
+async function runDownloadDependencies(activeClient: LanguageClient): Promise<void> {
+  // `activeClient` was captured once by the caller: `client` is mutable
+  // module state (a restart could swap it out from under an in-flight,
+  // possibly long-running, download loop).
   let initial: MissingDependenciesResult;
   try {
     initial = await activeClient.sendRequest<MissingDependenciesResult>(

@@ -241,10 +241,13 @@ export async function installVerifiedFile(finalPath: string, data: Buffer): Prom
     dir,
     `.${path.basename(finalPath)}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
   );
-  await fs.promises.writeFile(tmpPath, data);
   try {
+    await fs.promises.writeFile(tmpPath, data);
     await fs.promises.rename(tmpPath, finalPath);
   } catch (err) {
+    // Any failure (a partial write from ENOSPC included, not just a failed
+    // rename) must not leave a stray temp file behind. Best-effort: the
+    // original error is what matters, an unlink failure is swallowed.
     await fs.promises.unlink(tmpPath).catch(() => undefined);
     throw err;
   }
