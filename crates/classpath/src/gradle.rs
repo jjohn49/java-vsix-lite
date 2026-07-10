@@ -10,14 +10,20 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::maven::MavenLocator;
 use crate::resolve::{self, Locator, ResolvedProject};
 
 const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Resolve a Gradle project's dependencies (direct + transitive) from what
-/// can be statically scraped out of its build files, located in
-/// `gradle_cache` (`~/.gradle/caches`).
-pub(crate) fn resolve_project(root: &Path, gradle_cache: &Path) -> ResolvedProject {
+/// can be statically scraped out of its build files, located first in
+/// `gradle_cache` (`~/.gradle/caches`) and, failing that, in `m2_repo`
+/// (`~/.m2/repository`) — see [`FallbackLocator`]. The `~/.m2` fallback
+/// matters for M6.2: dependencies the user consents to download are always
+/// installed into `~/.m2` (repo-agnostic `g:a:v` coordinates), regardless of
+/// whether the project is Maven or Gradle, so a Gradle project must also be
+/// able to *find* them there after a rebuild.
+pub(crate) fn resolve_project(root: &Path, gradle_cache: &Path, m2_repo: &Path) -> ResolvedProject {
     let mut coords = Vec::new();
     for name in [
         "build.gradle",
@@ -53,8 +59,11 @@ pub(crate) fn resolve_project(root: &Path, gradle_cache: &Path) -> ResolvedProje
         }
     });
 
-    let locator = GradleLocator {
-        cache: gradle_cache,
+    let locator = FallbackLocator {
+        primary: GradleLocator {
+            cache: gradle_cache,
+        },
+        secondary: MavenLocator { m2_repo },
     };
     let seeds = resolve::coord_seeds(&coords);
     let (jars, mut degraded) = resolve::resolve_transitive(seeds, &locator);
@@ -140,6 +149,30 @@ impl Locator for GradleLocator<'_> {
 
     fn locate_jar(&self, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
         cache_file(self.cache, group, artifact, version, "jar")
+    }
+}
+
+/// Tries `primary` (the Gradle module cache) first, falling back to
+/// `secondary` (`~/.m2/repository`) only when the primary has neither the pom
+/// nor the jar. Static and offline like both locators it wraps — this is
+/// purely a "where might this coordinate already be on disk" lookup, never a
+/// network fetch.
+struct FallbackLocator<'a> {
+    primary: GradleLocator<'a>,
+    secondary: MavenLocator<'a>,
+}
+
+impl Locator for FallbackLocator<'_> {
+    fn locate_pom(&self, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+        self.primary
+            .locate_pom(group, artifact, version)
+            .or_else(|| self.secondary.locate_pom(group, artifact, version))
+    }
+
+    fn locate_jar(&self, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+        self.primary
+            .locate_jar(group, artifact, version)
+            .or_else(|| self.secondary.locate_jar(group, artifact, version))
     }
 }
 
@@ -247,7 +280,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_project(&root, &cache);
+        let result = resolve_project(&root, &cache, &base.join("m2"));
         assert_eq!(result.jars.len(), 1, "{:?}", result.jars);
         assert!(result.jars[0].ends_with("lib-1.0.jar"));
 
@@ -270,7 +303,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_project(&root, &cache);
+        let result = resolve_project(&root, &cache, &base.join("m2"));
         assert!(result.jars.is_empty(), "{:?}", result.jars);
         assert!(
             result
@@ -329,7 +362,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_project(&root, &cache);
+        let result = resolve_project(&root, &cache, &base.join("m2"));
         let names: Vec<String> = result
             .jars
             .iter()
@@ -337,6 +370,54 @@ mod tests {
             .collect();
         assert!(names.contains(&"B-1.0.jar".to_string()), "{names:?}");
         assert!(names.contains(&"C-1.0.jar".to_string()), "{names:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// M6.2: a dependency the user has downloaded lands in `~/.m2/repository`
+    /// (repo-agnostic `g:a:v` coordinates), regardless of whether the
+    /// project is Maven or Gradle. A Gradle project must therefore be able to
+    /// find it there too when the Gradle module cache doesn't have it —
+    /// see [`FallbackLocator`].
+    #[test]
+    fn falls_back_to_m2_repository_when_gradle_cache_misses() {
+        let base =
+            std::env::temp_dir().join(format!("jvl-gradle-m2-fallback-{}", std::process::id()));
+        let root = base.join("proj");
+        let cache = base.join("gcache"); // deliberately never populated
+        let m2 = base.join("m2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // The artifact lives ONLY in ~/.m2/repository, laid out exactly as
+        // the Maven backend would install it — not in the Gradle cache.
+        let m2_dir = m2.join("com/example/lib/1.0");
+        std::fs::create_dir_all(&m2_dir).unwrap();
+        std::fs::write(m2_dir.join("lib-1.0.jar"), b"jar").unwrap();
+        std::fs::write(
+            m2_dir.join("lib-1.0.pom"),
+            "<project><groupId>com.example</groupId><artifactId>lib</artifactId>\
+             <version>1.0</version></project>",
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("build.gradle"),
+            "dependencies { implementation 'com.example:lib:1.0' }",
+        )
+        .unwrap();
+
+        let result = resolve_project(&root, &cache, &m2);
+        let names: Vec<String> = result
+            .jars
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"lib-1.0.jar".to_string()),
+            "expected the Gradle project to find the dependency via the ~/.m2 fallback: {names:?}"
+        );
+        assert!(result.degraded.is_empty(), "{:?}", result.degraded);
 
         let _ = std::fs::remove_dir_all(&base);
     }

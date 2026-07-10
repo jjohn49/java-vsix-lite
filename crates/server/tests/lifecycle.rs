@@ -2060,6 +2060,205 @@ fn check_project_javac_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// M6.2: `jvl/missingDependencies` reports the current classpath's degraded
+/// coordinates split into `missing` (a real `g:a:v` absent from the fixture
+/// `~/.m2` — the extension's download candidate) and `skipped` (a
+/// classifier variant resolution deliberately won't pursue, surfaced with a
+/// reason so the UI can explain the gap instead of silently dropping it).
+#[test]
+fn missing_dependencies_reports_fetchable_and_skipped_coordinates() {
+    let root = temp_root("missing-deps");
+    std::fs::create_dir_all(&root).expect("create temp project dir");
+    std::fs::write(
+        root.join("pom.xml"),
+        "<project><groupId>com.example</groupId><artifactId>proj</artifactId>\
+         <version>1.0</version><dependencies>\
+         <dependency><groupId>com.example</groupId><artifactId>extlib</artifactId>\
+         <version>1.0</version></dependency>\
+         <dependency><groupId>com.example</groupId><artifactId>natives</artifactId>\
+         <version>2.0</version><classifier>natives-linux</classifier></dependency>\
+         </dependencies></project>",
+    )
+    .expect("write pom.xml");
+
+    // A fixture `HOME` for the *child server process only*, with an empty
+    // `~/.m2` — neither dependency is present.
+    let fixture_home = temp_root("missing-deps-home");
+    std::fs::create_dir_all(&fixture_home).expect("create fixture HOME");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("HOME", &fixture_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // No `params` field at all — `jvl/missingDependencies` takes none (see
+    // `tower_lsp_server`'s `FromParams for ()`, which only accepts an
+    // absent/`null` params value).
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"jvl/missingDependencies"}"#);
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    let json: Value = serde_json::from_str(&result).expect("parse missingDependencies response");
+    let missing = json["result"]["missing"].as_array().expect("missing array");
+    assert!(
+        missing.iter().any(|m| m["group"] == "com.example"
+            && m["artifact"] == "extlib"
+            && m["version"] == "1.0"),
+        "expected extlib to be reported as a fetchable missing dependency: {result}"
+    );
+    let skipped = json["result"]["skipped"].as_array().expect("skipped array");
+    assert!(
+        skipped.iter().any(|s| s["group"] == "com.example"
+            && s["artifact"] == "natives"
+            && s["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("classifier natives-linux unsupported"))),
+        "expected the classifier variant to be reported as skipped with a reason: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&fixture_home);
+}
+
+/// M6.2: the fixed-point rebuild loop's server-side half — after the
+/// extension installs a consented-to dependency into `~/.m2` and calls
+/// `jvl.classpath.rebuild`, a follow-up `jvl/missingDependencies` query must
+/// no longer report it. Uses dummy (non-`javac`-built) jar/pom bytes, same as
+/// the `resolve.rs`/`gradle.rs` unit tests — this test is about the
+/// rebuild/re-query wiring, not the jar's actual bytecode, so it never needs
+/// a real JDK and always runs.
+#[test]
+fn rebuild_classpath_command_shrinks_missing_dependencies_list() {
+    let root = temp_root("rebuild-missing-deps");
+    std::fs::create_dir_all(&root).expect("create temp project dir");
+    std::fs::write(
+        root.join("pom.xml"),
+        "<project><groupId>com.example</groupId><artifactId>proj</artifactId>\
+         <version>1.0</version><dependencies>\
+         <dependency><groupId>com.example</groupId><artifactId>extlib</artifactId>\
+         <version>1.0</version></dependency>\
+         </dependencies></project>",
+    )
+    .expect("write pom.xml");
+
+    let fixture_home = temp_root("rebuild-missing-deps-home");
+    std::fs::create_dir_all(&fixture_home).expect("create fixture HOME");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("HOME", &fixture_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("jvl.classpath.rebuild"),
+        "missing executeCommandProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"jvl/missingDependencies"}"#);
+    let before = read_until(&mut reader, "\"id\":2", &mut seen);
+    let before_json: Value = serde_json::from_str(&before).expect("parse response");
+    assert!(
+        before_json["result"]["missing"]
+            .as_array()
+            .expect("missing array")
+            .iter()
+            .any(|m| m["artifact"] == "extlib"),
+        "expected extlib to be missing before install: {before}"
+    );
+
+    // Simulate what `mavenFetch.ts` does after a consented download:
+    // install the pom + jar directly into the fixture `~/.m2/repository`,
+    // laid out exactly as the Maven backend expects.
+    let artifact_dir = fixture_home.join(".m2/repository/com/example/extlib/1.0");
+    std::fs::create_dir_all(&artifact_dir).expect("create m2 artifact dir");
+    std::fs::write(artifact_dir.join("extlib-1.0.jar"), b"jar").expect("install fixture jar");
+    std::fs::write(
+        artifact_dir.join("extlib-1.0.pom"),
+        "<project><groupId>com.example</groupId><artifactId>extlib</artifactId>\
+         <version>1.0</version></project>",
+    )
+    .expect("install fixture pom");
+
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace/executeCommand","params":{"command":"jvl.classpath.rebuild","arguments":[]}}"#,
+    );
+    let rebuild = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        rebuild.contains("\"status\":\"ok\""),
+        "expected the rebuild command to report ok: {rebuild}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"jvl/missingDependencies"}"#);
+    let after = read_until(&mut reader, "\"id\":4", &mut seen);
+    let after_json: Value = serde_json::from_str(&after).expect("parse response");
+    assert!(
+        !after_json["result"]["missing"]
+            .as_array()
+            .expect("missing array")
+            .iter()
+            .any(|m| m["artifact"] == "extlib"),
+        "expected extlib to no longer be missing after rebuild: {after}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":5", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&fixture_home);
+}
+
 /// The VS Code extension registers its user-facing commands itself (with a
 /// Workspace-Trust gate), and `vscode-languageclient` ALSO auto-registers a
 /// VS Code command for every ID the server advertises in

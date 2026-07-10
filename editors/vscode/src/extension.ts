@@ -8,6 +8,7 @@
 
 import { execFile } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as util from "util";
 import * as vscode from "vscode";
@@ -19,6 +20,8 @@ import {
   State,
   TransportKind,
 } from "vscode-languageclient/node";
+
+import * as mavenFetch from "./mavenFetch";
 
 // M5.4: the one-shot javac check command. The result shape mirrors the
 // server's `checkProject` executeCommand response (see `crates/server/src/
@@ -40,6 +43,47 @@ const CHECK_PROJECT_COMMAND = "java-vsix-lite.checkProject";
 // command this extension registers itself would throw
 // `command '<id>' already exists` during client startup.
 const SERVER_CHECK_PROJECT_COMMAND = "jvl.checkProject.run";
+
+// M6.2: the consent-gated dependency download command. Same collision-
+// avoidance pattern as `CHECK_PROJECT_COMMAND`/`SERVER_CHECK_PROJECT_COMMAND`
+// above — this extension-contributed id and the server's internal
+// executeCommand id it drives (`SERVER_REBUILD_CLASSPATH_COMMAND`) must never
+// be the same string.
+const DOWNLOAD_DEPENDENCIES_COMMAND = "java-vsix-lite.downloadDependencies";
+const SERVER_REBUILD_CLASSPATH_COMMAND = "jvl.classpath.rebuild";
+
+// Fixed-point loop bounds (see the task brief): a runaway or maliciously deep
+// transitive graph must never turn one consented download into an unbounded
+// one.
+const MAX_DOWNLOAD_ROUNDS = 5;
+const MAX_ARTIFACTS_PER_INVOCATION = 300;
+const MAX_TOTAL_BYTES_PER_INVOCATION = 200 * 1024 * 1024;
+/** How many coordinates the consent dialog / skipped summary lists by name before collapsing into "and N more". */
+const CONSENT_DISPLAY_CAP = 20;
+
+/** One fetchable `g:a:v` from the server's `jvl/missingDependencies` response. */
+interface ServerCoordinate {
+  group: string;
+  artifact: string;
+  version: string;
+}
+
+/** One degraded coordinate the server won't offer to download, with why. */
+interface ServerSkippedDependency {
+  group: string;
+  artifact: string;
+  version?: string;
+  reason: string;
+}
+
+interface MissingDependenciesResult {
+  missing: ServerCoordinate[];
+  skipped: ServerSkippedDependency[];
+}
+
+function coordLabel(coord: ServerCoordinate): string {
+  return `${coord.group}:${coord.artifact}:${coord.version}`;
+}
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
@@ -77,6 +121,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand(CHECK_PROJECT_COMMAND, async () => {
       await checkProject();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(DOWNLOAD_DEPENDENCIES_COMMAND, async () => {
+      await downloadDependencies();
     }),
   );
 
@@ -297,6 +347,246 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
       void vscode.window.showErrorMessage(
         `java-vsix-lite: Check Project failed: ${result.message ?? result.status}`,
       );
+  }
+}
+
+// M6.2: the consent-gated dependency download command. Trust-gated like
+// `checkProject` (this one performs network I/O and writes into `~/.m2`,
+// both squarely "acts on behalf of this project" territory), then:
+// `jvl/missingDependencies` -> one modal consent dialog -> a bounded
+// fixed-point download/rebuild loop. See `mavenFetch.ts` for the actual
+// HTTPS/checksum/install logic and the threat-model notes on what checksum
+// verification does and doesn't protect against.
+async function downloadDependencies(): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: Download Missing Dependencies is disabled in an untrusted workspace — it downloads files over the network and installs them into ~/.m2. Trust this workspace to enable it.",
+    );
+    return;
+  }
+  if (!client) {
+    void vscode.window.showErrorMessage("java-vsix-lite: the language server is not running.");
+    return;
+  }
+  // Captured once: `client` is mutable module state (a restart could swap
+  // it out from under an in-flight, possibly long-running, download loop).
+  const activeClient = client;
+
+  let initial: MissingDependenciesResult;
+  try {
+    initial = await activeClient.sendRequest<MissingDependenciesResult>(
+      "jvl/missingDependencies",
+    );
+  } catch (err) {
+    void vscode.window.showErrorMessage(
+      `java-vsix-lite: could not query missing dependencies: ${String(err)}`,
+    );
+    return;
+  }
+
+  if (initial.missing.length === 0) {
+    if (initial.skipped.length > 0) {
+      void vscode.window.showInformationMessage(
+        `java-vsix-lite: no missing dependencies can be downloaded automatically. ` +
+          `${initial.skipped.length} dependency(ies) skipped: ${summarizeSkipped(initial.skipped)}.`,
+      );
+    } else {
+      void vscode.window.showInformationMessage("java-vsix-lite: no missing dependencies detected.");
+    }
+    return;
+  }
+
+  if (!(await confirmDownloadConsent(initial))) {
+    return;
+  }
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "java-vsix-lite: downloading dependencies",
+      cancellable: true,
+    },
+    (progress, token) => runDownloadLoop(activeClient, initial, progress, token),
+  );
+}
+
+/**
+ * The single consent dialog the brief requires: modal, names the artifacts
+ * (capped display), states the source and destination, and notes that
+ * transitives may follow under this same consent. Cancel (or dismissing the
+ * dialog) does nothing — only the "Download" choice proceeds.
+ */
+async function confirmDownloadConsent(initial: MissingDependenciesResult): Promise<boolean> {
+  const shown = initial.missing.slice(0, CONSENT_DISPLAY_CAP).map(coordLabel);
+  const more = initial.missing.length - shown.length;
+  const list = shown.join("\n") + (more > 0 ? `\n… and ${more} more` : "");
+  const skippedNote =
+    initial.skipped.length > 0
+      ? `\n\n${initial.skipped.length} other degraded dependency(ies) can't be downloaded automatically and will be left as-is.`
+      : "";
+  const detail =
+    `This downloads ${initial.missing.length} artifact(s) over HTTPS from Maven Central ` +
+    `(repo.maven.apache.org) and installs them into ~/.m2/repository:\n\n${list}\n\n` +
+    "A downloaded artifact's own transitive dependencies may be discovered and downloaded " +
+    "automatically afterward, under this same consent. Every file's checksum is verified " +
+    `before it's installed; nothing downloaded is ever executed.${skippedNote}`;
+  const choice = await vscode.window.showWarningMessage(
+    "java-vsix-lite: Download Missing Dependencies?",
+    { modal: true, detail },
+    "Download",
+  );
+  return choice === "Download";
+}
+
+/**
+ * The bounded fixed-point loop: download this round's missing coordinates,
+ * ask the server to rebuild the classpath, re-query for newly-surfaced
+ * transitives, repeat — until nothing's left, a round makes no progress, a
+ * bound is hit, or the user cancels. Cancellation is only ever observed
+ * between artifacts (see the check before each `fetchAndInstallArtifact`
+ * call): a coordinate already in flight always finishes installing (both
+ * files) or fails cleanly, so no partial file is ever left at its `~/.m2`
+ * path.
+ */
+async function runDownloadLoop(
+  activeClient: LanguageClient,
+  initial: MissingDependenciesResult,
+  progress: vscode.Progress<{ message?: string; increment?: number }>,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const m2Root = path.join(os.homedir(), ".m2", "repository");
+  const downloaded: string[] = [];
+  const failed: { coord: string; reason: string }[] = [];
+  const attempted = new Set<string>();
+  let totalBytes = 0;
+  let capNote: string | undefined;
+  let cancelled = false;
+  // Whether anything has been installed since the last successful rebuild —
+  // set on every successful install, cleared once a rebuild for it runs.
+  // Tracked separately from the in-loop rebuild below so that a cap/cancel
+  // exit (which `break`s out before reaching that rebuild) still gets one
+  // final rebuild for whatever *did* install — leaving downloaded jars
+  // sitting in `~/.m2` unindexed until a later, unrelated rebuild would be a
+  // needless surprise for the user.
+  let needsRebuild = false;
+
+  let pending = initial.missing;
+  let round = 0;
+
+  roundLoop: while (round < MAX_DOWNLOAD_ROUNDS && pending.length > 0) {
+    round++;
+    let downloadedThisRound = 0;
+
+    for (const coord of pending) {
+      const key = coordLabel(coord);
+      if (attempted.has(key)) {
+        continue; // already tried (success or failure) in an earlier round
+      }
+      if (token.isCancellationRequested) {
+        cancelled = true;
+        break roundLoop;
+      }
+      if (attempted.size >= MAX_ARTIFACTS_PER_INVOCATION) {
+        capNote = `stopped at the ${MAX_ARTIFACTS_PER_INVOCATION}-artifact cap for one invocation`;
+        break roundLoop;
+      }
+      const remainingBytes = MAX_TOTAL_BYTES_PER_INVOCATION - totalBytes;
+      if (remainingBytes <= 0) {
+        capNote = `stopped at the ${formatBytes(MAX_TOTAL_BYTES_PER_INVOCATION)} download-size cap for one invocation`;
+        break roundLoop;
+      }
+
+      attempted.add(key);
+      progress.report({ message: key });
+      const outcome = await mavenFetch.fetchAndInstallArtifact(coord, m2Root, remainingBytes);
+      if (outcome.status === "downloaded") {
+        downloaded.push(key);
+        downloadedThisRound++;
+        totalBytes += outcome.bytes;
+        needsRebuild = true;
+      } else {
+        failed.push({ coord: key, reason: outcome.reason });
+      }
+    }
+
+    if (token.isCancellationRequested) {
+      cancelled = true;
+      break;
+    }
+    if (downloadedThisRound === 0) {
+      break; // nothing installed this round — a rebuild/re-query can't surface anything new
+    }
+
+    try {
+      await activeClient.sendRequest(ExecuteCommandRequest.type, {
+        command: SERVER_REBUILD_CLASSPATH_COMMAND,
+        arguments: [],
+      });
+      needsRebuild = false;
+      const next = await activeClient.sendRequest<MissingDependenciesResult>(
+        "jvl/missingDependencies",
+      );
+      pending = next.missing;
+    } catch (err) {
+      capNote = `stopped: classpath rebuild failed (${String(err)})`;
+      break;
+    }
+  }
+
+  if (needsRebuild) {
+    // Best-effort: a cap or cancellation cut the loop short after an install
+    // — still surface it to IntelliSense rather than leaving a downloaded
+    // jar sitting unindexed. Failure here doesn't change the summary; the
+    // next build-file change or restart would pick it up regardless.
+    await activeClient
+      .sendRequest(ExecuteCommandRequest.type, {
+        command: SERVER_REBUILD_CLASSPATH_COMMAND,
+        arguments: [],
+      })
+      .catch(() => undefined);
+  }
+
+  if (!capNote && !cancelled && round >= MAX_DOWNLOAD_ROUNDS && pending.length > 0) {
+    capNote = `stopped at the ${MAX_DOWNLOAD_ROUNDS}-round fixed-point cap`;
+  }
+
+  reportDownloadSummary(downloaded, failed, capNote, cancelled);
+}
+
+function formatBytes(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024))}MB`;
+}
+
+function summarizeSkipped(skipped: ServerSkippedDependency[]): string {
+  const shown = skipped
+    .slice(0, CONSENT_DISPLAY_CAP)
+    .map((s) => `${s.group}:${s.artifact}${s.version ? `:${s.version}` : ""} (${s.reason})`);
+  const more = skipped.length - shown.length;
+  return shown.join("; ") + (more > 0 ? `; and ${more} more` : "");
+}
+
+function reportDownloadSummary(
+  downloaded: string[],
+  failed: { coord: string; reason: string }[],
+  capNote: string | undefined,
+  cancelled: boolean,
+): void {
+  const parts = [`downloaded ${downloaded.length}`];
+  if (failed.length > 0) {
+    const detail = failed.map((f) => `${f.coord} (${f.reason})`).join("; ");
+    parts.push(`failed ${failed.length}: ${detail}`);
+  }
+  if (cancelled) {
+    parts.push("cancelled by user");
+  }
+  if (capNote) {
+    parts.push(capNote);
+  }
+  const message = `java-vsix-lite: ${parts.join(" — ")}.`;
+  if (failed.length > 0 || cancelled) {
+    void vscode.window.showWarningMessage(message);
+  } else {
+    void vscode.window.showInformationMessage(message);
   }
 }
 

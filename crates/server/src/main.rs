@@ -38,6 +38,16 @@ use tower_lsp_server::ls_types::request::{
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+/// M6.2: the server-internal `executeCommand` id the extension's trust-gated
+/// `java-vsix-lite.downloadDependencies` command forwards to, to trigger an
+/// immediate (non-debounced) classpath rebuild after installing consented-to
+/// dependencies. Deliberately namespaced `jvl.*` and NOT the same id as any
+/// extension-contributed command — see `CHECK_PROJECT_COMMAND`'s doc comment
+/// (in `javac.rs`) for why a collision would break client startup; the
+/// `server_commands_do_not_collide_with_extension_commands` lifecycle test
+/// guards this for every server command, this one included.
+const REBUILD_CLASSPATH_COMMAND: &str = "jvl.classpath.rebuild";
+
 /// Bound on the step-(d) external stub/source cache: cleared wholesale past
 /// this many entries rather than tracking LRU — the path is rare enough
 /// (cold, one-off lookups) that eviction pressure is low and a simple bound
@@ -847,6 +857,21 @@ impl Backend {
                     .await;
             }
         }
+    }
+
+    /// M6.2: `REBUILD_CLASSPATH_COMMAND` — an immediate, synchronous classpath
+    /// rebuild (unlike `drive_classpath_rebuild`'s debounced version driven by
+    /// watched build-file changes), used by the fixed-point loop that follows
+    /// a consent-gated dependency install: the extension awaits this
+    /// `executeCommand` response before re-querying `jvl/missingDependencies`,
+    /// so it must reflect the just-installed jar(s) by the time it returns.
+    /// Reuses the exact same static/offline resolution as every other
+    /// rebuild path — this command itself never touches the network; it only
+    /// re-reads whatever the extension already placed under `~/.m2`.
+    async fn run_rebuild_classpath_command(&self) -> serde_json::Value {
+        self.rebuild_classpath().await;
+        self.republish_all_diagnostics().await;
+        serde_json::json!({ "status": "ok" })
     }
 }
 
@@ -1680,12 +1705,16 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
-                // M5.4: the one-shot, trust-gated `javac` check command. The
-                // extension only sends this after confirming Workspace
-                // Trust; see `javac`'s module doc comment for the rest of
-                // the security invariants.
+                // M5.4/M6.2: the one-shot, trust-gated `javac` check command
+                // and the M6.2 classpath-rebuild command. The extension only
+                // sends either after confirming Workspace Trust; see
+                // `javac`'s module doc comment (and `REBUILD_CLASSPATH_COMMAND`'s)
+                // for the rest of the security invariants.
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![javac::CHECK_PROJECT_COMMAND.to_string()],
+                    commands: vec![
+                        javac::CHECK_PROJECT_COMMAND.to_string(),
+                        REBUILD_CLASSPATH_COMMAND.to_string(),
+                    ],
                     work_done_progress_options: Default::default(),
                 }),
                 ..Default::default()
@@ -1853,15 +1882,18 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// M5.4: `workspace/executeCommand` — currently only
-    /// `javac::CHECK_PROJECT_COMMAND`. Explicit, one-shot, never automatic;
-    /// the extension only sends this after confirming Workspace Trust (the
+    /// M5.4/M6.2: `workspace/executeCommand` — `javac::CHECK_PROJECT_COMMAND`
+    /// or `REBUILD_CLASSPATH_COMMAND`. Explicit, one-shot, never automatic;
+    /// the extension only sends either after confirming Workspace Trust (the
     /// server itself has no notion of that and just does what it's told —
     /// see `javac`'s module doc comment).
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
+        if params.command == REBUILD_CLASSPATH_COMMAND {
+            return Ok(Some(self.run_rebuild_classpath_command().await));
+        }
         if params.command != javac::CHECK_PROJECT_COMMAND {
             return Err(Error::method_not_found());
         }
@@ -2527,6 +2559,69 @@ impl Backend {
     }
 }
 
+/// M6.2: one fetchable coordinate the current classpath's resolution
+/// couldn't find in the local cache — a candidate for the extension's
+/// consent-gated Maven Central download.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct MissingDependencyCoord {
+    group: String,
+    artifact: String,
+    version: String,
+}
+
+/// M6.2: a degraded coordinate the server deliberately will not offer to
+/// download (a dynamic/unresolved version, an unsupported classifier, a
+/// resolver bound) — surfaced so the extension's UI can explain the gap
+/// rather than silently drop it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct SkippedDependency {
+    group: String,
+    artifact: String,
+    version: Option<String>,
+    reason: String,
+}
+
+/// The `jvl/missingDependencies` custom request's result: the extension's
+/// `java-vsix-lite.downloadDependencies` command queries this (after
+/// confirming Workspace Trust) to learn what it may offer to download, and
+/// re-queries it after each rebuild in its fixed-point loop.
+#[derive(Debug, Serialize, Default)]
+struct MissingDependenciesResult {
+    missing: Vec<MissingDependencyCoord>,
+    skipped: Vec<SkippedDependency>,
+}
+
+impl Backend {
+    /// M6.2: `jvl/missingDependencies` — reports the current classpath's
+    /// degraded coordinates, split into `missing` (a real `g:a:v` absent
+    /// from the local cache — fetchable) and `skipped` (resolution
+    /// deliberately declined to pursue further — not fetchable, with a
+    /// reason). Read-only and network-free: this only inspects whatever the
+    /// last (static, offline) resolution already recorded — see
+    /// `jvl_classpath::parse_degraded_entry` for the parsing rules.
+    async fn missing_dependencies(&self) -> Result<MissingDependenciesResult> {
+        let classpath = self.classpath();
+        let mut result = MissingDependenciesResult::default();
+        for coord in classpath.missing_dependencies() {
+            if coord.is_fetchable() {
+                result.missing.push(MissingDependencyCoord {
+                    group: coord.group,
+                    artifact: coord.artifact,
+                    version: coord.version.unwrap_or_default(),
+                });
+            } else if let Some(reason) = coord.reason {
+                result.skipped.push(SkippedDependency {
+                    group: coord.group,
+                    artifact: coord.artifact,
+                    version: coord.version,
+                    reason,
+                });
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
 /// bytecode model into the analysis crate's external-symbol types. Holds an
 /// owned snapshot `Arc` (from `Backend::classpath()`) rather than a borrow,
@@ -2722,6 +2817,7 @@ async fn main() {
 
     let (service, socket) = LspService::build(Backend::new)
         .custom_method("jvl/externalSource", Backend::external_source)
+        .custom_method("jvl/missingDependencies", Backend::missing_dependencies)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }

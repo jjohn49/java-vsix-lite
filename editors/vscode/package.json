@@ -23,7 +23,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code. The optional javac tier and build commands stay disabled until the workspace is trusted."
+      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, build commands, and the consent-gated dependency download all stay disabled until the workspace is trusted."
     }
   },
   "contributes": {
@@ -80,6 +80,11 @@
       {
         "command": "java-vsix-lite.checkProject",
         "title": "Check Project (javac)",
+        "category": "java-vsix-lite"
+      },
+      {
+        "command": "java-vsix-lite.downloadDependencies",
+        "title": "Java: Download Missing Dependencies",
         "category": "java-vsix-lite"
       }
     ]

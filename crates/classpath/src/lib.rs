@@ -170,7 +170,11 @@ impl Classpath {
             cp.source_roots.extend(maven.source_roots);
             cp.degraded.extend(maven.degraded);
 
-            let gradle = gradle::resolve_project(root, &home.join(".gradle/caches"));
+            let gradle = gradle::resolve_project(
+                root,
+                &home.join(".gradle/caches"),
+                &home.join(".m2/repository"),
+            );
             for jar in &gradle.jars {
                 cp.add_jar(jar);
             }
@@ -198,6 +202,20 @@ impl Classpath {
     /// surface "IntelliSense partial: N unresolved deps" to the user.
     pub fn degraded(&self) -> &[String] {
         &self.degraded
+    }
+
+    /// M6.2: [`degraded`](Self::degraded) entries parsed into structured
+    /// coordinates, for the `jvl/missingDependencies` request that backs the
+    /// consent-gated dependency download command. Unparseable entries
+    /// (project-structure problems like an unreadable parent/module pom, or
+    /// a resolver-bound message) are silently dropped — they don't name a
+    /// single fetchable coordinate, so there's nothing actionable to offer.
+    /// See [`parse_degraded_entry`] for exactly which shapes survive.
+    pub fn missing_dependencies(&self) -> Vec<DegradedCoordinate> {
+        self.degraded
+            .iter()
+            .filter_map(|entry| parse_degraded_entry(entry))
+            .collect()
     }
 
     /// Add a dependency jar to the classpath (no-op if it can't be opened). Its
@@ -316,6 +334,93 @@ fn sources_jar_path(jar: &Path) -> Option<PathBuf> {
 /// The user's home directory, for locating `~/.m2` and `~/.gradle`.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// A [`Classpath::degraded`] entry parsed into a structured coordinate — see
+/// [`parse_degraded_entry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedCoordinate {
+    pub group: String,
+    pub artifact: String,
+    /// `None` only when the version itself couldn't be resolved (always
+    /// paired with `reason` in that case — see [`parse_degraded_entry`]).
+    pub version: Option<String>,
+    /// `None` means this is a plain "missing from the local cache" record —
+    /// exactly the fetchable case `jvl/missingDependencies` wants: a real
+    /// `g:a:v` that resolution simply couldn't find a pom/jar for. `Some`
+    /// means resolution deliberately declined to pursue it further (an
+    /// unresolvable/dynamic version, an unsupported classifier, a
+    /// depth/node bound) — surfaced so the UI can explain the gap, but never
+    /// auto-downloaded.
+    pub reason: Option<String>,
+}
+
+impl DegradedCoordinate {
+    /// A real `g:a:v` this crate simply doesn't have locally — the shape
+    /// `jvl/missingDependencies` treats as downloadable from Maven Central.
+    pub fn is_fetchable(&self) -> bool {
+        self.reason.is_none() && self.version.is_some()
+    }
+}
+
+/// A record's coordinate segment is safe to surface if it's non-empty and
+/// contains no whitespace (real Maven coordinate segments never do; this
+/// also happens to reject the free-text messages — "resolution truncated:
+/// node limit (2000) exceeded", "x: parent g:ghost:7.0 unreadable" — that
+/// aren't about a single coordinate at all).
+fn is_plain_segment(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(char::is_whitespace)
+}
+
+/// Parse one [`Classpath::degraded`] string into a [`DegradedCoordinate`],
+/// or `None` if it doesn't name a single coordinate at all (a project-
+/// structure problem, or a resolver-bound message — see `resolve.rs` and
+/// `gradle.rs` for every format this must handle). Every format currently
+/// produced:
+///
+/// - `"g:a:v"` — missing pom/jar in the cache: fetchable, no reason.
+/// - `"g:a:v (classifier X unsupported)"` / `"g:a:v (max depth exceeded)"` /
+///   `"g:a:v (dynamic version unsupported)"` — a real coordinate resolution
+///   deliberately didn't pursue: not fetchable, reason explains why.
+/// - `"g:a (unresolved version)"` — no version could be determined at all:
+///   not fetchable (nothing to download), reason explains why.
+/// - anything else (`"module modA (pom unreadable)"`, `"x: parent
+///   g:ghost:7.0 unreadable"`, `"resolution truncated: ..."`) — not about a
+///   single coordinate: `None`.
+pub fn parse_degraded_entry(entry: &str) -> Option<DegradedCoordinate> {
+    let (base, reason) = match entry.strip_suffix(')') {
+        Some(without_close) => {
+            let open = without_close.rfind(" (")?;
+            (
+                &without_close[..open],
+                Some(without_close[open + 2..].to_string()),
+            )
+        }
+        None => (entry, None),
+    };
+
+    match base.split(':').collect::<Vec<_>>().as_slice() {
+        [g, a, v] if is_plain_segment(g) && is_plain_segment(a) && is_plain_segment(v) => {
+            Some(DegradedCoordinate {
+                group: (*g).to_string(),
+                artifact: (*a).to_string(),
+                version: Some((*v).to_string()),
+                reason,
+            })
+        }
+        // A bare (no-reason) 2-segment base never occurs in practice, but
+        // requiring `reason.is_some()` here keeps that case from being
+        // misread as some kind of coordinate rather than free text.
+        [g, a] if reason.is_some() && is_plain_segment(g) && is_plain_segment(a) => {
+            Some(DegradedCoordinate {
+                group: (*g).to_string(),
+                artifact: (*a).to_string(),
+                version: None,
+                reason,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +661,88 @@ mod generic_tests {
             out = out.replace(&format!("{{{i}}}"), arg);
         }
         out
+    }
+
+    // M6.2: `parse_degraded_entry` must handle every shape `resolve.rs` and
+    // `gradle.rs` actually produce (see their `degraded.push(...)` call
+    // sites) — one case per distinct format string in this codebase today.
+
+    #[test]
+    fn parses_bare_missing_coordinate_as_fetchable() {
+        let parsed = parse_degraded_entry("g:C:1.0").expect("should parse");
+        assert_eq!(parsed.group, "g");
+        assert_eq!(parsed.artifact, "C");
+        assert_eq!(parsed.version.as_deref(), Some("1.0"));
+        assert!(parsed.reason.is_none());
+        assert!(parsed.is_fetchable());
+    }
+
+    #[test]
+    fn parses_classifier_unsupported_as_not_fetchable_with_reason() {
+        let parsed = parse_degraded_entry("g:B:1.0 (classifier natives-linux unsupported)")
+            .expect("should parse");
+        assert_eq!(parsed.group, "g");
+        assert_eq!(parsed.artifact, "B");
+        assert_eq!(parsed.version.as_deref(), Some("1.0"));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("classifier natives-linux unsupported")
+        );
+        assert!(!parsed.is_fetchable());
+    }
+
+    #[test]
+    fn parses_dynamic_version_as_not_fetchable_with_reason() {
+        let parsed =
+            parse_degraded_entry("g:wild:1.+ (dynamic version unsupported)").expect("should parse");
+        assert_eq!(parsed.version.as_deref(), Some("1.+"));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("dynamic version unsupported")
+        );
+        assert!(!parsed.is_fetchable());
+    }
+
+    #[test]
+    fn parses_max_depth_exceeded_as_not_fetchable_with_reason() {
+        let parsed = parse_degraded_entry("g:N29:1.0 (max depth exceeded)").expect("should parse");
+        assert_eq!(parsed.version.as_deref(), Some("1.0"));
+        assert_eq!(parsed.reason.as_deref(), Some("max depth exceeded"));
+        assert!(!parsed.is_fetchable());
+    }
+
+    #[test]
+    fn parses_unresolved_version_with_no_version_field() {
+        let parsed = parse_degraded_entry("g:D (unresolved version)").expect("should parse");
+        assert_eq!(parsed.group, "g");
+        assert_eq!(parsed.artifact, "D");
+        assert!(parsed.version.is_none());
+        assert_eq!(parsed.reason.as_deref(), Some("unresolved version"));
+        assert!(!parsed.is_fetchable());
+    }
+
+    #[test]
+    fn non_coordinate_project_structure_messages_are_dropped() {
+        assert!(parse_degraded_entry("resolution truncated: node limit (2000) exceeded").is_none());
+        assert!(parse_degraded_entry("x: parent g:ghost:7.0 unreadable").is_none());
+        assert!(parse_degraded_entry("module modA (pom unreadable)").is_none());
+    }
+
+    #[test]
+    fn missing_dependencies_filters_degraded_list_through_the_parser() {
+        let mut cp = Classpath::empty();
+        cp.degraded = vec![
+            "g:C:1.0".to_string(),
+            "g:B:1.0 (classifier natives-linux unsupported)".to_string(),
+            "module modA (pom unreadable)".to_string(),
+        ];
+        let missing = cp.missing_dependencies();
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing
+            .iter()
+            .any(|c| c.is_fetchable() && c.artifact == "C"));
+        assert!(missing
+            .iter()
+            .any(|c| !c.is_fetchable() && c.artifact == "B"));
     }
 }
