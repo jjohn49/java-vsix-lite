@@ -94,6 +94,15 @@
 - [ ] Implement; update test helpers to `.items`; server handler returns `CompletionResponse::List(CompletionList { is_incomplete, items })`, still `None` when empty and complete.
 - [ ] Workspace green; commit.
 
+### Task 4c: project-source symbol layer (closed files)
+
+**Files:**
+- Create: `crates/syntax/src/srcclass.rs` — `pub fn class_from_source(source: &str, type_path: &str, pick_fqn: &dyn Fn(&[String]) -> Option<String>) -> Option<ExternalClass>`; supers/ret types resolved via the declaring file's `Imports::candidates` + `pick_fqn` (first candidate that exists; supers fall back to the first candidate). Members: own fields/methods/constructors with `signature()` text, `is_static`, `ret_display` = source return-type text, `ret_fqn` via `pick_fqn`. Nested `Outer$Inner` descends `NestedType` members. Derive `Clone` on `ExternalClass`/`ExternalMember`.
+- Create: `crates/server/src/project_symbols.rs` — `ProjectSymbols { index: Arc<WorkspaceIndex>, classpath: Arc<Classpath>, cache: Mutex<HashMap<String, (SystemTime, Option<ExternalClass>)>> }`; `class(fqn)`: index lookup (outer simple + package) → size-capped read → `class_from_source` with `pick_fqn` = index-sibling-or-classpath-exists; `types_with_prefix`/`package_children` from index entries; `doc` via `javadoc_in_source`. `CombinedSymbols(ProjectSymbols, ClasspathSymbols)`: project-first `class`/`doc`; `super_type_args` routed to whichever layer owns the fqn; candidate lists merged project-first, deduped by fqn, capped.
+- Modify: `crates/server/src/main.rs` — every `ClasspathSymbols(self.classpath())` handler site becomes the combined source; project cache cleared on classpath rebuild.
+
+**Tests:** srcclass unit tests (members/statics/ctors/supers/ret via mock pick_fqn; nested path); server E2E: `Person.java` + `Main.java` in workspace, only `Main.java` opened — `Person` name completion carries auto-import; `Person p; p.` lists methods; chain `p.getAddress().` through a closed file; javadoc hover.
+
 ### Task 4b: proactive dependency install (extension)
 
 **Files:**

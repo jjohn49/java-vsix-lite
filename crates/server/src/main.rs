@@ -2132,12 +2132,21 @@ impl LanguageServer for Backend {
         };
         let index = LineIndex::new(open[0].source, self.encoding());
         let symbols = ClasspathSymbols(self.classpath());
-        let mut items =
+        let mut result =
             jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
-        for item in &mut items {
+        for item in &mut result.items {
             stamp_completion_data_uri(item, &uris);
         }
-        Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+        // M7: a `CompletionList` (not a bare array) so `isIncomplete` reaches
+        // the client — it re-queries as the user types past a capped set.
+        Ok(
+            (!result.items.is_empty() || result.is_incomplete).then_some(CompletionResponse::List(
+                CompletionList {
+                    is_incomplete: result.is_incomplete,
+                    items: result.items,
+                },
+            )),
+        )
     }
 
     /// M6.3: the strictly-lazy counterpart to `completion` — Javadoc is

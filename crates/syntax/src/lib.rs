@@ -44,7 +44,7 @@ mod signature;
 mod signature_help;
 mod structural;
 
-pub use completion::{completion, resolve_documentation};
+pub use completion::{completion, resolve_documentation, CompletionResult};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::member_diagnostics;
 pub use docsrc::{javadoc_in_source, locate_in_source};

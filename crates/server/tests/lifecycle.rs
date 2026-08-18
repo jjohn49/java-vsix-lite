@@ -2596,9 +2596,9 @@ fn completion_resolve_lazy_documentation_round_trip() {
 
     let completion_json: Value =
         serde_json::from_str(&completion).expect("parse completion response");
-    let items = completion_json["result"]
+    let items = completion_json["result"]["items"]
         .as_array()
-        .expect("completion result array");
+        .expect("completion result items");
     let add_item = items
         .iter()
         .find(|i| i["label"] == "add")
@@ -2684,9 +2684,9 @@ fn completion_resolve_same_named_types_uses_originating_document() {
     let completion = read_until(&mut reader, "\"id\":2", &mut seen);
     let completion_json: Value =
         serde_json::from_str(&completion).expect("parse completion response");
-    let width_item = completion_json["result"]
+    let width_item = completion_json["result"]["items"]
         .as_array()
-        .expect("completion result array")
+        .expect("completion result items")
         .iter()
         .find(|i| i["label"] == "width")
         .expect("width item present")
@@ -2791,9 +2791,9 @@ fn completion_resolve_external_member_jdk_round_trip() {
     } else {
         let completion_json: Value =
             serde_json::from_str(&completion).expect("parse completion response");
-        let items = completion_json["result"]
+        let items = completion_json["result"]["items"]
             .as_array()
-            .expect("completion result array");
+            .expect("completion result items");
         let length_item = items
             .iter()
             .find(|i| i["label"] == "length")

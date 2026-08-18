@@ -211,6 +211,22 @@ caps bound completion payloads. Auto-import emits client-side text edits only.
   and the Maven-Central-only origin stay mandatory (threat model: no *silent*
   network without a standing opt-in; the opt-in is explicit and revocable).
 
+- **Closed project files are first-class** (user: "type `Person` when the
+  class is imported [same project] — no option; `Person p = new Person();
+  p.` gives no methods"): the server was open-files-only — a project class
+  whose file isn't open was invisible. Fix: a **project-source symbol
+  layer** — `ProjectSymbols`, backed by the existing lazy/bounded
+  `WorkspaceIndex` (M4.5) — that resolves an FQN to a workspace `.java`
+  file, parses it on demand (tree-sitter, mtime-cached, size-capped), and
+  exposes it as an `ExternalClass` via a new `jvl_syntax::class_from_source`
+  (supers/ret types resolved through the *declaring* file's imports with an
+  existence-checking `pick_fqn` closure). Composed as
+  `CombinedSymbols(project, classpath)` — project first — so closed files
+  get name completion + auto-import, member completion, chains, hover, and
+  Javadoc identically to jars. Open documents still shadow the disk copy in
+  simple-name resolution (the TypeTable wins), keeping live-buffer edits
+  authoritative.
+
 ## Non-goals (follow-ups tracked)
 
 Organize-imports & add-import code actions on diagnostics; enhanced-`for`

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
-    Position,
+    Position, TextEdit,
 };
 use serde_json::{json, Value};
 use tree_sitter::Node;
@@ -79,9 +79,37 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "null",
 ];
 
-/// Produce completion items for the cursor position. After a resolvable `.` this
-/// is member completion; otherwise in-scope identifiers + keywords. `snippets`
-/// reflects the client's `completionItem.snippetSupport` capability.
+/// M7: a completion answer — the items plus whether the set was capped, so
+/// the server can tell the client to re-query as the user types
+/// (LSP `CompletionList.isIncomplete`).
+pub struct CompletionResult {
+    pub items: Vec<CompletionItem>,
+    pub is_incomplete: bool,
+}
+
+impl CompletionResult {
+    fn complete(items: Vec<CompletionItem>) -> CompletionResult {
+        CompletionResult {
+            items,
+            is_incomplete: false,
+        }
+    }
+}
+
+/// M7: minimum typed-identifier length before classpath type names join scope
+/// completion — below this the candidate space is all of `java.*` and every
+/// dependency, which is noise, not help.
+const MIN_TYPE_PREFIX: usize = 2;
+
+/// M7: cap on classpath type candidates per request; hitting it sets
+/// `is_incomplete` so the client re-queries on further typing.
+const MAX_CLASSPATH_TYPES: usize = 200;
+
+/// Produce completion items for the cursor position. Inside an `import`
+/// declaration this walks packages/types/static members; after a resolvable
+/// `.` it is member completion; otherwise in-scope identifiers + keywords +
+/// classpath type names (with auto-import). `snippets` reflects the client's
+/// `completionItem.snippetSupport` capability.
 pub fn completion(
     docs: &[OpenDoc],
     current: usize,
@@ -89,9 +117,9 @@ pub fn completion(
     pos: Position,
     snippets: bool,
     symbols: &dyn SymbolSource,
-) -> Vec<CompletionItem> {
+) -> CompletionResult {
     let Some(doc) = docs.get(current) else {
-        return Vec::new();
+        return CompletionResult::complete(Vec::new());
     };
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
@@ -104,16 +132,23 @@ pub fn completion(
         symbols,
     };
 
+    // M7: `import java.ut|` — checked before member access, which would
+    // otherwise treat the path's trailing `.` as a member dot and resolve
+    // nothing.
+    if let Some(items) = import_items(doc.source, cursor, &ctx) {
+        return CompletionResult::complete(items);
+    }
+
     if let Some(recv) = resolve::member_receiver(doc.tree, doc.source, cursor) {
         // In a member-access position: only members, never scope fallback, so a
         // typed `.` never yields wrong global suggestions.
-        return match resolve::resolve_receiver_type(recv, &ctx) {
+        return CompletionResult::complete(match resolve::resolve_receiver_type(recv, &ctx) {
             Some(resolved) => member_items(&resolved, &ctx, snippets),
             None => Vec::new(),
-        };
+        });
     }
 
-    scope_items(&ctx, cursor, snippets)
+    scope_items(&ctx, cursor, snippets, index)
 }
 
 fn member_items<'t>(
@@ -237,18 +272,23 @@ pub fn resolve_documentation(
     symbols: &dyn SymbolSource,
 ) -> Option<Documentation> {
     let kind = data.get("kind")?.as_str()?;
-    let member = data.get("member")?.as_str()?;
+    let member = data.get("member").and_then(Value::as_str);
     let text = match kind {
         "inproject" => {
             let type_name = data.get("type")?.as_str()?;
             let table = TypeTable::build(docs, 0);
             let td = table.get(type_name)?;
-            let m = table.find_member(td, member)?;
+            let m = table.find_member(td, member?)?;
             javadoc(m.node, m.source)
         }
         "external" => {
             let fqn = data.get("fqn")?.as_str()?;
-            symbols.doc(fqn, Some(member))
+            symbols.doc(fqn, Some(member?))
+        }
+        // M7: a classpath *type* item (scope or import completion).
+        "external_type" => {
+            let fqn = data.get("fqn")?.as_str()?;
+            symbols.doc(fqn, None)
         }
         _ => None,
     }?;
@@ -282,7 +322,21 @@ fn apply_method_insert(item: &mut CompletionItem, has_params: bool, snippets: bo
     }
 }
 
-fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<CompletionItem> {
+/// M7: stable ranking buckets, prefixed onto `sort_text` so closer things
+/// sort first: bindings < enclosing members < in-project types < classpath
+/// types < keywords. Clients that fuzzy-rank still respect this as the
+/// tiebreak.
+fn bucketed(mut item: CompletionItem, bucket: u8) -> CompletionItem {
+    item.sort_text = Some(format!("{bucket}{}", item.label));
+    item
+}
+
+fn scope_items<'t>(
+    ctx: &Ctx<'_, 't>,
+    cursor: usize,
+    snippets: bool,
+    index: &LineIndex,
+) -> CompletionResult {
     let doc = ctx.doc;
     let mut items = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -298,7 +352,7 @@ fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<Comp
     for binding in
         resolve::collect_bindings(doc.tree, doc.source, cursor, ctx.table, false, ctx.current)
     {
-        push(binding_item(&binding), &mut items);
+        push(bucketed(binding_item(&binding), 0), &mut items);
     }
 
     // The enclosing type's members (fields + methods + nested types), own and
@@ -310,28 +364,313 @@ fn scope_items<'t>(ctx: &Ctx<'_, 't>, cursor: usize, snippets: bool) -> Vec<Comp
             static_only: false,
         };
         for member in resolve::collect_members(&resolved, ctx) {
-            push(hier_item(&member, &resolved, snippets), &mut items);
+            push(
+                bucketed(hier_item(&member, &resolved, snippets), 1),
+                &mut items,
+            );
         }
     }
 
     // In-scope type names (current + open files).
     for decl in ctx.table.iter() {
-        push(type_item(decl), &mut items);
+        push(bucketed(type_item(decl), 2), &mut items);
+    }
+
+    // M7: classpath/project type names matching the typed prefix, with
+    // auto-import. Open-document types shadow same-named candidates (they
+    // were pushed above; the candidate is skipped entirely so a stale
+    // classpath twin can't appear alongside).
+    let mut is_incomplete = false;
+    let prefix = typed_prefix(doc.source, cursor);
+    if prefix.len() >= MIN_TYPE_PREFIX {
+        let (candidates, truncated) = ctx.symbols.types_with_prefix(prefix, MAX_CLASSPATH_TYPES);
+        is_incomplete = truncated;
+        let insertion = ImportInsertion::compute(doc, index);
+        for c in &candidates {
+            if ctx.table.get(&c.simple).is_some() {
+                continue; // an open document declares this simple name
+            }
+            match import_status(c, ctx.imports) {
+                ImportStatus::Conflicting => continue,
+                status => {
+                    let mut item = CompletionItem {
+                        label: c.simple.clone(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some(c.import_path.clone()),
+                        data: Some(json!({ "kind": "external_type", "fqn": c.fqn })),
+                        ..Default::default()
+                    };
+                    if status == ImportStatus::NeedsImport {
+                        item.additional_text_edits = Some(vec![insertion.edit(&c.import_path)]);
+                    }
+                    push(bucketed(item, 3), &mut items);
+                }
+            }
+        }
     }
 
     // Keywords.
     for kw in KEYWORDS {
         push(
-            CompletionItem {
-                label: kw.to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                ..Default::default()
-            },
+            bucketed(
+                CompletionItem {
+                    label: kw.to_string(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    ..Default::default()
+                },
+                4,
+            ),
             &mut items,
         );
     }
 
-    items
+    CompletionResult {
+        items,
+        is_incomplete,
+    }
+}
+
+/// M7: the identifier fragment immediately before the cursor — the typed
+/// prefix classpath type-name completion matches against.
+fn typed_prefix(source: &str, cursor: usize) -> &str {
+    let bytes = source.as_bytes();
+    let end = cursor.min(bytes.len());
+    let mut start = end;
+    while start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'_' | b'$'))
+    {
+        start -= 1;
+    }
+    &source[start..end]
+}
+
+/// M7: whether (and how) a classpath type candidate needs an import to be
+/// referenced by its simple name in this file.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ImportStatus {
+    /// Insert an import on accept.
+    NeedsImport,
+    /// Usable as-is (already imported / same package / `java.lang` /
+    /// wildcard-covered).
+    NoImportNeeded,
+    /// The simple name is single-imported to a *different* type — this
+    /// candidate can't be referenced by simple name at all; don't offer it.
+    Conflicting,
+}
+
+fn import_status(c: &crate::external::TypeCandidate, imports: &Imports) -> ImportStatus {
+    if let Some(existing) = imports.single_import(&c.simple) {
+        return if existing == c.import_path {
+            ImportStatus::NoImportNeeded
+        } else {
+            ImportStatus::Conflicting
+        };
+    }
+    // A nested type (`Map.Entry`) always needs its explicit import — a
+    // wildcard or same-package context never puts the *inner* simple name in
+    // scope.
+    if c.fqn.contains('$') {
+        return ImportStatus::NeedsImport;
+    }
+    let package = match c.import_path.rsplit_once('.') {
+        Some((pkg, _)) => pkg,
+        None => "", // default package — never importable, usable as-is
+    };
+    if package.is_empty()
+        || package == "java.lang"
+        || Some(package) == imports.package()
+        || imports.has_wildcard(package)
+    {
+        ImportStatus::NoImportNeeded
+    } else {
+        ImportStatus::NeedsImport
+    }
+}
+
+/// M7: where to insert a new `import`, computed once per request from the
+/// tree: after the last existing import, else after the `package`
+/// declaration, else at the very top.
+struct ImportInsertion {
+    position: Position,
+    /// Text template around the path: `(before, after)`.
+    wrap: (&'static str, &'static str),
+}
+
+impl ImportInsertion {
+    fn compute(doc: &OpenDoc, index: &LineIndex) -> ImportInsertion {
+        let mut last_import_end = None;
+        let mut package_end = None;
+        for child in crate::model::named_children(doc.tree.root_node()) {
+            match child.kind() {
+                "import_declaration" => last_import_end = Some(child.end_byte()),
+                "package_declaration" => package_end = Some(child.end_byte()),
+                _ => {}
+            }
+        }
+        if let Some(end) = last_import_end {
+            ImportInsertion {
+                position: index.position(end),
+                wrap: ("\nimport ", ";"),
+            }
+        } else if let Some(end) = package_end {
+            ImportInsertion {
+                position: index.position(end),
+                wrap: ("\n\nimport ", ";"),
+            }
+        } else {
+            ImportInsertion {
+                position: index.position(0),
+                wrap: ("import ", ";\n\n"),
+            }
+        }
+    }
+
+    fn edit(&self, import_path: &str) -> TextEdit {
+        TextEdit {
+            range: ls_types::Range {
+                start: self.position,
+                end: self.position,
+            },
+            new_text: format!("{}{}{}", self.wrap.0, import_path, self.wrap.1),
+        }
+    }
+}
+
+/// M7: completion inside an `import` declaration — package segments, types,
+/// nested types, and (for `import static`) static members. `None` when the
+/// cursor line isn't a plain import path, letting ordinary completion run.
+fn import_items(source: &str, cursor: usize, ctx: &Ctx) -> Option<Vec<CompletionItem>> {
+    let cursor = cursor.min(source.len());
+    let line_start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..cursor];
+    let rest = line.trim_start().strip_prefix("import")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None; // an identifier like `imported` — not the keyword
+    }
+    let rest = rest.trim_start();
+    let (is_static, path) = match rest.strip_prefix("static") {
+        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim_start()),
+        _ => (false, rest),
+    };
+    if path
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.')))
+    {
+        return None; // past the path (`;`, comment, …) — nothing to offer
+    }
+    let (parent, prefix) = match path.rfind('.') {
+        Some(dot) => (&path[..dot], &path[dot + 1..]),
+        None => ("", path),
+    };
+
+    let mut items = Vec::new();
+    // The `static` keyword itself, while still typing the first word.
+    if parent.is_empty() && !is_static && "static".starts_with(prefix) && !prefix.is_empty() {
+        items.push(CompletionItem {
+            label: "static".to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        });
+    }
+
+    let (subpackages, types) = ctx.symbols.package_children(parent);
+    if !subpackages.is_empty() || !types.is_empty() {
+        // `parent` is a package: offer its subpackages and types.
+        let matches = |s: &str| prefix.is_empty() || starts_with_ci(s, prefix);
+        for pkg in &subpackages {
+            if matches(pkg) {
+                items.push(CompletionItem {
+                    label: pkg.clone(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    ..Default::default()
+                });
+            }
+        }
+        for t in &types {
+            if matches(&t.simple) {
+                items.push(CompletionItem {
+                    label: t.simple.clone(),
+                    kind: Some(CompletionItemKind::CLASS),
+                    detail: Some(t.import_path.clone()),
+                    data: Some(json!({ "kind": "external_type", "fqn": t.fqn })),
+                    ..Default::default()
+                });
+            }
+        }
+        return Some(items);
+    }
+
+    // `parent` may instead be a *type* path (`java.util.Map` /
+    // `java.util.Map.Entry`): offer its nested types and, for a static
+    // import, its static members.
+    if let Some(fqn) = import_path_to_fqn(parent, ctx) {
+        let package = fqn.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+        let (_, siblings) = ctx.symbols.package_children(package);
+        let nested_prefix = format!("{fqn}$");
+        for t in &siblings {
+            let Some(inner) = t.fqn.strip_prefix(&nested_prefix) else {
+                continue;
+            };
+            if inner.contains('$') {
+                continue; // not an immediate child
+            }
+            if prefix.is_empty() || starts_with_ci(inner, prefix) {
+                items.push(CompletionItem {
+                    label: inner.to_string(),
+                    kind: Some(CompletionItemKind::CLASS),
+                    detail: Some(t.import_path.clone()),
+                    data: Some(json!({ "kind": "external_type", "fqn": t.fqn })),
+                    ..Default::default()
+                });
+            }
+        }
+        if is_static {
+            if let Some(class) = ctx.symbols.class(&fqn) {
+                let mut seen = HashSet::new();
+                for m in class.members {
+                    if !m.is_static
+                        || m.kind == ExternalMemberKind::Constructor
+                        || !(prefix.is_empty() || starts_with_ci(&m.name, prefix))
+                        || !seen.insert(m.name.clone())
+                    {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        kind: Some(match m.kind {
+                            ExternalMemberKind::Field => CompletionItemKind::FIELD,
+                            _ => CompletionItemKind::METHOD,
+                        }),
+                        label: m.name,
+                        detail: Some(m.signature),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    Some(items)
+}
+
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// M7: an import path (`java.util.Map.Entry`) to the binary FQN
+/// (`java.util.Map$Entry`) — replace trailing dots with `$` until the symbol
+/// source recognizes the name.
+fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut candidate = path.to_string();
+    for _ in 0..8 {
+        if ctx.symbols.class(&candidate).is_some() {
+            return Some(candidate);
+        }
+        let dot = candidate.rfind('.')?;
+        candidate.replace_range(dot..dot + 1, "$");
+    }
+    None
 }
 
 fn binding_item(binding: &Binding) -> CompletionItem {
@@ -452,7 +791,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at), true, &NoSymbols)
+        completion(&docs, 0, &index, index.position(at), true, &NoSymbols).items
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -606,7 +945,7 @@ mod tests {
         ];
         let index = LineIndex::new(use_src, PositionEncoding::Utf16);
         let at = use_src.find("w.").unwrap() + 2;
-        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
+        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols).items;
         assert!(has(&items, "spin"), "cross-file: {:?}", labels(&items));
     }
 
@@ -628,7 +967,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at), snippets, &NoSymbols)
+        completion(&docs, 0, &index, index.position(at), snippets, &NoSymbols).items
     }
 
     #[test]
@@ -722,7 +1061,7 @@ mod tests {
         }];
         let index = LineIndex::new(&src, PositionEncoding::Utf16);
         let at = src.rfind('.').unwrap() + 1;
-        let _ = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
+        let _ = completion(&docs, 0, &index, index.position(at), true, &NoSymbols).items;
     }
 
     // --- External (JDK/dependency) symbol resolution, via a mock SymbolSource ---
@@ -735,7 +1074,7 @@ mod tests {
         }];
         let index = LineIndex::new(src, PositionEncoding::Utf16);
         let at = src.find(marker).expect("marker present") + marker.len();
-        completion(&docs, 0, &index, index.position(at), true, symbols)
+        completion(&docs, 0, &index, index.position(at), true, symbols).items
     }
 
     fn mock(entries: Vec<(&str, ExternalClass)>) -> MockSymbols {
@@ -885,7 +1224,7 @@ mod tests {
         ];
         let index = LineIndex::new(use_src, PositionEncoding::Utf16);
         let at = use_src.find("w.").unwrap() + 2;
-        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols);
+        let items = completion(&docs, 0, &index, index.position(at), true, &NoSymbols).items;
         let spin = items.iter().find(|i| i.label == "spin").unwrap();
         let data = spin.data.as_ref().expect("lazy-resolve data payload");
         assert_eq!(data["doc"], 1, "declaring doc is docs[1]: {data:?}");
@@ -1285,6 +1624,383 @@ mod tests {
             "instance members excluded on a type receiver: {:?}",
             labels(&items)
         );
+    }
+
+    // --- M7: classpath type names, auto-import, import-path completion ---
+
+    use crate::external::TypeCandidate;
+
+    fn cand(simple: &str, fqn: &str, import_path: &str) -> TypeCandidate {
+        TypeCandidate {
+            simple: simple.to_string(),
+            fqn: fqn.to_string(),
+            import_path: import_path.to_string(),
+        }
+    }
+
+    /// A `SymbolSource` with a name index: candidate types (prefix-filtered
+    /// like the real index) and a package tree, plus optional classes.
+    struct NameSymbols {
+        classes: HashMap<String, ExternalClass>,
+        candidates: Vec<TypeCandidate>,
+        truncated: bool,
+        packages: HashMap<String, (Vec<String>, Vec<TypeCandidate>)>,
+    }
+
+    impl NameSymbols {
+        fn of_candidates(candidates: Vec<TypeCandidate>) -> NameSymbols {
+            NameSymbols {
+                classes: HashMap::new(),
+                candidates,
+                truncated: false,
+                packages: HashMap::new(),
+            }
+        }
+    }
+
+    impl SymbolSource for NameSymbols {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            self.classes.get(fqn).map(|c| ExternalClass {
+                supers: c.supers.clone(),
+                type_params: c.type_params.clone(),
+                members: c
+                    .members
+                    .iter()
+                    .map(|m| ExternalMember {
+                        name: m.name.clone(),
+                        kind: m.kind,
+                        signature: m.signature.clone(),
+                        template: m.template.clone(),
+                        is_static: m.is_static,
+                        ret_fqn: m.ret_fqn.clone(),
+                        ret_display: m.ret_display.clone(),
+                    })
+                    .collect(),
+            })
+        }
+
+        fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeCandidate>, bool) {
+            let hits: Vec<TypeCandidate> = self
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.simple.len() >= prefix.len()
+                        && c.simple[..prefix.len()].eq_ignore_ascii_case(prefix)
+                })
+                .cloned()
+                .collect();
+            let over = hits.len() > limit;
+            (
+                hits.into_iter().take(limit).collect(),
+                self.truncated || over,
+            )
+        }
+
+        fn package_children(&self, package: &str) -> (Vec<String>, Vec<TypeCandidate>) {
+            self.packages.get(package).cloned().unwrap_or_default()
+        }
+    }
+
+    /// Full-result variant of [`complete_ext`], for `is_incomplete` and
+    /// edit assertions.
+    fn complete_full(src: &str, marker: &str, symbols: &dyn SymbolSource) -> CompletionResult {
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find(marker).expect("marker present") + marker.len();
+        completion(&docs, 0, &index, index.position(at), true, symbols)
+    }
+
+    fn arraylist_symbols() -> NameSymbols {
+        NameSymbols::of_candidates(vec![cand(
+            "ArrayList",
+            "java.util.ArrayList",
+            "java.util.ArrayList",
+        )])
+    }
+
+    fn find_type<'a>(items: &'a [CompletionItem], detail: &str) -> Option<&'a CompletionItem> {
+        items.iter().find(|i| i.detail.as_deref() == Some(detail))
+    }
+
+    #[test]
+    fn classpath_type_completion_with_auto_import_after_last_import() {
+        let src = "package demo;\n\nimport java.util.List;\n\nclass C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "ArrayLi", &arraylist_symbols());
+        let item = find_type(&result.items, "java.util.ArrayList").expect("candidate offered");
+        assert_eq!(item.label, "ArrayList");
+        assert_eq!(item.sort_text.as_deref(), Some("3ArrayList"));
+        let edits = item.additional_text_edits.as_ref().expect("auto-import");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "\nimport java.util.ArrayList;");
+        // Right after `import java.util.List;` — line 2 (0-based), col 23.
+        assert_eq!(edits[0].range.start.line, 2);
+        assert_eq!(edits[0].range.start.character, 22); // after `import java.util.List;`
+        assert_eq!(edits[0].range.start, edits[0].range.end);
+        assert_eq!(
+            item.data,
+            Some(json!({ "kind": "external_type", "fqn": "java.util.ArrayList" }))
+        );
+        assert!(!result.is_incomplete);
+    }
+
+    #[test]
+    fn auto_import_lands_after_package_or_at_file_top() {
+        // No imports: insert after the package declaration.
+        let src = "package demo;\nclass C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "ArrayLi", &arraylist_symbols());
+        let item = find_type(&result.items, "java.util.ArrayList").unwrap();
+        let edit = &item.additional_text_edits.as_ref().unwrap()[0];
+        assert_eq!(edit.new_text, "\n\nimport java.util.ArrayList;");
+        assert_eq!(edit.range.start.line, 0);
+        assert_eq!(edit.range.start.character, 13); // after `package demo;`
+
+        // No package either: insert at the very top.
+        let src = "class C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "ArrayLi", &arraylist_symbols());
+        let item = find_type(&result.items, "java.util.ArrayList").unwrap();
+        let edit = &item.additional_text_edits.as_ref().unwrap()[0];
+        assert_eq!(edit.new_text, "import java.util.ArrayList;\n\n");
+        assert_eq!(edit.range.start.line, 0);
+        assert_eq!(edit.range.start.character, 0);
+    }
+
+    #[test]
+    fn classpath_types_require_min_prefix() {
+        let src = "class C { void m() { A } }\n";
+        let result = complete_full(src, "{ A", &arraylist_symbols());
+        assert!(
+            find_type(&result.items, "java.util.ArrayList").is_none(),
+            "1-char prefix must not query the classpath"
+        );
+    }
+
+    #[test]
+    fn no_auto_import_when_already_usable() {
+        // Already single-imported.
+        let src = "import java.util.ArrayList;\nclass C { void m() { ArrayLi } }\n";
+        let item_edits = |src: &str, symbols: &dyn SymbolSource| {
+            let result = complete_full(src, "{ ArrayLi", symbols);
+            let item = find_type(&result.items, "java.util.ArrayList")
+                .unwrap_or_else(|| panic!("candidate offered for {src:?}"))
+                .clone();
+            item.additional_text_edits
+        };
+        assert_eq!(item_edits(src, &arraylist_symbols()), None);
+
+        // Wildcard-covered.
+        let src = "import java.util.*;\nclass C { void m() { ArrayLi } }\n";
+        assert_eq!(item_edits(src, &arraylist_symbols()), None);
+
+        // Same package.
+        let symbols =
+            NameSymbols::of_candidates(vec![cand("Widget", "demo.Widget", "demo.Widget")]);
+        let src = "package demo;\nclass C { void m() { Widg } }\n";
+        let result = complete_full(src, "Widg", &symbols);
+        let item = find_type(&result.items, "demo.Widget").expect("same-package candidate");
+        assert_eq!(item.additional_text_edits, None);
+
+        // java.lang.
+        let symbols = NameSymbols::of_candidates(vec![cand(
+            "String",
+            "java.lang.String",
+            "java.lang.String",
+        )]);
+        let src = "class C { void m() { Stri } }\n";
+        let result = complete_full(src, "Stri", &symbols);
+        let item = find_type(&result.items, "java.lang.String").expect("java.lang candidate");
+        assert_eq!(item.additional_text_edits, None);
+    }
+
+    #[test]
+    fn conflicting_single_import_hides_the_candidate() {
+        let src = "import other.ArrayList;\nclass C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "{ ArrayLi", &arraylist_symbols());
+        assert!(
+            find_type(&result.items, "java.util.ArrayList").is_none(),
+            "a same-simple-name import to a different type makes the candidate unusable"
+        );
+    }
+
+    #[test]
+    fn open_document_type_shadows_classpath_candidate() {
+        let src = "class ArrayList {}\nclass C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "{ ArrayLi", &arraylist_symbols());
+        let hits: Vec<_> = result
+            .items
+            .iter()
+            .filter(|i| i.label == "ArrayList")
+            .collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].sort_text.as_deref(),
+            Some("2ArrayList"),
+            "the in-project declaration wins"
+        );
+        assert_eq!(hits[0].additional_text_edits, None);
+    }
+
+    #[test]
+    fn truncated_candidate_set_marks_result_incomplete() {
+        let mut symbols = arraylist_symbols();
+        symbols.truncated = true;
+        let src = "class C { void m() { ArrayLi } }\n";
+        let result = complete_full(src, "ArrayLi", &symbols);
+        assert!(result.is_incomplete);
+    }
+
+    #[test]
+    fn nested_candidate_always_carries_its_import() {
+        // Even under `import java.util.*`, the *inner* simple name `Entry`
+        // needs `import java.util.Map.Entry;`.
+        let symbols = NameSymbols::of_candidates(vec![cand(
+            "Entry",
+            "java.util.Map$Entry",
+            "java.util.Map.Entry",
+        )]);
+        let src = "import java.util.*;\nclass C { void m() { Entr } }\n";
+        let result = complete_full(src, "Entr", &symbols);
+        let item = find_type(&result.items, "java.util.Map.Entry").expect("nested candidate");
+        let edits = item.additional_text_edits.as_ref().expect("nested import");
+        assert_eq!(edits[0].new_text, "\nimport java.util.Map.Entry;");
+    }
+
+    #[test]
+    fn scope_items_rank_in_stable_buckets() {
+        let src = "class C { int field; void m(int param) { int local = 1; ZZZ } }\n";
+        let items = complete(src, "ZZZ");
+        let sort_of = |label: &str| {
+            items
+                .iter()
+                .find(|i| i.label == label)
+                .and_then(|i| i.sort_text.clone())
+                .unwrap_or_else(|| panic!("{label} present"))
+        };
+        assert_eq!(sort_of("local"), "0local");
+        assert_eq!(sort_of("field"), "1field");
+        assert_eq!(sort_of("C"), "2C");
+        assert_eq!(sort_of("return"), "4return");
+    }
+
+    // --- M7: import-path completion ---
+
+    fn import_symbols() -> NameSymbols {
+        let mut packages = HashMap::new();
+        packages.insert("".to_string(), (vec!["java".to_string()], Vec::new()));
+        packages.insert("java".to_string(), (vec!["util".to_string()], Vec::new()));
+        packages.insert(
+            "java.util".to_string(),
+            (
+                vec!["stream".to_string()],
+                vec![
+                    cand("ArrayList", "java.util.ArrayList", "java.util.ArrayList"),
+                    cand("Map", "java.util.Map", "java.util.Map"),
+                    cand("Entry", "java.util.Map$Entry", "java.util.Map.Entry"),
+                ],
+            ),
+        );
+        let mut classes = HashMap::new();
+        classes.insert(
+            "java.util.Map".to_string(),
+            ext_class(
+                &[],
+                vec![
+                    ExternalMember {
+                        is_static: true,
+                        ..ext_method("of", "Map of()")
+                    },
+                    ext_method("put", "Object put(Object, Object)"),
+                ],
+            ),
+        );
+        NameSymbols {
+            classes,
+            candidates: Vec::new(),
+            truncated: false,
+            packages,
+        }
+    }
+
+    #[test]
+    fn import_completion_walks_packages_and_types() {
+        let symbols = import_symbols();
+        let items = complete_ext("import ja\n", "import ja", &symbols);
+        assert!(has(&items, "java"), "{:?}", labels(&items));
+
+        let items = complete_ext("import java.ut\n", "import java.ut", &symbols);
+        assert!(has(&items, "util"), "{:?}", labels(&items));
+
+        let items = complete_ext("import java.util.\n", "import java.util.", &symbols);
+        assert!(has(&items, "stream"), "{:?}", labels(&items));
+        assert!(has(&items, "ArrayList"), "{:?}", labels(&items));
+
+        // Prefix filters both kinds.
+        let items = complete_ext("import java.util.A\n", "import java.util.A", &symbols);
+        assert!(has(&items, "ArrayList"));
+        assert!(!has(&items, "stream"));
+
+        // Keywords/locals never leak into an import path.
+        assert!(!has(
+            &complete_ext("import java.util.\n", "import java.util.", &symbols),
+            "return"
+        ));
+    }
+
+    #[test]
+    fn import_completion_walks_nested_types_and_static_members() {
+        let symbols = import_symbols();
+        // After a class segment: its nested types.
+        let items = complete_ext("import java.util.Map.\n", "import java.util.Map.", &symbols);
+        assert!(has(&items, "Entry"), "{:?}", labels(&items));
+
+        // `import static` after a class: static members only.
+        let items = complete_ext(
+            "import static java.util.Map.\n",
+            "import static java.util.Map.",
+            &symbols,
+        );
+        assert!(has(&items, "of"), "{:?}", labels(&items));
+        assert!(!has(&items, "put"), "instance member: {:?}", labels(&items));
+        assert!(
+            has(&items, "Entry"),
+            "nested types stay: {:?}",
+            labels(&items)
+        );
+    }
+
+    #[test]
+    fn import_completion_offers_the_static_keyword() {
+        let items = complete_ext("import st\n", "import st", &import_symbols());
+        assert!(has(&items, "static"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn resolve_documentation_finds_external_type_javadoc() {
+        struct TypeDocStub;
+        impl SymbolSource for TypeDocStub {
+            fn class(&self, _fqn: &str) -> Option<ExternalClass> {
+                None
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (fqn == "java.util.List" && member.is_none())
+                    .then(|| "An ordered collection.".to_string())
+            }
+        }
+        let src = "";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let data = serde_json::json!({"kind": "external_type", "fqn": "java.util.List"});
+        let doc = resolve_documentation(&docs, &data, &TypeDocStub).expect("type doc resolved");
+        match doc {
+            Documentation::MarkupContent(m) => assert_eq!(m.value, "An ordered collection."),
+            other => panic!("expected markup, got {other:?}"),
+        }
     }
 
     #[test]
