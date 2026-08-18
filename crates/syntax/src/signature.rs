@@ -303,6 +303,53 @@ fn throws_clause(node: Node, source: &str) -> Option<String> {
     Some(format!("throws {}", types.join(", ")))
 }
 
+/// M7: the same signature text as [`signature`] but with modifiers dropped —
+/// the display convention `jvl-classpath` uses for bytecode-derived members
+/// (`int size()`, not `public int size()`), so a project-source-derived
+/// `ExternalMember` (closed-file completion/hover) renders identically to a
+/// classpath one. Field/record-component/enum-constant/parameter shapes
+/// were already modifier-free (see [`field_signature`] et al.), so this
+/// only needs its own method/constructor branches; everything else
+/// delegates to [`signature`].
+pub(crate) fn erased_signature(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "method_declaration" | "annotation_type_element_declaration" => {
+            let ret = node
+                .child_by_field_name("type")
+                .map(|n| collapse_ws(node_text(n, source)))
+                .unwrap_or_else(|| "void".to_string());
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or("");
+            Some(format!("{ret} {name}({})", parameters(node, source)))
+        }
+        "constructor_declaration" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or("");
+            Some(format!("{name}({})", parameters(node, source)))
+        }
+        // A field's modifiers live on its *parent* `field_declaration`
+        // (mirrors `field_signature`'s own parent lookup) — dropping them
+        // means not consulting that parent for anything but its `type`.
+        "variable_declarator" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source))
+                .unwrap_or("");
+            let ty = node
+                .parent()
+                .and_then(|p| p.child_by_field_name("type"))
+                .map(|n| collapse_ws(node_text(n, source)))
+                .unwrap_or_default();
+            Some(format!("{ty} {name}").trim().to_string())
+        }
+        _ => signature(node, source),
+    }
+}
+
 /// Space-joined modifier keywords (annotations excluded), or `None` if there are
 /// none.
 fn modifier_keywords(decl: Node, source: &str) -> Option<String> {

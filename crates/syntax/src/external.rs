@@ -5,6 +5,7 @@
 //! server implements this over `jvl-classpath`; tests pass a mock.
 
 /// A type resolved from outside the open documents (a JDK or dependency class).
+#[derive(Debug, Clone)]
 pub struct ExternalClass {
     /// Superclass + interface FQNs.
     pub supers: Vec<String>,
@@ -14,6 +15,7 @@ pub struct ExternalClass {
 }
 
 /// One member of an external type.
+#[derive(Debug, Clone)]
 pub struct ExternalMember {
     pub name: String,
     pub kind: ExternalMemberKind,
@@ -34,7 +36,7 @@ pub struct ExternalMember {
     pub ret_display: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalMemberKind {
     Method,
     Field,

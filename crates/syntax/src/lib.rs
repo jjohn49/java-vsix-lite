@@ -42,6 +42,7 @@ mod rename;
 mod resolve;
 mod signature;
 mod signature_help;
+mod srcclass;
 mod structural;
 
 pub use completion::{completion, resolve_documentation, CompletionResult};
@@ -61,6 +62,7 @@ pub use rename::{
     PrepareRename,
 };
 pub use signature_help::signature_help;
+pub use srcclass::class_from_source;
 pub use structural::structural_diagnostics;
 
 /// A snapshot of one open document the analysis can read: its source text and
