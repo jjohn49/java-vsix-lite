@@ -79,12 +79,22 @@ pub(crate) enum BindingKind {
     Field,
 }
 
-/// A receiver type: either declared in an open document or an external
-/// (JDK/dependency) type named by its FQN, with any type arguments from the use
-/// site (e.g. `["String"]` for `ArrayList<String>`).
+/// A receiver type: declared in an open document, an external (JDK/dependency)
+/// type named by its FQN with any use-site type arguments (e.g. `["String"]`
+/// for `ArrayList<String>`), or an array (M7 — whose members are the synthetic
+/// `length`/`clone()` plus `java.lang.Object`'s, never the element's).
 pub(crate) enum ResolvedType<'t> {
     InProject(TypeDecl<'t>),
-    External { fqn: String, args: Vec<String> },
+    External {
+        fqn: String,
+        args: Vec<String>,
+    },
+    Array {
+        /// The declared display text (`String[]`), kept for rendering
+        /// `clone()`'s signature and for element-type resolution on
+        /// `arr[i].` receivers.
+        display: String,
+    },
 }
 
 /// A resolved receiver type plus whether the access is static (the receiver was
@@ -209,8 +219,47 @@ fn resolve_receiver_depth<'t>(
         // `type_identifier` is how tree-sitter parses a bare name in the common
         // mid-edit shape `recv.partial` (an ERROR / scoped_type_identifier), so
         // it must resolve like `identifier` — instance var or static type name.
-        "identifier" | "type_identifier" => {
-            resolve_name_to_type(node_text(recv, ctx.doc.source), recv.start_byte(), ctx)
+        "identifier" | "type_identifier" => resolve_name_depth(
+            node_text(recv, ctx.doc.source),
+            recv.start_byte(),
+            ctx,
+            depth + 1,
+        ),
+        // M7: a method call's receiver type is the called member's result
+        // type — the arm that makes `xs.stream().`, `s.trim().`, and every
+        // builder chain resolve. No object means an unqualified call on the
+        // enclosing type.
+        "method_invocation" => {
+            let name = recv.child_by_field_name("name")?;
+            let recv_ty = match recv.child_by_field_name("object") {
+                Some(obj) => resolve_receiver_depth(obj, ctx, depth + 1)?,
+                None => instance(ResolvedType::InProject(enclosing_typedecl(
+                    recv,
+                    ctx.doc.source,
+                    ctx.current,
+                )?)),
+            };
+            let member = find_member_hier_of_kind(
+                &recv_ty,
+                ctx,
+                node_text(name, ctx.doc.source),
+                MemberNamespace::Method,
+            )?;
+            member_result_type(&member, &recv_ty, ctx)
+        }
+        // M7: `((Type) expr).` exposes the cast-to type's members.
+        "cast_expression" => {
+            let ty = recv.child_by_field_name("type")?;
+            resolve_type_node(ty, ctx.doc.source, ctx).map(instance)
+        }
+        // M7: `arr[i].` exposes the array's element type.
+        "array_access" => {
+            let arr = recv.child_by_field_name("array")?;
+            let a = resolve_receiver_depth(arr, ctx, depth + 1)?;
+            match &a.ty {
+                ResolvedType::Array { display } => array_element_type(display, ctx),
+                _ => None,
+            }
         }
         // A string literal receiver (`"".length()`) is always `java.lang.String`.
         "string_literal" => {
@@ -225,17 +274,17 @@ fn resolve_receiver_depth<'t>(
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
             let field = recv.child_by_field_name("field")?;
-            let obj_ty = resolve_receiver_depth(obj, ctx, depth + 1)?;
-            // Only an in-project object exposes a field whose declared type we can
-            // re-resolve (external field-type chaining is deferred).
-            let ResolvedType::InProject(td) = &obj_ty.ty else {
-                return None;
-            };
-            let member = ctx
-                .table
-                .find_member(td, node_text(field, ctx.doc.source))?;
-            let type_node = field_type_node(member.node)?;
-            resolve_type_node(type_node, member.source, ctx).map(instance)
+            // M7: one shared segment step handles in-project fields, external
+            // fields (`System.out.` → `java.io.PrintStream`), and nested
+            // types alike.
+            if let Some(obj_ty) = resolve_receiver_depth(obj, ctx, depth + 1) {
+                return resolve_member_segment(&obj_ty, node_text(field, ctx.doc.source), ctx);
+            }
+            // `java.util.List` in expression position parses as *nested
+            // field_access*, whose head (`java`) resolves to nothing — fall
+            // back to treating the whole dotted shape as a scoped path
+            // (longest-prefix fully-qualified type + segment walk).
+            resolve_scoped_path(recv, ctx)
         }
         "object_creation_expression" => resolve_object_creation_type(recv, ctx).map(instance),
         "scoped_type_identifier" | "scoped_identifier" => resolve_scoped_path(recv, ctx),
@@ -251,6 +300,18 @@ pub(crate) fn resolve_name_to_type<'t>(
     byte: usize,
     ctx: &Ctx<'_, 't>,
 ) -> Option<Resolved<'t>> {
+    resolve_name_depth(name, byte, ctx, 0)
+}
+
+fn resolve_name_depth<'t>(
+    name: &str,
+    byte: usize,
+    ctx: &Ctx<'_, 't>,
+    depth: usize,
+) -> Option<Resolved<'t>> {
+    if depth > MAX_RESOLVE_DEPTH {
+        return None;
+    }
     if let Some(binding) = lookup_binding(
         ctx.doc.tree,
         ctx.doc.source,
@@ -259,8 +320,20 @@ pub(crate) fn resolve_name_to_type<'t>(
         ctx.table,
         ctx.current,
     ) {
-        let type_node = binding.type_node?;
-        return resolve_type_node(type_node, binding.source, ctx).map(instance);
+        if let Some(type_node) = binding.type_node {
+            if node_text(type_node, binding.source) != "var" {
+                return resolve_type_node(type_node, binding.source, ctx).map(instance);
+            }
+        }
+        // M7: a `var` (or typeless) binding infers its type from the
+        // declarator's initializer, resolved like any receiver expression
+        // (`var v = new ArrayList<String>()`, `var t = s.trim()`, …).
+        // Depth-capped: ERROR-recovery trees can produce self-referential
+        // shapes legal Java can't. The result is always an instance —
+        // whatever static-ness the initializer expression had does not
+        // transfer to the value it produced.
+        let value = binding.decl_node.child_by_field_name("value")?;
+        return resolve_receiver_depth(value, ctx, depth + 1).map(|r| instance(r.ty));
     }
     if let Some(td) = ctx.table.get(name) {
         return Some(Resolved {
@@ -299,6 +372,14 @@ fn resolve_type_node<'t>(
     source: &'t str,
     ctx: &Ctx<'_, 't>,
 ) -> Option<ResolvedType<'t>> {
+    // M7: an array's members are `length`/`clone()`/Object's — never the
+    // element type's (the old behavior offered `String`'s members on a
+    // `String[]` receiver).
+    if type_node.kind() == "array_type" {
+        return Some(ResolvedType::Array {
+            display: node_text(type_node, source).to_string(),
+        });
+    }
     let args = extract_type_args(type_node, source);
     if let Some(fqn) = dotted_type_name(type_node, source) {
         let simple = fqn.rsplit('.').next().unwrap_or(&fqn);
@@ -398,43 +479,262 @@ fn field_type_node<'t>(declarator: Node<'t>) -> Option<Node<'t>> {
     declarator.parent()?.child_by_field_name("type")
 }
 
-/// Resolve a dotted path (`a.b.c`). Prefer an in-project var.field chain; failing
-/// that, treat the whole dotted name as a fully-qualified external type (static).
+/// Resolve a dotted path (`a.b.c`), M7-style: walk it segment by segment from
+/// a resolvable head (binding → in-project type → imported/`java.lang`
+/// external type), stepping through fields, nested types, and enum constants
+/// in either world; failing that, try the longest prefix of the path as a
+/// fully-qualified external type (`java.util.List`) and walk any remaining
+/// segments from there.
 fn resolve_scoped_path<'t>(node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
     let names = flatten_scoped(node, ctx.doc.source);
-    if let Some(resolved) = resolve_inproject_chain(&names, node.start_byte(), ctx) {
+    if let Some(resolved) = names.split_first().and_then(|(first, rest)| {
+        let head = resolve_name_to_type(first, node.start_byte(), ctx)?;
+        walk_segments(head, rest, ctx)
+    }) {
         return Some(resolved);
     }
-    let fqn = names.join(".");
-    if ctx.symbols.class(&fqn).is_some() {
-        Some(Resolved {
-            ty: ResolvedType::External {
-                fqn,
-                args: Vec::new(),
-            },
+    for k in (1..=names.len()).rev() {
+        let fqn = names[..k].join(".");
+        if ctx.symbols.class(&fqn).is_some() {
+            let head = Resolved {
+                ty: ResolvedType::External {
+                    fqn,
+                    args: Vec::new(),
+                },
+                static_only: true,
+            };
+            return walk_segments(head, &names[k..], ctx);
+        }
+    }
+    None
+}
+
+fn walk_segments<'t>(
+    head: Resolved<'t>,
+    segments: &[&str],
+    ctx: &Ctx<'_, 't>,
+) -> Option<Resolved<'t>> {
+    let mut current = head;
+    for segment in segments {
+        current = resolve_member_segment(&current, segment, ctx)?;
+    }
+    Some(current)
+}
+
+/// One dotted step off a resolved receiver: a nested type (static context
+/// continues), or a field / enum constant (whose declared type the walk
+/// re-resolves as an instance). Methods never appear in a dotted path
+/// without parens, so the Field namespace is the only member lookup.
+fn resolve_member_segment<'t>(
+    current: &Resolved<'t>,
+    name: &str,
+    ctx: &Ctx<'_, 't>,
+) -> Option<Resolved<'t>> {
+    if current.static_only {
+        if let ResolvedType::External { fqn, .. } = &current.ty {
+            // `Map.Entry` — a nested class continues the static context.
+            let nested = format!("{fqn}${name}");
+            if ctx.symbols.class(&nested).is_some() {
+                return Some(Resolved {
+                    ty: ResolvedType::External {
+                        fqn: nested,
+                        args: Vec::new(),
+                    },
+                    static_only: true,
+                });
+            }
+        }
+    }
+    let members = collect_members(current, ctx);
+    // An in-project nested type (`Outer.Inner`) also continues the static
+    // context — it lives in the member list rather than the symbol source.
+    if let Some(td) = members.iter().find_map(|m| match m {
+        HierMember::InProject(m)
+            if m.name == name && matches!(m.kind, MemberKind::NestedType(_)) =>
+        {
+            TypeDecl::from_node(m.node, m.source, m.doc)
+        }
+        _ => None,
+    }) {
+        return Some(Resolved {
+            ty: ResolvedType::InProject(td),
             static_only: true,
-        })
-    } else {
-        None
+        });
+    }
+    let member = members
+        .into_iter()
+        .find(|m| m.name() == name && MemberNamespace::Field.matches(m))?;
+    member_result_type(&member, current, ctx)
+}
+
+/// M7: the type a member access *evaluates to* — a method call's return type
+/// or a field/enum-constant's declared type — which becomes the next
+/// receiver in a chain. `None` for primitives/void/arrays-of-unknown and
+/// whatever else can't be re-resolved (the chain just stops, never errors).
+fn member_result_type<'t>(
+    member: &HierMember<'t>,
+    recv: &Resolved<'t>,
+    ctx: &Ctx<'_, 't>,
+) -> Option<Resolved<'t>> {
+    match member {
+        HierMember::InProject(m) => {
+            let ty_node = match m.kind {
+                MemberKind::Method => m.node.child_by_field_name("type")?,
+                MemberKind::Field => field_type_node(m.node)?,
+                // An enum constant's type is its declaring enum.
+                MemberKind::EnumConstant => {
+                    let td = TypeDecl::from_node(enclosing_type_node(m.node)?, m.source, m.doc)?;
+                    return Some(instance(ResolvedType::InProject(td)));
+                }
+                MemberKind::NestedType(_) => return None, // handled as a segment, not a value
+            };
+            resolve_type_node(ty_node, m.source, ctx).map(instance)
+        }
+        HierMember::External(m) => external_result_type(m, recv, ctx).map(instance),
     }
 }
 
-fn resolve_inproject_chain<'t>(
-    names: &[&str],
-    first_byte: usize,
+/// M7: an external member's result type. Prefers the generic `ret_display`
+/// template substituted with the receiver's use-site type arguments (so
+/// `List<String>.get(int)` chains as `String`, `stream()` as
+/// `Stream<String>`); falls back to the erased `ret_fqn`.
+fn external_result_type<'t>(
+    m: &ExternalMember,
+    recv: &Resolved<'_>,
     ctx: &Ctx<'_, 't>,
-) -> Option<Resolved<'t>> {
-    let (first, rest) = names.split_first()?;
-    let mut current = resolve_name_to_type(first, first_byte, ctx)?;
-    for segment in rest {
-        let ResolvedType::InProject(td) = &current.ty else {
-            return None;
+) -> Option<ResolvedType<'t>> {
+    if let Some(display) = &m.ret_display {
+        let (args, type_params) = match &recv.ty {
+            ResolvedType::External { fqn, args } => {
+                let params = ctx
+                    .symbols
+                    .class(fqn)
+                    .map(|c| c.type_params)
+                    .unwrap_or_default();
+                (args.clone(), params)
+            }
+            _ => (Vec::new(), Vec::new()),
         };
-        let member = ctx.table.find_member(td, segment)?;
-        let type_node = field_type_node(member.node)?;
-        current = instance(resolve_type_node(type_node, member.source, ctx)?);
+        let substituted = substitute_template(display, &args, &type_params);
+        // An unfilled placeholder means the substitution had nothing to say
+        // (raw receiver, malformed template) — fall through to erasure.
+        if !substituted.contains('{') {
+            if let Some(resolved) = resolve_display_type(&substituted, m.ret_fqn.as_deref(), ctx) {
+                return Some(resolved);
+            }
+        }
     }
-    Some(current)
+    let fqn = m.ret_fqn.clone()?;
+    Some(ResolvedType::External {
+        fqn,
+        args: Vec::new(),
+    })
+}
+
+/// M7: resolve a rendered display type (`Stream<String>`, `String`,
+/// `MyType`) back to a receiver type: the in-project table first, then the
+/// erased FQN when its simple name agrees with the display's base (the
+/// common generic-class case), then the file's imports/`java.lang` (the
+/// type-variable case, where erasure and display genuinely differ).
+fn resolve_display_type<'t>(
+    display: &str,
+    erased_fqn: Option<&str>,
+    ctx: &Ctx<'_, 't>,
+) -> Option<ResolvedType<'t>> {
+    let (base, args) = parse_display_type(display)?;
+    let simple = base.rsplit('.').next().unwrap_or(base);
+    if let Some(td) = ctx.table.get(simple) {
+        return Some(ResolvedType::InProject(td.clone()));
+    }
+    if let Some(fqn) = erased_fqn {
+        let erased_simple = fqn.rsplit(['.', '$']).next().unwrap_or(fqn);
+        if erased_simple == simple {
+            return Some(ResolvedType::External {
+                fqn: fqn.to_string(),
+                args,
+            });
+        }
+    }
+    resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External { fqn, args })
+}
+
+/// M7: split a rendered type into its base name and top-level type
+/// arguments: `Map<String, List<Integer>>` → `("Map", ["String",
+/// "List<Integer>"])`. Arrays and malformed shapes yield `None` (chains
+/// don't continue through them).
+fn parse_display_type(s: &str) -> Option<(&str, Vec<String>)> {
+    let s = s.trim();
+    if s.is_empty() || s.ends_with("[]") {
+        return None;
+    }
+    let Some(lt) = s.find('<') else {
+        return Some((s, Vec::new()));
+    };
+    let base = &s[..lt];
+    let inner = s.strip_suffix('>')?.get(lt + 1..)?;
+    let mut args = Vec::new();
+    let mut nesting = 0usize;
+    let mut start = 0usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => nesting += 1,
+            '>' => nesting = nesting.checked_sub(1)?,
+            ',' if nesting == 0 => {
+                args.push(inner[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim().to_string());
+    Some((base, args))
+}
+
+/// M7: the two members every Java array has beyond `java.lang.Object`'s —
+/// the `length` field and the covariant `clone()`.
+fn array_members(display: &str) -> [ExternalMember; 2] {
+    [
+        ExternalMember {
+            name: "length".to_string(),
+            kind: ExternalMemberKind::Field,
+            signature: "int length".to_string(),
+            template: None,
+            is_static: false,
+            ret_fqn: None,
+            ret_display: None,
+        },
+        ExternalMember {
+            name: "clone".to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: format!("{display} clone()"),
+            template: None,
+            is_static: false,
+            ret_fqn: None,
+            ret_display: Some(display.to_string()),
+        },
+    ]
+}
+
+/// M7: the element type of an array receiver (`arr[i].`), resolved from the
+/// array's declared display text. Multi-dimensional arrays peel one level.
+fn array_element_type<'t>(display: &str, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
+    let element = display.trim().strip_suffix("[]")?.trim_end();
+    if element.ends_with(']') {
+        return Some(instance(ResolvedType::Array {
+            display: element.to_string(),
+        }));
+    }
+    let base = element.split('<').next().unwrap_or(element).trim();
+    let simple = base.rsplit('.').next().unwrap_or(base);
+    if let Some(td) = ctx.table.get(simple) {
+        return Some(instance(ResolvedType::InProject(td.clone())));
+    }
+    resolve_simple_to_fqn(simple, ctx).map(|fqn| {
+        instance(ResolvedType::External {
+            fqn,
+            args: Vec::new(),
+        })
+    })
 }
 
 /// A member of a resolved type — declared in an open document or external.
@@ -586,6 +886,27 @@ fn walk_members<'t>(
                     );
                 }
             }
+        }
+        // M7: arrays expose exactly `length`, `clone()`, and Object's members.
+        ResolvedType::Array { display } => {
+            for m in array_members(display) {
+                if static_only {
+                    continue; // arrays have no static members
+                }
+                if acc.seen.insert(m.signature.clone()) {
+                    acc.out.push(HierMember::External(m));
+                }
+            }
+            walk_members(
+                &ResolvedType::External {
+                    fqn: "java.lang.Object".to_string(),
+                    args: Vec::new(),
+                },
+                ctx,
+                static_only,
+                acc,
+                depth + 1,
+            );
         }
         ResolvedType::External { fqn, args } => {
             if !acc.visited_fqn.insert(fqn.clone()) {
@@ -750,6 +1071,13 @@ fn diag_walk(
                 } else {
                     *complete = false; // unknown supertype — give up flagging
                 }
+            }
+        }
+        // M7: an array's complete member set is `length` + `clone` (plus
+        // Object's, appended globally by `member_names`).
+        ResolvedType::Array { display } => {
+            for m in array_members(display) {
+                names.insert(m.name);
             }
         }
         ResolvedType::External { fqn, .. } => {
@@ -1114,6 +1442,8 @@ mod decl_site_tests {
                         signature: "int length()".to_string(),
                         template: None,
                         is_static: false,
+                        ret_fqn: None,
+                        ret_display: None,
                     }],
                 })
             }
@@ -1167,6 +1497,8 @@ mod super_type_args_tests {
             signature: signature.to_string(),
             template: Some(template.to_string()),
             is_static: false,
+            ret_fqn: None,
+            ret_display: None,
         }
     }
 

@@ -170,6 +170,9 @@ fn constructor_overloads<'t>(
     ctx: &Ctx<'_, 't>,
 ) -> Option<Vec<SignatureInformation>> {
     match resolve::resolve_object_creation_type(call, ctx)? {
+        // `new T[...]` array creation never routes here (different node kind),
+        // so an Array resolution is a malformed shape — no overloads.
+        ResolvedType::Array { .. } => None,
         ResolvedType::InProject(td) => {
             let signatures = td
                 .constructors()
@@ -325,6 +328,8 @@ mod tests {
                         signature: sig.to_string(),
                         template: None,
                         is_static: false,
+                        ret_fqn: None,
+                        ret_display: None,
                     })
                     .collect(),
             })
@@ -434,6 +439,8 @@ mod tests {
                             signature: "Widget()".to_string(),
                             template: None,
                             is_static: false,
+                            ret_fqn: None,
+                            ret_display: None,
                         },
                         ExternalMember {
                             name: "Widget".to_string(),
@@ -441,6 +448,8 @@ mod tests {
                             signature: "Widget(int a, int b)".to_string(),
                             template: None,
                             is_static: false,
+                            ret_fqn: None,
+                            ret_display: None,
                         },
                     ],
                 })

@@ -24,8 +24,8 @@ mod maven;
 mod resolve;
 mod zip;
 
-use index::TypeIndex;
 pub use index::TypeEntry;
+use index::TypeIndex;
 use zip::ZipArchive;
 
 /// A type read from bytecode: its fully-qualified name, its direct supertypes

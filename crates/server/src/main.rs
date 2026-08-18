@@ -2649,9 +2649,27 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
                     signature: m.signature.clone(),
                     template: m.template.clone(),
                     is_static: m.is_static,
+                    ret_fqn: m.ret_fqn.clone(),
+                    ret_display: m.ret_display.clone(),
                 })
                 .collect(),
         })
+    }
+
+    /// M7: name-index delegation — classpath type-name completion.
+    fn types_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> (Vec<jvl_syntax::TypeCandidate>, bool) {
+        let (entries, truncated) = self.0.types_with_prefix(prefix, limit);
+        (entries.into_iter().map(candidate).collect(), truncated)
+    }
+
+    /// M7: name-index delegation — import-path completion.
+    fn package_children(&self, package: &str) -> (Vec<String>, Vec<jvl_syntax::TypeCandidate>) {
+        let (subpackages, types) = self.0.package_children(package);
+        (subpackages, types.into_iter().map(candidate).collect())
     }
 
     /// Type arguments each supertype entry is instantiated with (index-aligned
@@ -2694,6 +2712,16 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
             }
         }
         None
+    }
+}
+
+/// A classpath [`jvl_classpath::TypeEntry`] as the analysis crate's
+/// [`jvl_syntax::TypeCandidate`] — same fields, crate-local types.
+fn candidate(entry: jvl_classpath::TypeEntry) -> jvl_syntax::TypeCandidate {
+    jvl_syntax::TypeCandidate {
+        simple: entry.simple,
+        fqn: entry.fqn,
+        import_path: entry.import_path,
     }
 }
 

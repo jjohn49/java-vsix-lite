@@ -211,7 +211,7 @@ fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> 
             "fqn": fqn,
             "member": member.name,
         })),
-        ResolvedType::InProject(_) => None,
+        ResolvedType::InProject(_) | ResolvedType::Array { .. } => None,
     }
 }
 
@@ -405,6 +405,8 @@ mod tests {
                         signature: m.signature.clone(),
                         template: m.template.clone(),
                         is_static: m.is_static,
+                        ret_fqn: m.ret_fqn.clone(),
+                        ret_display: m.ret_display.clone(),
                     })
                     .collect(),
             })
@@ -418,6 +420,8 @@ mod tests {
             signature: signature.to_string(),
             template: None,
             is_static: false,
+            ret_fqn: None,
+            ret_display: None,
         }
     }
 
@@ -429,6 +433,8 @@ mod tests {
             signature: erased.to_string(),
             template: Some(template.to_string()),
             is_static: false,
+            ret_fqn: None,
+            ret_display: None,
         }
     }
 
@@ -1017,6 +1023,268 @@ mod tests {
             &NoSymbols
         )
         .is_none());
+    }
+
+    // --- M7: everyday IntelliSense — chains, statics, var, casts, arrays ---
+
+    /// A method whose (erased) return type is an object — enough for a chain
+    /// to continue through `ret_fqn`.
+    fn ext_method_ret(name: &str, signature: &str, ret_fqn: &str) -> ExternalMember {
+        ExternalMember {
+            ret_fqn: Some(ret_fqn.to_string()),
+            ..ext_method(name, signature)
+        }
+    }
+
+    /// A generic method carrying both chain fields (`ret_display` in `{i}`
+    /// template form).
+    fn ext_method_ret_display(
+        name: &str,
+        signature: &str,
+        ret_fqn: &str,
+        ret_display: &str,
+    ) -> ExternalMember {
+        ExternalMember {
+            ret_fqn: Some(ret_fqn.to_string()),
+            ret_display: Some(ret_display.to_string()),
+            ..ext_method(name, signature)
+        }
+    }
+
+    fn ext_static_field_ret(name: &str, signature: &str, ret_fqn: &str) -> ExternalMember {
+        ExternalMember {
+            name: name.to_string(),
+            kind: ExternalMemberKind::Field,
+            signature: signature.to_string(),
+            template: None,
+            is_static: true,
+            ret_fqn: Some(ret_fqn.to_string()),
+            ret_display: None,
+        }
+    }
+
+    /// A JDK-shaped fixture: List/Stream/String/System/PrintStream/Map.Entry
+    /// with just enough members to exercise every chain shape.
+    fn rich_mock() -> MockSymbols {
+        mock(vec![
+            (
+                "java.util.List",
+                ext_generic_class(
+                    &["E"],
+                    &[],
+                    vec![
+                        ext_generic_method("add", "boolean add(Object)", "boolean add({0})"),
+                        ExternalMember {
+                            ret_fqn: Some("java.lang.Object".to_string()),
+                            ret_display: Some("{0}".to_string()),
+                            ..ext_generic_method("get", "Object get(int)", "{0} get(int)")
+                        },
+                        ext_method_ret_display(
+                            "stream",
+                            "Stream stream()",
+                            "java.util.stream.Stream",
+                            "Stream<{0}>",
+                        ),
+                        ExternalMember {
+                            is_static: true,
+                            ..ext_method_ret_display("of", "List of()", "java.util.List", "List<E>")
+                        },
+                    ],
+                ),
+            ),
+            (
+                "java.util.ArrayList",
+                ext_generic_class(
+                    &["E"],
+                    &[],
+                    vec![ext_generic_method(
+                        "add",
+                        "boolean add(Object)",
+                        "boolean add({0})",
+                    )],
+                ),
+            ),
+            (
+                "java.util.stream.Stream",
+                ext_generic_class(
+                    &["T"],
+                    &[],
+                    vec![
+                        ext_method("count", "long count()"),
+                        ext_method_ret_display(
+                            "filter",
+                            "Stream filter(Predicate)",
+                            "java.util.stream.Stream",
+                            "Stream<{0}>",
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "java.lang.String",
+                ext_class(
+                    &[],
+                    vec![
+                        ext_method("length", "int length()"),
+                        ext_method_ret("trim", "String trim()", "java.lang.String"),
+                    ],
+                ),
+            ),
+            (
+                "java.lang.System",
+                ext_class(
+                    &[],
+                    vec![ext_static_field_ret(
+                        "out",
+                        "PrintStream out",
+                        "java.io.PrintStream",
+                    )],
+                ),
+            ),
+            (
+                "java.io.PrintStream",
+                ext_class(&[], vec![ext_method("println", "void println(String)")]),
+            ),
+            (
+                "java.util.Map",
+                ext_class(&[], vec![ext_method("put", "Object put(Object, Object)")]),
+            ),
+            (
+                "java.util.Map$Entry",
+                ext_class(
+                    &[],
+                    vec![ExternalMember {
+                        is_static: true,
+                        ..ext_method("comparingByKey", "Comparator comparingByKey()")
+                    }],
+                ),
+            ),
+            (
+                "java.lang.Object",
+                ext_class(&[], vec![ext_method("toString", "String toString()")]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn chained_method_call_on_external_receiver() {
+        let src = "import java.util.List;\n\
+                   class C { void m() { List<String> xs; xs.stream().x; } }\n";
+        let items = complete_ext(src, "xs.stream().", &rich_mock());
+        assert!(has(&items, "count"), "{:?}", labels(&items));
+        assert!(has(&items, "filter"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn chained_call_substitutes_type_var_return() {
+        // List<String>.get(int) returns {0} = String — the chain must land on
+        // java.lang.String via the implicit java.lang resolution.
+        let src = "import java.util.List;\n\
+                   class C { void m() { List<String> xs; xs.get(0).x; } }\n";
+        let items = complete_ext(src, "xs.get(0).", &rich_mock());
+        assert!(has(&items, "length"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn chain_through_erased_return_without_signature() {
+        let src = "class C { void m() { String s; s.trim().x; } }\n";
+        let items = complete_ext(src, "s.trim().", &rich_mock());
+        assert!(has(&items, "length"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn system_out_member_completion() {
+        let src = "class C { void m() { System.out.x; } }\n";
+        let items = complete_ext(src, "System.out.", &rich_mock());
+        assert!(has(&items, "println"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn static_method_chain_on_type_receiver() {
+        let src = "import java.util.List;\n\
+                   class C { void m() { List.of().x; } }\n";
+        let items = complete_ext(src, "List.of().", &rich_mock());
+        assert!(has(&items, "add"), "{:?}", labels(&items));
+        assert!(has(&items, "stream"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn in_project_method_return_chains() {
+        let src = "class Foo { int leaf; Foo self() { return this; } }\n\
+                   class C { void m() { Foo f; f.self().x; } }\n";
+        let items = complete(src, "f.self().");
+        assert!(has(&items, "leaf"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn unqualified_call_in_own_class_chains() {
+        let src = "class Foo { int leaf; }\n\
+                   class C { Foo make() { return null; } void m() { make().x; } }\n";
+        let items = complete(src, "make().");
+        assert!(has(&items, "leaf"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn var_infers_from_object_creation_initializer() {
+        let src = "import java.util.ArrayList;\n\
+                   class C { void m() { var v = new ArrayList<String>(); v.x; } }\n";
+        let items = complete_ext(src, "v.", &rich_mock());
+        assert!(has(&items, "add"), "{:?}", labels(&items));
+        // Generic substitution flows through the inferred type.
+        assert_eq!(detail_of(&items, "add"), Some("boolean add(String)"));
+    }
+
+    #[test]
+    fn var_infers_from_chained_initializer() {
+        let src = "class C { void m() { String s; var t = s.trim(); t.x; } }\n";
+        let items = complete_ext(src, "t.", &rich_mock());
+        assert!(has(&items, "length"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn cast_receiver_resolves_to_cast_type() {
+        let src = "import java.util.List;\n\
+                   class C { void m(Object o) { ((List) o).x; } }\n";
+        let items = complete_ext(src, "o).", &rich_mock());
+        assert!(has(&items, "add"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn array_receiver_offers_length_and_clone_not_element_members() {
+        let src = "class C { void m(String[] a) { a.x; } }\n";
+        let items = complete_ext(src, "a.", &rich_mock());
+        assert!(has(&items, "length"), "{:?}", labels(&items));
+        assert!(has(&items, "clone"), "{:?}", labels(&items));
+        assert!(
+            !has(&items, "trim"),
+            "element members must not leak: {:?}",
+            labels(&items)
+        );
+        assert!(
+            has(&items, "toString"),
+            "arrays are Objects: {:?}",
+            labels(&items)
+        );
+    }
+
+    #[test]
+    fn nested_class_static_walk() {
+        let src = "import java.util.Map;\n\
+                   class C { void m() { Map.Entry.x; } }\n";
+        let items = complete_ext(src, "Map.Entry.", &rich_mock());
+        assert!(has(&items, "comparingByKey"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn fully_qualified_type_receiver_stays_static_only() {
+        let src = "class C { void m() { java.util.List.x; } }\n";
+        let items = complete_ext(src, "java.util.List.", &rich_mock());
+        assert!(has(&items, "of"), "{:?}", labels(&items));
+        assert!(
+            !has(&items, "add"),
+            "instance members excluded on a type receiver: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]

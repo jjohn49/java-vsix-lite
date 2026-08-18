@@ -118,9 +118,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             };
             format!("{prefix}{ret} {}({})", method.name, params.join(", "))
         });
-        let ret_display = parsed
-            .map(|(_, ret, _)| ret)
-            .filter(|ret| ret != "void");
+        let ret_display = parsed.map(|(_, ret, _)| ret).filter(|ret| ret != "void");
         members.push(Member {
             signature: render_method(&method.name, &method.descriptor),
             template,

@@ -48,7 +48,9 @@ pub use completion::{completion, resolve_documentation};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::member_diagnostics;
 pub use docsrc::{javadoc_in_source, locate_in_source};
-pub use external::{ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource};
+pub use external::{
+    ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource, TypeCandidate,
+};
 pub use hover::hover;
 pub use implementation::{
     implementation_target, implementations_in_doc, ImplementationHit, ImplementationTarget,

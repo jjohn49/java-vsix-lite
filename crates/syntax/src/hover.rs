@@ -159,7 +159,7 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     match &resolved.ty {
         ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source)),
-        ResolvedType::External { .. } => None,
+        ResolvedType::External { .. } | ResolvedType::Array { .. } => None,
     }
 }
 
@@ -170,7 +170,7 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
             // Javadoc only when the receiver itself is external (we have its FQN).
             let doc = match &resolved.ty {
                 ResolvedType::External { fqn, .. } => ctx.symbols.doc(fqn, Some(name)),
-                ResolvedType::InProject(_) => None,
+                ResolvedType::InProject(_) | ResolvedType::Array { .. } => None,
             };
             Some(Target::External(m.signature, doc))
         }
@@ -230,6 +230,9 @@ fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t
     let resolved_ty = resolve::resolve_object_creation_type(call, ctx)?;
     let arg_count = call_arg_count(call);
     match resolved_ty {
+        // Array creation is a different node kind — a stray Array resolution
+        // has no constructors to show.
+        ResolvedType::Array { .. } => None,
         ResolvedType::InProject(td) => {
             let ctors = td.constructors();
             let (sig, ctor_doc) = if ctors.is_empty() {
@@ -340,6 +343,8 @@ mod tests {
                         signature: m.signature.clone(),
                         template: m.template.clone(),
                         is_static: m.is_static,
+                        ret_fqn: m.ret_fqn.clone(),
+                        ret_display: m.ret_display.clone(),
                     })
                     .collect(),
             })
@@ -527,6 +532,8 @@ mod tests {
                     signature: "Widget()".to_string(),
                     template: None,
                     is_static: false,
+                    ret_fqn: None,
+                    ret_display: None,
                 },
                 ExternalMember {
                     name: "Widget".to_string(),
@@ -534,6 +541,8 @@ mod tests {
                     signature: "Widget(int)".to_string(),
                     template: None,
                     is_static: false,
+                    ret_fqn: None,
+                    ret_display: None,
                 },
             ],
         };
@@ -593,6 +602,8 @@ mod tests {
                 signature: "int size()".to_string(),
                 template: None,
                 is_static: false,
+                ret_fqn: None,
+                ret_display: None,
             }],
         };
         let tree = tree(src);

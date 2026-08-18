@@ -105,6 +105,8 @@ mod tests {
                         signature: format!("{n}()"),
                         template: None,
                         is_static: false,
+                        ret_fqn: None,
+                        ret_display: None,
                     })
                     .collect(),
             };
@@ -144,6 +146,18 @@ mod tests {
                    class C { void m() { Box b; b.width = b.hashCode(); b.toString(); } }\n";
         // width is real; hashCode/toString are inherited from Object.
         assert!(diags(src, &ObjectAware(vec![])).is_empty());
+    }
+
+    /// M7: array receivers know their complete member set — `length`/`clone`
+    /// plus Object's — so real members stay silent and bogus ones are
+    /// flagged (the pre-M7 resolver treated `a` as its *element* type).
+    #[test]
+    fn array_members_diagnose_correctly() {
+        let src = "class C { void m(int[] a) { int n = a.length; a.clone(); a.toString(); } }\n";
+        assert!(diags(src, &ObjectAware(vec![])).is_empty());
+        let src = "class C { void m(int[] a) { a.missingNo(); } }\n";
+        let msgs = diags(src, &ObjectAware(vec![]));
+        assert!(msgs.iter().any(|m| m.contains("missingNo")), "{msgs:?}");
     }
 
     #[test]
