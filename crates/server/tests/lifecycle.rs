@@ -2833,3 +2833,140 @@ fn completion_resolve_external_member_jdk_round_trip() {
     let status = child.wait().expect("wait for server exit");
     assert!(status.success(), "server exited with failure: {status:?}");
 }
+
+/// M7: project-source symbol layer end-to-end — a workspace type the user
+/// never opens (`Person.java`) still drives member completion, classpath-
+/// style type-name completion, and lazy Javadoc, identically to a compiled
+/// dependency. Only `Main.java` is opened.
+#[test]
+fn project_source_symbols_closed_file_round_trip() {
+    let root = temp_root("project-symbols");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("Person.java"),
+        "package demo;\n\n\
+         /** Represents a person. */\n\
+         public class Person {\n\
+         \u{20}   /** Returns the person's name. */\n\
+         \u{20}   public String getName() { return null; }\n\
+         }\n",
+    )
+    .expect("write Person.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{"textDocument":{{"completion":{{"completionItem":{{"snippetSupport":true}}}}}}}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // `Person` used (same package, no import needed), but its own file is
+    // never opened. Kept on a single line so a byte offset from `.find`
+    // doubles as the `character` column (`line` stays 0).
+    let main_uri = format!(
+        "file://{}",
+        root.join("src/main/java/demo/Main.java").display()
+    );
+    let main_text = "package demo; class Main { void m() { Person p = new Person(\"x\"); p.getName(); Per } }\n";
+    assert_eq!(
+        main_text.find('\n'),
+        Some(main_text.len() - 1),
+        "must stay single-line for the byte-offset-as-column math below"
+    );
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{main_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(main_text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // A: member completion on the closed type — `p.` yields `getName`.
+    let dot_after_p = main_text.find("p.getName").unwrap() + 2;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{main_uri}"}},"position":{{"line":0,"character":{dot_after_p}}}}}}}"#
+    ));
+    let member_completion = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        member_completion.contains(r#""label":"getName""#),
+        "expected getName from the closed Person.java: {member_completion}"
+    );
+
+    // B: classpath-style type-name completion for the closed type itself.
+    let after_per = main_text.rfind("Per").unwrap() + 3;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{main_uri}"}},"position":{{"line":0,"character":{after_per}}}}}}}"#
+    ));
+    let type_completion = read_until(&mut reader, "\"id\":3", &mut seen);
+    let type_json: Value = serde_json::from_str(&type_completion).expect("parse completion");
+    let items = type_json["result"]["items"]
+        .as_array()
+        .expect("completion result items");
+    let person_item = items
+        .iter()
+        .find(|i| i["label"] == "Person")
+        .expect("Person type item present")
+        .clone();
+    assert_eq!(
+        person_item["additionalTextEdits"],
+        Value::Null,
+        "same package, no import needed: {person_item:?}"
+    );
+
+    // C: lazy Javadoc for the closed type resolves via completionItem/resolve.
+    let resolve_type = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "completionItem/resolve", "params": person_item,
+    });
+    send(&resolve_type.to_string());
+    let resolved_type = read_until(&mut reader, "\"id\":4", &mut seen);
+    assert!(
+        resolved_type.contains("Represents a person."),
+        "expected the closed file's own type Javadoc: {resolved_type}"
+    );
+
+    // D: lazy Javadoc for a member of the closed type.
+    let member_completion_json: Value =
+        serde_json::from_str(&member_completion).expect("parse member completion");
+    let get_name_item = member_completion_json["result"]["items"]
+        .as_array()
+        .expect("member completion items")
+        .iter()
+        .find(|i| i["label"] == "getName")
+        .expect("getName item present")
+        .clone();
+    let resolve_member = serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "completionItem/resolve", "params": get_name_item,
+    });
+    send(&resolve_member.to_string());
+    let resolved_member = read_until(&mut reader, "\"id\":5", &mut seen);
+    assert!(
+        resolved_member.contains("Returns the person's name."),
+        "expected the closed file's own member Javadoc: {resolved_member}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":6,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":6", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

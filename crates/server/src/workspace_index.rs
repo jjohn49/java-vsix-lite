@@ -186,9 +186,9 @@ impl WorkspaceIndex {
     /// Every indexed path for an exact simple name — the "simple name ->
     /// paths" lookup a future add-import feature (and, if it doesn't already
     /// have one, go-to-definition's unopened-file ladder step) can reuse
-    /// rather than re-walking the workspace itself. Not yet called from
-    /// production code in this crate (no consumer has landed), only from
-    /// this module's own tests — hence the explicit `allow`.
+    /// rather than re-walking the workspace itself. `project_symbols`
+    /// (M7) needed package-exact lookup instead (see `find_type`), so this
+    /// still has no production caller — only this module's own tests.
     #[allow(dead_code)]
     pub(crate) fn paths_for_simple_name(&self, name: &str) -> Vec<PathBuf> {
         let inner = self.inner.lock().expect("workspace index poisoned");
@@ -198,6 +198,79 @@ impl WorkspaceIndex {
             .filter(|e| e.simple_name == name)
             .map(|e| e.path.clone())
             .collect()
+    }
+
+    /// M7: the file declaring the exact `(package, simple_name)` pair —
+    /// `project_symbols`'s FQN-to-file lookup for closed-file completion.
+    /// The first match wins (two same-named top-level types in the same
+    /// package is invalid Java; ambiguity here just means "one of them").
+    pub(crate) fn find_type(&self, package: &str, simple_name: &str) -> Option<PathBuf> {
+        let inner = self.inner.lock().expect("workspace index poisoned");
+        inner
+            .entries
+            .iter()
+            .find(|e| e.package == package && e.simple_name == simple_name)
+            .map(|e| e.path.clone())
+    }
+
+    /// M7: entries whose simple name starts with `prefix` (case-insensitive),
+    /// shortest-name-first, capped at `limit`; the bool reports whether the
+    /// cap cut candidates off. The classpath-index counterpart to
+    /// `jvl_classpath::Classpath::types_with_prefix`, so project types
+    /// complete the same way dependency types do.
+    pub(crate) fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<SymbolEntry>, bool) {
+        if prefix.is_empty() || limit == 0 {
+            return (Vec::new(), false);
+        }
+        let needle = prefix.to_ascii_lowercase();
+        let inner = self.inner.lock().expect("workspace index poisoned");
+        let mut hits: Vec<&SymbolEntry> = inner
+            .entries
+            .iter()
+            .filter(|e| {
+                e.simple_name.len() >= needle.len()
+                    && e.simple_name[..needle.len()].eq_ignore_ascii_case(&needle)
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            (a.simple_name.len(), &a.simple_name).cmp(&(b.simple_name.len(), &b.simple_name))
+        });
+        let truncated = hits.len() > limit;
+        (hits.into_iter().take(limit).cloned().collect(), truncated)
+    }
+
+    /// M7: immediate child packages and top-level types of a dotted package
+    /// (`""` = roots) — the project-source counterpart to
+    /// `jvl_classpath::Classpath::package_children`, for import-path
+    /// completion across project files. Nested types aren't tracked by this
+    /// index (it only records the filename-matching top-level type per
+    /// file), so only top-level types are ever returned here.
+    pub(crate) fn package_children(&self, package: &str) -> (Vec<String>, Vec<SymbolEntry>) {
+        let inner = self.inner.lock().expect("workspace index poisoned");
+        let mut subpackages: Vec<String> = Vec::new();
+        let mut types = Vec::new();
+        for e in &inner.entries {
+            if e.package == package {
+                types.push(e.clone());
+                continue;
+            }
+            let prefix = if package.is_empty() {
+                String::new()
+            } else {
+                format!("{package}.")
+            };
+            if let Some(rest) = e.package.strip_prefix(&prefix) {
+                if !rest.is_empty() {
+                    let segment = rest.split('.').next().unwrap_or(rest).to_string();
+                    if !subpackages.contains(&segment) {
+                        subpackages.push(segment);
+                    }
+                }
+            }
+        }
+        subpackages.sort();
+        types.sort_by(|a, b| a.simple_name.cmp(&b.simple_name));
+        (subpackages, types)
     }
 }
 
@@ -718,5 +791,81 @@ mod tests {
             !matches_query("BaFo", "FooBar"),
             "out-of-order humps must not match"
         );
+    }
+
+    // --- M7: project-source symbol layer query methods ---
+
+    async fn person_index() -> (WorkspaceIndex, PathBuf) {
+        let root = temp_dir("project-symbols");
+        write(
+            &root,
+            "src/main/java/demo/Person.java",
+            "package demo;\npublic class Person {}\n",
+        );
+        write(
+            &root,
+            "src/main/java/demo/util/StringUtils.java",
+            "package demo.util;\npublic class StringUtils {}\n",
+        );
+        write(
+            &root,
+            "src/main/java/demo/util/Other.java",
+            "package demo.util;\npublic class Other {}\n",
+        );
+        let index = WorkspaceIndex::new();
+        built(&index, &[root.join("src/main/java")], &root).await;
+        (index, root)
+    }
+
+    #[tokio::test]
+    async fn find_type_locates_exact_package_and_simple_name() {
+        let (index, root) = person_index().await;
+        let found = index.find_type("demo", "Person").expect("found");
+        assert_eq!(found, root.join("src/main/java/demo/Person.java"));
+        assert!(index.find_type("demo", "NoSuchType").is_none());
+        assert!(
+            index.find_type("other.pkg", "Person").is_none(),
+            "wrong package must not match"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn types_with_prefix_matches_case_insensitively_and_caps() {
+        let (index, root) = person_index().await;
+        let (hits, truncated) = index.types_with_prefix("Person", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].simple_name, "Person");
+        assert!(!truncated);
+
+        let (hits, _) = index.types_with_prefix("person", 10);
+        assert_eq!(hits.len(), 1, "case-insensitive");
+
+        let (hits, truncated) = index.types_with_prefix("S", 1);
+        // "StringUtils" matches; capped at 1 with more available is still
+        // correctly reported even though there's exactly one S-match here.
+        assert_eq!(hits.len(), 1);
+        assert!(!truncated);
+
+        assert!(index.types_with_prefix("", 10).0.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn package_children_lists_subpackages_and_types() {
+        let (index, root) = person_index().await;
+        let (subs, types) = index.package_children("demo");
+        assert_eq!(subs, vec!["util".to_string()]);
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].simple_name, "Person");
+
+        let (subs, types) = index.package_children("demo.util");
+        assert!(subs.is_empty());
+        let names: Vec<&str> = types.iter().map(|t| t.simple_name.as_str()).collect();
+        assert_eq!(names, vec!["Other", "StringUtils"]);
+
+        let (subs, types) = index.package_children("no.such.pkg");
+        assert!(subs.is_empty() && types.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

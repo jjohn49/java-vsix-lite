@@ -17,8 +17,11 @@
 #![forbid(unsafe_code)]
 
 mod javac;
+mod project_symbols;
 mod references;
 mod workspace_index;
+
+use project_symbols::{CombinedSymbols, ProjectSymbols};
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as StdRange;
@@ -526,6 +529,29 @@ impl Backend {
         &self.workspace_index
     }
 
+    /// M7: refresh the workspace type-name index (see `workspace_index`)
+    /// before consulting `ProjectSymbols` — the same lock-roots-then-
+    /// release-then-walk choreography the `symbol` handler already used
+    /// (M4.5), factored out so every interactive handler that now consults
+    /// closed project files can call it too. Cheap on the common case (a
+    /// handful of `stat`s, no walk) once nothing under a source root has
+    /// changed. Must be called *before* taking `self.documents`'s own lock
+    /// — it briefly takes that lock itself to compute source roots, and
+    /// `tokio::sync::Mutex` isn't reentrant.
+    async fn ensure_workspace_index(&self) {
+        let project_root = self.project_root();
+        let roots = {
+            let docs = self.documents.lock().await;
+            project_root
+                .as_deref()
+                .map(|root| self.source_roots(&docs, root))
+                .unwrap_or_default()
+        };
+        self.workspace_index()
+            .ensure_built(&roots, project_root.as_deref())
+            .await;
+    }
+
     /// Parse (or reuse a cached parse of) a single project source file,
     /// invalidated by `mtime` so an on-disk edit is picked up without an
     /// explicit notification (the server never watches files). Shared by
@@ -683,6 +709,14 @@ impl Backend {
                 let mut d = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
                 if self.unresolved_member_diagnostics.get().copied() == Some(true) {
                     let open = open_docs(docs, uri, doc);
+                    // M7: classpath-only, not `CombinedSymbols` — this is a
+                    // synchronous fn on the didOpen/didChange hot path, and
+                    // `ProjectSymbols` needs an async `ensure_workspace_index`
+                    // pass first. The unresolved-member check already stays
+                    // silent whenever a receiver's type doesn't resolve at
+                    // all (see `member_names`'s `complete` flag), so a
+                    // closed-file project type is a missed diagnosis, never a
+                    // false positive — an accepted gap, not a regression.
                     let symbols = ClasspathSymbols(self.classpath());
                     d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
                 }
@@ -1289,10 +1323,11 @@ impl Backend {
     /// symbol, `this`/`super`, a non-identifier, or a document that isn't
     /// currently open).
     async fn target_snapshot(&self, uri: &str, position: Position) -> Option<TargetSnapshot> {
+        self.ensure_workspace_index().await;
         let docs = self.documents.lock().await;
         let (open, uris) = open_docs_and_uris(&docs, uri)?;
         let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         let target = jvl_syntax::reference_target(&open, 0, &index, position, &symbols)?;
 
         let target_uri = uris[target.doc].to_string();
@@ -1344,7 +1379,8 @@ impl Backend {
         open_snapshot: &HashMap<PathBuf, (i32, String, Tree)>,
         include_declaration: bool,
     ) -> ScanOutcome {
-        let symbols = ClasspathSymbols(self.classpath());
+        self.ensure_workspace_index().await;
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         let empty = || ScanOutcome {
             hits: Vec::new(),
             possible: 0,
@@ -1478,10 +1514,11 @@ impl Backend {
         uri: &str,
         position: Position,
     ) -> Option<ImplTargetSnapshot> {
+        self.ensure_workspace_index().await;
         let docs = self.documents.lock().await;
         let (open, uris) = open_docs_and_uris(&docs, uri)?;
         let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         let target = jvl_syntax::implementation_target(&open, 0, &index, position, &symbols)?;
 
         let target_uri = uris[target.type_doc].to_string();
@@ -1944,21 +1981,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         let query = params.query;
 
-        // Compute the source roots (needs a peek at open documents, for the
-        // package-inferred ones) and release the lock *before* the
-        // potentially slow disk walk in `ensure_built`, so a concurrent
-        // `didOpen`/`didChange` isn't blocked on it.
-        let project_root = self.project_root();
-        let roots = {
-            let docs = self.documents.lock().await;
-            project_root
-                .as_deref()
-                .map(|root| self.source_roots(&docs, root))
-                .unwrap_or_default()
-        };
-        self.workspace_index()
-            .ensure_built(&roots, project_root.as_deref())
-            .await;
+        self.ensure_workspace_index().await;
         tracing::debug!(
             entries = self.workspace_index().len(),
             generation = self.workspace_index().generation(),
@@ -2087,6 +2110,7 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.ensure_workspace_index().await;
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -2097,11 +2121,12 @@ impl LanguageServer for Backend {
         // (for cross-file types). All synchronous — no await held.
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         Ok(jvl_syntax::hover(&open, 0, &index, position, &symbols))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        self.ensure_workspace_index().await;
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -2112,13 +2137,14 @@ impl LanguageServer for Backend {
         // document, for cross-file overload resolution. All synchronous.
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         Ok(jvl_syntax::signature_help(
             &open, 0, &index, position, &symbols,
         ))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        self.ensure_workspace_index().await;
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let docs = self.documents.lock().await;
@@ -2131,7 +2157,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         let mut result =
             jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
         for item in &mut result.items {
@@ -2163,6 +2189,7 @@ impl LanguageServer for Backend {
     /// closed since the completion request) resolves to no documentation
     /// rather than a guess. External keys carry no URI and ignore `open`.
     async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        self.ensure_workspace_index().await;
         let Some(data) = item.data.clone() else {
             return Ok(item);
         };
@@ -2178,7 +2205,7 @@ impl LanguageServer for Backend {
                 }]
             })
             .unwrap_or_default();
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         if let Some(doc) = jvl_syntax::resolve_documentation(&open, &data, &symbols) {
             item.documentation = Some(doc);
         }
@@ -2189,6 +2216,15 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        // M7: deliberately ClasspathSymbols-only, NOT CombinedSymbols.
+        // jvl_syntax::definition's ladder step (c) — landing precisely
+        // inside an unopened project file via locate_in_project_file —
+        // is *triggered* by the SymbolSource failing to recognize a bare
+        // type name (see definition.rs's module doc). ProjectSymbols
+        // would make that name resolve instead, short-circuiting the
+        // ladder into step (d)'s classpath-only External handling, which
+        // can't locate a real project file at all. See
+        // `definition_into_unopened_project_file` in lifecycle.rs.
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -2206,6 +2242,15 @@ impl LanguageServer for Backend {
         &self,
         params: GotoTypeDefinitionParams,
     ) -> Result<Option<GotoTypeDefinitionResponse>> {
+        // M7: deliberately ClasspathSymbols-only, NOT CombinedSymbols.
+        // jvl_syntax::definition's ladder step (c) — landing precisely
+        // inside an unopened project file via locate_in_project_file —
+        // is *triggered* by the SymbolSource failing to recognize a bare
+        // type name (see definition.rs's module doc). ProjectSymbols
+        // would make that name resolve instead, short-circuiting the
+        // ladder into step (d)'s classpath-only External handling, which
+        // can't locate a real project file at all. See
+        // `definition_into_unopened_project_file` in lifecycle.rs.
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -2375,6 +2420,7 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        self.ensure_workspace_index().await;
         let uri = params.text_document.uri;
         let position = params.position;
         let docs = self.documents.lock().await;
@@ -2383,7 +2429,7 @@ impl LanguageServer for Backend {
         };
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = ClasspathSymbols(self.classpath());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
         let Some(prep) = jvl_syntax::prepare_rename(&open, 0, &index, position, &symbols) else {
             return Ok(None);
         };
