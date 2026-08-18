@@ -68,6 +68,12 @@
           "minimum": 10,
           "maximum": 600,
           "markdownDescription": "How long `Check Project (javac)` (M5.4) waits before killing `javac`, in seconds. Clamped to 10–600."
+        },
+        "java-vsix-lite.dependencies.autoDownload": {
+          "type": "string",
+          "enum": ["prompt", "always", "never"],
+          "default": "prompt",
+          "markdownDescription": "What to do when missing dependencies are detected (M7), in a trusted workspace: `prompt` asks once per session with a Download / Always / Never choice; `always` downloads silently from then on (same HTTPS + checksum verification, Maven Central only, as `Java: Download Missing Dependencies`); `never` disables the automatic check (the manual command still works). Choosing Always or Never from the prompt updates this setting for the current workspace."
         }
       }
     },

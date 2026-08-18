@@ -266,6 +266,21 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   client.onDidChangeState((event) => updateStatus(event.newState));
   context.subscriptions.push(client);
 
+  // M7: the first `publishDiagnostics` after startup is this session's
+  // signal that the classpath has been built at least once (see
+  // `maybeProactiveDependencyCheck`'s doc comment) — disposed after firing
+  // once, since the check itself is also one-shot per session.
+  const proactiveCheckListener = client.onNotification(
+    "textDocument/publishDiagnostics",
+    () => {
+      proactiveCheckListener.dispose();
+      if (client) {
+        void maybeProactiveDependencyCheck(client);
+      }
+    },
+  );
+  context.subscriptions.push(proactiveCheckListener);
+
   await client.start();
 }
 
@@ -423,6 +438,20 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
     return;
   }
 
+  await startDownloadProgress(activeClient, initial);
+}
+
+/**
+ * The bounded download loop wrapped in a cancellable progress notification —
+ * factored out of `runDownloadDependencies` so the M7 proactive path (which
+ * has its own, lighter consent step — see `maybeProactiveDependencyCheck`)
+ * can drive the same verified-HTTPS, capped, fixed-point machinery without
+ * showing the manual command's heavier modal dialog on top.
+ */
+async function startDownloadProgress(
+  activeClient: LanguageClient,
+  initial: MissingDependenciesResult,
+): Promise<void> {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -431,6 +460,99 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
     },
     (progress, token) => runDownloadLoop(activeClient, initial, progress, token),
   );
+}
+
+// M7: proactive dependency detection — fires at most once per extension
+// session (see `proactiveDependencyCheckDone`), the first time diagnostics
+// are published after startup (a reliable, already-happening signal that
+// the classpath has been resolved at least once — see `Backend::classpath`'s
+// lazy-build-on-first-use doc comment; querying any earlier could race a
+// still-empty classpath). Trust-gated and single-flight-guarded exactly like
+// the manual command, since it can trigger the same network + `~/.m2` write.
+let proactiveDependencyCheckDone = false;
+
+type AutoDownloadSetting = "prompt" | "always" | "never";
+
+function autoDownloadSetting(): AutoDownloadSetting {
+  return vscode.workspace
+    .getConfiguration("java-vsix-lite")
+    .get<AutoDownloadSetting>("dependencies.autoDownload", "prompt");
+}
+
+async function persistAutoDownloadSetting(value: AutoDownloadSetting): Promise<void> {
+  try {
+    await vscode.workspace
+      .getConfiguration("java-vsix-lite")
+      .update("dependencies.autoDownload", value, vscode.ConfigurationTarget.Workspace);
+  } catch {
+    // No open workspace folder (single-file mode) or another write race —
+    // the choice still applies to *this* session via the local variable in
+    // `maybeProactiveDependencyCheck`; only persistence across sessions is
+    // lost, which is a soft failure, not worth surfacing to the user.
+  }
+}
+
+async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Promise<void> {
+  if (proactiveDependencyCheckDone || !vscode.workspace.isTrusted || downloadInFlight) {
+    return;
+  }
+  proactiveDependencyCheckDone = true;
+
+  const setting = autoDownloadSetting();
+  if (setting === "never") {
+    return;
+  }
+
+  let initial: MissingDependenciesResult;
+  try {
+    initial = await activeClient.sendRequest<MissingDependenciesResult>(
+      "jvl/missingDependencies",
+    );
+  } catch {
+    return; // silent — this is a background convenience check, not a user action
+  }
+  if (initial.missing.length === 0) {
+    return;
+  }
+
+  if (setting === "always") {
+    downloadInFlight = true;
+    try {
+      await startDownloadProgress(activeClient, initial);
+    } finally {
+      downloadInFlight = false;
+    }
+    return;
+  }
+
+  // "prompt": one lightweight (non-modal) notification — deliberately not
+  // the manual command's heavier modal dialog, since this fires
+  // unprompted. "Always"/"Never" persist the choice for future sessions in
+  // this workspace; dismissing the notification (no button) asks again
+  // next session rather than silently deciding "never".
+  const count = initial.missing.length;
+  const choice = await vscode.window.showInformationMessage(
+    `java-vsix-lite: ${count} missing dependenc${count === 1 ? "y" : "ies"} can be downloaded from Maven Central.`,
+    "Download",
+    "Always for this workspace",
+    "Never",
+  );
+  if (choice === undefined) {
+    return;
+  }
+  if (choice === "Never") {
+    await persistAutoDownloadSetting("never");
+    return;
+  }
+  if (choice === "Always for this workspace") {
+    await persistAutoDownloadSetting("always");
+  }
+  downloadInFlight = true;
+  try {
+    await startDownloadProgress(activeClient, initial);
+  } finally {
+    downloadInFlight = false;
+  }
 }
 
 /**
