@@ -59,6 +59,16 @@ pub struct Member {
     /// e.g. `boolean add({0})`. `None` when the member uses no type variables.
     pub template: Option<String>,
     pub is_static: bool,
+    /// M7: dotted FQN of the **erased** method return type / field declared
+    /// type, from the descriptor (`Ljava/util/stream/Stream;` →
+    /// `java.util.stream.Stream`) — what a `recv.member().` chain resolves
+    /// through. `None` for primitives, `void`, arrays, and constructors.
+    pub ret_fqn: Option<String>,
+    /// M7: the generic return/field type alone, in the same `{i}` template
+    /// convention as [`Member::template`] (`Stream<{0}>`, `{0}`), so a chain
+    /// can substitute use-site type arguments before re-resolving. `None`
+    /// without a `Signature` attribute, for `void`, and for constructors.
+    pub ret_display: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +507,29 @@ mod tests {
             "supers: {:?}",
             al.supers
         );
+    }
+
+    /// M7: real-JDK proof that chains have what they need — `stream()`
+    /// (declared on `java.util.Collection`; `List` reaches it through the
+    /// supers walk) carries its erased return FQN (+ generic display),
+    /// `String.trim()` its FQN alone (no `Signature` attribute on a
+    /// non-generic method), and `System.out` its field type FQN.
+    #[test]
+    fn member_result_types_from_real_jdk() {
+        let Some(cp) = jdk() else { return };
+        let list = cp.class("java.util.Collection").unwrap();
+        let stream = list.members.iter().find(|m| m.name == "stream").unwrap();
+        assert_eq!(stream.ret_fqn.as_deref(), Some("java.util.stream.Stream"));
+        assert_eq!(stream.ret_display.as_deref(), Some("Stream<{0}>"));
+
+        let string = cp.class("java.lang.String").unwrap();
+        let trim = string.members.iter().find(|m| m.name == "trim").unwrap();
+        assert_eq!(trim.ret_fqn.as_deref(), Some("java.lang.String"));
+
+        let system = cp.class("java.lang.System").unwrap();
+        let out = system.members.iter().find(|m| m.name == "out").unwrap();
+        assert!(out.is_static);
+        assert_eq!(out.ret_fqn.as_deref(), Some("java.io.PrintStream"));
     }
 
     #[test]

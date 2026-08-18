@@ -55,8 +55,10 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         if !field_visible(field.access_flags) {
             continue;
         }
-        let template = signature_attr(&field.attributes)
-            .and_then(|sig| generics::field_template(sig, &type_params))
+        let ret_display = signature_attr(&field.attributes)
+            .and_then(|sig| generics::field_template(sig, &type_params));
+        let template = ret_display
+            .as_ref()
             .map(|ty| format!("{ty} {}", field.name));
         members.push(Member {
             signature: format!("{} {}", render_field(&field.descriptor), field.name),
@@ -64,6 +66,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             name: field.name.to_string(),
             kind: MemberKind::Field,
             is_static: field.access_flags.contains(FieldAccessFlags::STATIC),
+            ret_fqn: object_fqn(&field.descriptor),
+            ret_display,
         });
     }
     for method in &class.methods {
@@ -89,6 +93,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
                 name: this_simple.clone(),
                 kind: MemberKind::Constructor,
                 is_static: false,
+                // A constructor "returns" its own class, but chains reach that
+                // via `object_creation_expression`, never through a member
+                // result type — so nothing is carried here.
+                ret_fqn: None,
+                ret_display: None,
             });
             continue;
         }
@@ -99,22 +108,30 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         if method.name.starts_with('<') {
             continue;
         }
-        let template = signature_attr(&method.attributes)
-            .and_then(|sig| generics::method_template(sig, &type_params))
-            .map(|(method_type_params, ret, params)| {
-                let prefix = if method_type_params.is_empty() {
-                    String::new()
-                } else {
-                    format!("<{}> ", method_type_params.join(", "))
-                };
-                format!("{prefix}{ret} {}({})", method.name, params.join(", "))
-            });
+        let parsed = signature_attr(&method.attributes)
+            .and_then(|sig| generics::method_template(sig, &type_params));
+        let template = parsed.as_ref().map(|(method_type_params, ret, params)| {
+            let prefix = if method_type_params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}> ", method_type_params.join(", "))
+            };
+            format!("{prefix}{ret} {}({})", method.name, params.join(", "))
+        });
+        let ret_display = parsed
+            .map(|(_, ret, _)| ret)
+            .filter(|ret| ret != "void");
         members.push(Member {
             signature: render_method(&method.name, &method.descriptor),
             template,
             name: method.name.to_string(),
             kind: MemberKind::Method,
             is_static: method.access_flags.contains(MethodAccessFlags::STATIC),
+            ret_fqn: match &method.descriptor.return_type {
+                ReturnDescriptor::Return(field) => object_fqn(field),
+                ReturnDescriptor::Void => None,
+            },
+            ret_display,
         });
     }
 
@@ -186,6 +203,19 @@ fn render_constructor(name: &str, descriptor: &MethodDescriptor) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({params})")
+}
+
+/// The dotted FQN of a non-array object descriptor (`Ljava/io/PrintStream;` →
+/// `java.io.PrintStream`), or `None` for primitives and arrays — the erased
+/// type a member-access chain can continue through.
+fn object_fqn(descriptor: &FieldDescriptor) -> Option<String> {
+    if descriptor.dimensions != 0 {
+        return None;
+    }
+    match &descriptor.field_type {
+        FieldType::Object(class) => Some(fqn_of(class)),
+        _ => None,
+    }
 }
 
 fn render_field(descriptor: &FieldDescriptor) -> String {
@@ -265,6 +295,11 @@ mod fixture {
             signature: Some(signature),
             ..member(name, descriptor)
         }
+    }
+
+    /// A public field with no `Signature` attribute.
+    pub(super) fn field(name: &'static str, descriptor: &'static str) -> MemberSpec {
+        member(name, descriptor)
     }
 
     /// Growable constant pool: each push returns its 1-based CP index.
@@ -382,7 +417,7 @@ mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{build, field_sig, method, method_flags, method_sig};
+    use super::fixture::{build, field, field_sig, method, method_flags, method_sig};
     use super::*;
 
     #[test]
@@ -560,6 +595,113 @@ mod tests {
             .members
             .iter()
             .any(|m| m.name == "plain" && matches!(m.kind, MemberKind::Method)));
+    }
+
+    // --- M7: structured member result types (chain resolution) ---
+
+    #[test]
+    fn generic_return_carries_erased_fqn_and_display_template() {
+        // class Box<E> { Stream<E> stream() } — descriptor erases to Stream,
+        // Signature carries Stream<E> (rendered Stream<{0}>).
+        let bytes = build(
+            "test/Box",
+            Some("<E:Ljava/lang/Object;>Ljava/lang/Object;"),
+            &[],
+            &[method_sig(
+                "stream",
+                "()Ljava/util/stream/Stream;",
+                "()Ljava/util/stream/Stream<TE;>;",
+            )],
+        );
+        let info = parse(&bytes).expect("parses");
+        let m = info.members.iter().find(|m| m.name == "stream").unwrap();
+        assert_eq!(m.ret_fqn.as_deref(), Some("java.util.stream.Stream"));
+        assert_eq!(m.ret_display.as_deref(), Some("Stream<{0}>"));
+    }
+
+    #[test]
+    fn type_var_return_keeps_erasure_fqn_with_placeholder_display() {
+        // class Box<E> { E get(int) } — erasure Object, display {0}.
+        let bytes = build(
+            "test/Box",
+            Some("<E:Ljava/lang/Object;>Ljava/lang/Object;"),
+            &[],
+            &[method_sig("get", "(I)Ljava/lang/Object;", "(I)TE;")],
+        );
+        let info = parse(&bytes).expect("parses");
+        let m = info.members.iter().find(|m| m.name == "get").unwrap();
+        assert_eq!(m.ret_fqn.as_deref(), Some("java.lang.Object"));
+        assert_eq!(m.ret_display.as_deref(), Some("{0}"));
+    }
+
+    #[test]
+    fn plain_object_return_without_signature_has_fqn_only() {
+        let bytes = build(
+            "test/S",
+            None,
+            &[],
+            &[method("trim", "()Ljava/lang/String;")],
+        );
+        let info = parse(&bytes).expect("parses");
+        let m = info.members.iter().find(|m| m.name == "trim").unwrap();
+        assert_eq!(m.ret_fqn.as_deref(), Some("java.lang.String"));
+        assert_eq!(m.ret_display, None);
+    }
+
+    #[test]
+    fn primitive_void_and_array_returns_have_no_result_type() {
+        let bytes = build(
+            "test/P",
+            None,
+            &[],
+            &[
+                method("size", "()I"),
+                method_sig("clear", "()V", "()V"),
+                method("toArray", "()[Ljava/lang/Object;"),
+            ],
+        );
+        let info = parse(&bytes).expect("parses");
+        let by = |n: &str| info.members.iter().find(|m| m.name == n).unwrap();
+        assert_eq!(by("size").ret_fqn, None);
+        assert_eq!(by("size").ret_display, None);
+        // Even with a Signature attribute, a void return carries no display.
+        assert_eq!(by("clear").ret_fqn, None);
+        assert_eq!(by("clear").ret_display, None);
+        assert_eq!(by("toArray").ret_fqn, None);
+    }
+
+    #[test]
+    fn field_declared_type_carries_fqn_and_generic_display() {
+        let bytes = build(
+            "test/F",
+            Some("<E:Ljava/lang/Object;>Ljava/lang/Object;"),
+            &[
+                field("out", "Ljava/io/PrintStream;"),
+                field_sig("items", "Ljava/util/List;", "Ljava/util/List<TE;>;"),
+                field("count", "I"),
+            ],
+            &[],
+        );
+        let info = parse(&bytes).expect("parses");
+        let by = |n: &str| info.members.iter().find(|m| m.name == n).unwrap();
+        assert_eq!(by("out").ret_fqn.as_deref(), Some("java.io.PrintStream"));
+        assert_eq!(by("out").ret_display, None);
+        assert_eq!(by("items").ret_fqn.as_deref(), Some("java.util.List"));
+        assert_eq!(by("items").ret_display.as_deref(), Some("List<{0}>"));
+        assert_eq!(by("count").ret_fqn, None);
+    }
+
+    #[test]
+    fn constructors_carry_no_result_type() {
+        let bytes = build("test/C", None, &[], &[method("<init>", "(I)V")]);
+        let info = parse(&bytes).expect("parses");
+        let ctor = info
+            .members
+            .iter()
+            .find(|m| matches!(m.kind, MemberKind::Constructor))
+            .unwrap();
+        assert_eq!(ctor.ret_fqn, None);
+        assert_eq!(ctor.ret_display, None);
     }
 
     /// `<clinit>` (the static initializer) is never surfaced as a member,
