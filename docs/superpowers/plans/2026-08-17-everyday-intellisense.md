@@ -94,6 +94,19 @@
 - [ ] Implement; update test helpers to `.items`; server handler returns `CompletionResponse::List(CompletionList { is_incomplete, items })`, still `None` when empty and complete.
 - [ ] Workspace green; commit.
 
+### Task 4b: proactive dependency install (extension)
+
+**Files:**
+- Modify: `editors/vscode/src/extension.ts` (on classpath build/rebuild completion, query `jvl/missingDependencies`; notification Download / Always (workspace) / Never; honor `jvl.dependencies.autoDownload`)
+- Modify: `editors/vscode/src/mavenFetch.ts` (reuse fetch pipeline unchanged)
+- Modify: `editors/vscode/package.json` (setting `jvl.dependencies.autoDownload`: `"prompt" | "always" | "never"`, default `"prompt"`)
+
+**Steps:**
+- [ ] Read current wiring (when the manual command runs, how results surface).
+- [ ] Implement prompt + setting + auto path; `npm run compile` + lint clean.
+- [ ] Manual note in README (consent model unchanged: TLS + checksum, Maven Central only).
+- [ ] Commit.
+
 ### Task 5: E2E + polish
 
 **Files:**

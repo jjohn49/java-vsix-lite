@@ -193,6 +193,24 @@ caps bound completion payloads. Auto-import emits client-side text edits only.
 - **server**: lifecycle E2E against the real JDK for the repro's seven rows.
 - The `/tmp/jvl-repro/drive.py` script re-run at the end must print 7 × OK.
 
+## Addendum (user directives, 2026-08-17 session)
+
+- **Dependency jars are first-class** (user: "packages referenced in gradle or
+  maven … want intellisense as well"): the type-name index covers every
+  archive on the resolved classpath — JDK jmods *and* Maven/Gradle dependency
+  jars (transitives included, per M5.1). The JDK-internal namespace filter
+  applies **only to jmod-sourced names**; a dependency legitimately shipping
+  `com.sun.*` (e.g. Jersey) keeps full IntelliSense.
+- **Proactive dependency install** (user: "if it is not in .m2 … try and
+  install / index it"): when classpath resolution reports fetchable missing
+  coordinates (`jvl/missingDependencies`, M6.2), the extension now offers the
+  download *proactively* — a notification with **Download / Always (this
+  workspace) / Never** — instead of waiting for the manual command. "Always"
+  is a workspace setting (`jvl.dependencies.autoDownload`) that makes future
+  misses download + rebuild + index silently. TLS + SHA-checksum verification
+  and the Maven-Central-only origin stay mandatory (threat model: no *silent*
+  network without a standing opt-in; the opt-in is explicit and revocable).
+
 ## Non-goals (follow-ups tracked)
 
 Organize-imports & add-import code actions on diagnostics; enhanced-`for`

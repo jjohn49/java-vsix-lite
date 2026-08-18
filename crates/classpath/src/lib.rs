@@ -13,16 +13,19 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 mod class_info;
 mod generics;
 mod gradle;
+mod index;
 mod jdk;
 mod maven;
 mod resolve;
 mod zip;
 
+use index::TypeIndex;
+pub use index::TypeEntry;
 use zip::ZipArchive;
 
 /// A type read from bytecode: its fully-qualified name, its direct supertypes
@@ -121,6 +124,12 @@ pub struct Classpath {
     /// are deliberately excluded — javac's own installation already supplies
     /// its bootclasspath, and jmods aren't valid `-cp` entries anyway).
     entries: Vec<PathBuf>,
+    /// M7: lazily-built type-name index over every archive's central
+    /// directory (see [`index`]) — powers classpath type-name completion,
+    /// auto-import, and import-path completion. Built at most once per
+    /// `Classpath`; a rebuild swaps in a whole new `Classpath`, so the index
+    /// can never go stale relative to its archives.
+    name_index: OnceLock<TypeIndex>,
 }
 
 impl Classpath {
@@ -135,6 +144,7 @@ impl Classpath {
             source_roots: Vec::new(),
             degraded: Vec::new(),
             entries: Vec::new(),
+            name_index: OnceLock::new(),
         }
     }
 
@@ -278,6 +288,39 @@ impl Classpath {
             }
         }
         None
+    }
+
+    /// M7: the lazily-built name index (see [`index`]). First call walks every
+    /// archive's central-directory names (strings already in memory — no
+    /// bytecode parsing, no extra IO); subsequent calls are free.
+    fn name_index(&self) -> &TypeIndex {
+        self.name_index.get_or_init(|| {
+            TypeIndex::build(self.archives.iter().flat_map(|archive| {
+                // A jmod's entries live under `classes/` — also the marker
+                // that this archive is JDK-sourced (dependency jars have no
+                // prefix), which scopes the internal-namespace filter.
+                let from_jdk = !archive.prefix.is_empty();
+                archive.zip.names().filter_map(move |name| {
+                    name.strip_prefix(archive.prefix)
+                        .and_then(|n| n.strip_suffix(".class"))
+                        .map(|n| (n, from_jdk))
+                })
+            }))
+        })
+    }
+
+    /// M7: classpath types whose simple name starts with `prefix`
+    /// (case-insensitive), best-first, capped at `limit`; the bool reports
+    /// whether the cap cut candidates off (LSP `isIncomplete`).
+    pub fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeEntry>, bool) {
+        self.name_index().types_with_prefix(prefix, limit)
+    }
+
+    /// M7: immediate children of a dotted package (`""` = roots):
+    /// `(subpackage segments, types)`, both sorted — the shape import-path
+    /// completion walks.
+    pub fn package_children(&self, package: &str) -> (Vec<String>, Vec<TypeEntry>) {
+        self.name_index().package_children(package)
     }
 
     /// The `.java` source for a fully-qualified type from a source archive, if
@@ -544,6 +587,117 @@ mod tests {
         let cp = Classpath::empty();
         assert!(cp.is_empty());
         assert!(cp.class("java.util.List").is_none());
+        assert!(cp.types_with_prefix("Array", 10).0.is_empty());
+        assert!(cp.package_children("").0.is_empty());
+    }
+
+    /// M7: the name index over a real JDK — type-name prefix search finds
+    /// `ArrayList`, package walking sees `java.util`'s children, and
+    /// JDK-internal namespaces never surface.
+    #[test]
+    fn name_index_from_real_jdk() {
+        let Some(cp) = jdk() else { return };
+        let (hits, _) = cp.types_with_prefix("ArrayLi", 50);
+        assert!(
+            hits.iter().any(|t| t.fqn == "java.util.ArrayList"),
+            "{hits:?}"
+        );
+
+        let (hits, _) = cp.types_with_prefix("Unsafe", 50);
+        assert!(
+            hits.iter()
+                .all(|t| !t.fqn.starts_with("sun.") && !t.fqn.starts_with("jdk.internal.")),
+            "internal namespaces leaked: {hits:?}"
+        );
+
+        let (subs, types) = cp.package_children("java.util");
+        assert!(subs.iter().any(|s| s == "stream"), "{subs:?}");
+        assert!(types.iter().any(|t| t.simple == "List"), "missing List");
+        let (roots, _) = cp.package_children("");
+        assert!(roots.iter().any(|s| s == "java"), "{roots:?}");
+
+        // Nested types are offered by inner simple name with a canonical
+        // (dot-separated) import path.
+        let (hits, _) = cp.types_with_prefix("Entry", 200);
+        let entry = hits
+            .iter()
+            .find(|t| t.fqn == "java.util.Map$Entry")
+            .expect("Map$Entry offered");
+        assert_eq!(entry.simple, "Entry");
+        assert_eq!(entry.import_path, "java.util.Map.Entry");
+    }
+
+    /// Minimal STORED-method zip: enough structure for `ZipArchive::open`.
+    /// Test-only — production reading stays hardened elsewhere.
+    fn stored_zip(entries: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for name in entries {
+            let offset = out.len() as u32;
+            let n = name.as_bytes();
+            // Local file header (empty content, method STORE).
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // ver/flags/method/time/date
+            out.extend_from_slice(&[0; 12]); // crc, comp, uncomp
+            out.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(n);
+            // Central directory record.
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            central.extend_from_slice(&[0; 12]); // crc, comp, uncomp
+            central.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 12]); // extra/comment/disk/attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(n);
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        // End of central directory.
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    /// M7 (user directive): dependency jars get full name-index IntelliSense
+    /// — including `com.sun.*` namespaces that the JDK-scoped filter would
+    /// hide if they came from a jmod.
+    #[test]
+    fn dependency_jar_types_are_indexed() {
+        let dir = std::env::temp_dir().join(format!("jvl-index-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar = dir.join("dep.jar");
+        std::fs::write(
+            &jar,
+            stored_zip(&[
+                "com/example/widgets/Widget.class",
+                "com/sun/jersey/api/Client.class",
+                "com/example/widgets/Widget$1.class",
+            ]),
+        )
+        .unwrap();
+
+        let mut cp = Classpath::empty();
+        cp.add_jar(&jar);
+        let (hits, _) = cp.types_with_prefix("Widg", 10);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].fqn, "com.example.widgets.Widget");
+        let (hits, _) = cp.types_with_prefix("Client", 10);
+        assert_eq!(
+            hits.first().map(|t| t.fqn.as_str()),
+            Some("com.sun.jersey.api.Client"),
+            "dependency com.sun.* must stay visible"
+        );
+        let (subs, types) = cp.package_children("com.example");
+        assert_eq!(subs, vec!["widgets".to_string()]);
+        assert!(types.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// M6.3: real JDK bytecode surfaces `<init>` methods as `Constructor`

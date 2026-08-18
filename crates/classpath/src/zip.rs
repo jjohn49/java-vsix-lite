@@ -71,6 +71,13 @@ impl ZipArchive {
         self.entries.contains_key(name)
     }
 
+    /// Every entry name in the central directory (arbitrary order — callers
+    /// sort). Names were already screened by [`parse_central_directory`]'s
+    /// traversal guards.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     /// The first entry whose name ends with `suffix` — used to find a
     /// module-prefixed source file (`java.base/java/util/List.java`) in src.zip.
     pub(crate) fn find_suffix(&self, suffix: &str) -> Option<String> {
