@@ -380,11 +380,24 @@ fn scope_items<'t>(
     // auto-import. Open-document types shadow same-named candidates (they
     // were pushed above; the candidate is skipped entirely so a stale
     // classpath twin can't appear alongside).
+    //
+    // `is_incomplete` is set unconditionally whenever this branch runs at
+    // all, not only when `MAX_CLASSPATH_TYPES` truncates — this is a
+    // deliberate signal to the client, not the literal LSP-spec meaning.
+    // VS Code treats an `isIncomplete: false` list as "stable, filter it
+    // yourself as I keep typing" and stops re-querying; with a classpath/
+    // dependency symbol table in the thousands, a client-side filter of one
+    // early (possibly narrow, possibly capped) response reliably buries or
+    // drops a genuine match as the prefix changes — precisely the
+    // real-world failure this fixes (confirmed empirically: the same query
+    // re-sent fresh, e.g. after a delete-and-retype forcing a new request,
+    // returns the correct merged list every time). Marking it incomplete
+    // forces a fresh request on every keystroke instead.
     let mut is_incomplete = false;
     let prefix = typed_prefix(doc.source, cursor);
     if prefix.len() >= MIN_TYPE_PREFIX {
-        let (candidates, truncated) = ctx.symbols.types_with_prefix(prefix, MAX_CLASSPATH_TYPES);
-        is_incomplete = truncated;
+        let (candidates, _truncated) = ctx.symbols.types_with_prefix(prefix, MAX_CLASSPATH_TYPES);
+        is_incomplete = true;
         let insertion = ImportInsertion::compute(doc, index);
         for c in &candidates {
             if ctx.table.get(&c.simple).is_some() {
@@ -1744,7 +1757,12 @@ mod tests {
             item.data,
             Some(json!({ "kind": "external_type", "fqn": "java.util.ArrayList" }))
         );
-        assert!(!result.is_incomplete);
+        // Deliberately always incomplete once a classpath/project query ran
+        // at all — see the doc comment on `scope_items`'s type-name branch:
+        // this forces the client to re-query fresh on every keystroke
+        // rather than client-side-filtering a stale response, which is what
+        // let a real match get buried/dropped in practice.
+        assert!(result.is_incomplete);
     }
 
     #[test]
@@ -1775,6 +1793,10 @@ mod tests {
         assert!(
             find_type(&result.items, "java.util.ArrayList").is_none(),
             "1-char prefix must not query the classpath"
+        );
+        assert!(
+            !result.is_incomplete,
+            "no classpath query ran, so nothing forces a re-query"
         );
     }
 
@@ -1844,11 +1866,19 @@ mod tests {
     }
 
     #[test]
-    fn truncated_candidate_set_marks_result_incomplete() {
+    fn result_is_incomplete_whether_or_not_the_candidate_set_was_truncated() {
+        // Not truncated...
+        let result = complete_full(
+            "class C { void m() { ArrayLi } }\n",
+            "ArrayLi",
+            &arraylist_symbols(),
+        );
+        assert!(result.is_incomplete);
+
+        // ...and truncated: both force a re-query, for the same reason.
         let mut symbols = arraylist_symbols();
         symbols.truncated = true;
-        let src = "class C { void m() { ArrayLi } }\n";
-        let result = complete_full(src, "ArrayLi", &symbols);
+        let result = complete_full("class C { void m() { ArrayLi } }\n", "ArrayLi", &symbols);
         assert!(result.is_incomplete);
     }
 
