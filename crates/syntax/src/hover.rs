@@ -141,8 +141,25 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
             "scoped_type_identifier" | "scoped_identifier" => {
                 let segments = named_children(parent);
                 if segments.len() >= 2 && segments.last() == Some(&name_node) {
-                    let resolved = resolve::resolve_receiver_type(segments[0], ctx)?;
-                    return member_target(&resolved, ctx, name);
+                    if let Some(resolved) = resolve::resolve_receiver_type(segments[0], ctx) {
+                        if let Some(target) = member_target(&resolved, ctx, name) {
+                            return Some(target);
+                        }
+                        // Not a member of the prefix — fall through: the
+                        // trailing segment may instead be a *nested class*
+                        // of it (`Map.Entry` in an import), which the
+                        // whole-path lookup below resolves via `$`.
+                    }
+                    // M7.5: treat the whole dotted path as a fully-qualified
+                    // type name (`import java.util.List;`,
+                    // `java.util.List<String> x`, `import java.util.Map.Entry;`),
+                    // nested classes via the `$`-substitution helper.
+                    let path = node_text(parent, ctx.doc.source)
+                        .split_whitespace()
+                        .collect::<String>();
+                    if let Some(fqn) = resolve::import_path_to_fqn(&path, ctx) {
+                        return external_type_target(&fqn, ctx);
+                    }
                 }
             }
             _ => {}
@@ -160,9 +177,32 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
     ) {
         return Some(Target::InProject(binding.decl_node, binding.source, None));
     }
-    ctx.table
-        .get(name)
-        .map(|td| Target::InProject(td.node, td.source, None))
+    if let Some(td) = ctx.table.get(name) {
+        return Some(Target::InProject(td.node, td.source, None));
+    }
+    // M7.5: a type name resolving through imports/`java.lang` to an
+    // external (JDK/dependency/closed-project-file) class — show its
+    // signature and type-level Javadoc instead of nothing.
+    let fqn = resolve::resolve_simple_to_fqn(name, ctx)?;
+    external_type_target(&fqn, ctx)
+}
+
+/// M7.5: hover content for an external type itself: `fqn<TypeParams>` as
+/// the signature line plus the type-level Javadoc (project sources, JDK
+/// `src.zip`, or dependency `-sources.jar`, whichever the symbol source
+/// finds). The declaration keyword (`class` vs `interface`) isn't modeled
+/// at signature level, so none is shown.
+fn external_type_target<'t>(fqn: &str, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
+    let class = ctx.symbols.class(fqn)?;
+    let params = if class.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", class.type_params.join(", "))
+    };
+    Some(Target::External(
+        format!("{fqn}{params}"),
+        ctx.symbols.doc(fqn, None),
+    ))
 }
 
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
@@ -505,6 +545,71 @@ mod tests {
         let text = hover_text(src, "go();").expect("hover");
         assert!(text.contains("Own doc."), "{text}");
         assert!(!text.contains("Base doc."), "{text}");
+    }
+
+    /// M7.5: hover on an *external* type — in the import line, as a bare
+    /// usage, and as a nested class — shows its signature (FQN + type
+    /// params) plus the type-level Javadoc.
+    #[test]
+    fn hover_on_imported_external_type_shows_signature_and_javadoc() {
+        struct Types;
+        impl SymbolSource for Types {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                match fqn {
+                    "java.util.List" => Some(ExternalClass {
+                        supers: Vec::new(),
+                        type_params: vec!["E".to_string()],
+                        members: Vec::new(),
+                    }),
+                    "java.util.Map" | "java.util.Map$Entry" => Some(ExternalClass {
+                        supers: Vec::new(),
+                        type_params: Vec::new(),
+                        members: Vec::new(),
+                    }),
+                    _ => None,
+                }
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (member.is_none() && fqn == "java.util.List")
+                    .then(|| "An ordered collection.".to_string())
+            }
+        }
+
+        let hover_with = |src: &str, marker: &str| -> Option<String> {
+            let tree = tree(src);
+            let docs = [OpenDoc {
+                source: src,
+                tree: &tree,
+            }];
+            let index = LineIndex::new(src, PositionEncoding::Utf16);
+            let at = src.find(marker).expect("marker");
+            let h = hover(&docs, 0, &index, index.position(at), &Types)?;
+            match h.contents {
+                HoverContents::Markup(m) => Some(m.value),
+                _ => None,
+            }
+        };
+
+        // In the import declaration itself.
+        let src = "import java.util.List;\nclass C { }\n";
+        let text = hover_with(src, "List;").expect("hover in import");
+        assert!(text.contains("java.util.List<E>"), "{text}");
+        assert!(text.contains("An ordered collection."), "{text}");
+
+        // On a bare usage of the imported name.
+        let src = "import java.util.List;\nclass C { List xs; }\n";
+        let text = hover_with(src, "List xs").expect("hover on usage");
+        assert!(text.contains("java.util.List<E>"), "{text}");
+        assert!(text.contains("An ordered collection."), "{text}");
+
+        // A nested class in an import resolves through `$` substitution.
+        let src = "import java.util.Map.Entry;\nclass C { }\n";
+        let text = hover_with(src, "Entry;").expect("hover on nested import");
+        assert!(text.contains("java.util.Map$Entry"), "{text}");
+
+        // An unknown name still hovers to nothing.
+        let src = "import no.such.Thing;\nclass C { }\n";
+        assert!(hover_with(src, "Thing;").is_none());
     }
 
     /// M7.5: the inherited-doc walk crosses into the external world — an

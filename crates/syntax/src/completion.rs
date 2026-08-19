@@ -621,7 +621,7 @@ fn import_items(source: &str, cursor: usize, ctx: &Ctx) -> Option<Vec<Completion
     // `parent` may instead be a *type* path (`java.util.Map` /
     // `java.util.Map.Entry`): offer its nested types and, for a static
     // import, its static members.
-    if let Some(fqn) = import_path_to_fqn(parent, ctx) {
+    if let Some(fqn) = resolve::import_path_to_fqn(parent, ctx) {
         let package = fqn.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
         let (_, siblings) = ctx.symbols.package_children(package);
         let nested_prefix = format!("{fqn}$");
@@ -671,24 +671,6 @@ fn import_items(source: &str, cursor: usize, ctx: &Ctx) -> Option<Vec<Completion
 
 fn starts_with_ci(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
-/// M7: an import path (`java.util.Map.Entry`) to the binary FQN
-/// (`java.util.Map$Entry`) — replace trailing dots with `$` until the symbol
-/// source recognizes the name.
-fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    let mut candidate = path.to_string();
-    for _ in 0..8 {
-        if ctx.symbols.class(&candidate).is_some() {
-            return Some(candidate);
-        }
-        let dot = candidate.rfind('.')?;
-        candidate.replace_range(dot..dot + 1, "$");
-    }
-    None
 }
 
 fn binding_item(binding: &Binding) -> CompletionItem {

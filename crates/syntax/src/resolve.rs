@@ -437,6 +437,25 @@ fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>
 }
 
 /// First import candidate FQN that the symbol source can actually resolve.
+/// M7: an import path (`java.util.Map.Entry`) to the binary FQN
+/// (`java.util.Map$Entry`) — replace trailing dots with `$` until the symbol
+/// source recognizes the name. Shared by import completion and (M7.5)
+/// hover-on-import.
+pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut candidate = path.to_string();
+    for _ in 0..8 {
+        if ctx.symbols.class(&candidate).is_some() {
+            return Some(candidate);
+        }
+        let dot = candidate.rfind('.')?;
+        candidate.replace_range(dot..dot + 1, "$");
+    }
+    None
+}
+
 /// `pub(crate)` (M7.5): also used by hover's inherited-Javadoc walk, which
 /// resolves a supertype simple name to ask the symbol source for the
 /// super's member doc.
