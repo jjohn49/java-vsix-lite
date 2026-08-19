@@ -381,23 +381,28 @@ fn scope_items<'t>(
     // were pushed above; the candidate is skipped entirely so a stale
     // classpath twin can't appear alongside).
     //
-    // `is_incomplete` is set unconditionally whenever this branch runs at
-    // all, not only when `MAX_CLASSPATH_TYPES` truncates — this is a
-    // deliberate signal to the client, not the literal LSP-spec meaning.
-    // VS Code treats an `isIncomplete: false` list as "stable, filter it
-    // yourself as I keep typing" and stops re-querying; with a classpath/
-    // dependency symbol table in the thousands, a client-side filter of one
-    // early (possibly narrow, possibly capped) response reliably buries or
-    // drops a genuine match as the prefix changes — precisely the
-    // real-world failure this fixes (confirmed empirically: the same query
-    // re-sent fresh, e.g. after a delete-and-retype forcing a new request,
-    // returns the correct merged list every time). Marking it incomplete
-    // forces a fresh request on every keystroke instead.
-    let mut is_incomplete = false;
+    // Every scope-completion result is `is_incomplete` — a deliberate
+    // signal to the client, not the literal LSP-spec meaning. VS Code
+    // treats an `isIncomplete: false` list as "stable, filter it yourself
+    // as I keep typing" and stops re-querying, and the scope candidate set
+    // genuinely changes with the typed prefix in BOTH regimes:
+    //
+    // - below `MIN_TYPE_PREFIX`, classpath/project types are deliberately
+    //   withheld — the word's very first (1-char) request marked complete
+    //   would freeze that classpath-less list for the whole word, which is
+    //   exactly the field-reported failure ("typing `person` only shows
+    //   the variable; forcing a fresh request via delete-and-retype shows
+    //   `Person` and the other classes too");
+    // - at or past it, the candidate list is a prefix-filtered (and
+    //   possibly capped) slice that a longer prefix re-ranks and refills.
+    //
+    // Member and import-path completion stay complete: their item sets
+    // only ever narrow under further typing, so client-side filtering is
+    // correct there.
+    let is_incomplete = true;
     let prefix = typed_prefix(doc.source, cursor);
     if prefix.len() >= MIN_TYPE_PREFIX {
         let (candidates, _truncated) = ctx.symbols.types_with_prefix(prefix, MAX_CLASSPATH_TYPES);
-        is_incomplete = true;
         let insertion = ImportInsertion::compute(doc, index);
         for c in &candidates {
             if ctx.table.get(&c.simple).is_some() {
@@ -1794,10 +1799,12 @@ mod tests {
             find_type(&result.items, "java.util.ArrayList").is_none(),
             "1-char prefix must not query the classpath"
         );
-        assert!(
-            !result.is_incomplete,
-            "no classpath query ran, so nothing forces a re-query"
-        );
+        // ...but the result must still be incomplete: the classpath types
+        // were *withheld*, not absent — the very next character brings them
+        // in, and a complete-marked 1-char response would freeze this
+        // classpath-less list for the rest of the word (the field-reported
+        // "typing `person` never shows `Person`" failure).
+        assert!(result.is_incomplete);
     }
 
     #[test]
