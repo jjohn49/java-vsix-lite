@@ -387,7 +387,13 @@ pub(crate) fn javadoc(decl: Node, source: &str) -> Option<String> {
             "line_comment" => sib = s.prev_sibling(),
             "block_comment" => {
                 let text = node_text(s, source);
-                return text.starts_with("/**").then(|| strip_javadoc(text));
+                // M7.5: a comment that renders to nothing — empty, or only
+                // `{@inheritDoc}` (which the renderer drops) — reports no
+                // doc, so callers fall through to inherited-doc lookup.
+                return text
+                    .starts_with("/**")
+                    .then(|| strip_javadoc(text))
+                    .filter(|rendered| !rendered.is_empty());
             }
             _ => return None,
         }

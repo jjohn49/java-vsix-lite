@@ -437,7 +437,10 @@ fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>
 }
 
 /// First import candidate FQN that the symbol source can actually resolve.
-fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
+/// `pub(crate)` (M7.5): also used by hover's inherited-Javadoc walk, which
+/// resolves a supertype simple name to ask the symbol source for the
+/// super's member doc.
+pub(crate) fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
     ctx.imports
         .candidates(simple)
         .into_iter()

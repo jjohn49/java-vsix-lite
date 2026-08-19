@@ -7,7 +7,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::external::{ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
-use crate::model::{named_children, TypeTable};
+use crate::model::{named_children, TypeDecl, TypeTable};
 use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
 use crate::signature::{javadoc, param_count_in_label, param_labels, signature};
 use crate::{node_text, LineIndex, OpenDoc};
@@ -16,7 +16,10 @@ use crate::{node_text, LineIndex, OpenDoc};
 /// tree), or an external member's pre-rendered signature (no Javadoc — JDK/jar
 /// bytecode carries none).
 enum Target<'t> {
-    InProject(Node<'t>, &'t str),
+    /// A declaration node + its source, plus (M7.5) an inherited-Javadoc
+    /// fallback used when the node carries no rendered doc of its own —
+    /// `{@inheritDoc}` and doc-less overrides show the supertype's doc.
+    InProject(Node<'t>, &'t str, Option<String>),
     /// A pre-rendered external signature plus optional Javadoc.
     External(String, Option<String>),
 }
@@ -44,10 +47,10 @@ pub fn hover(
 
     let name_node = identifier_at(doc.tree, cursor)?;
     let value = match resolve_target(name_node, &ctx)? {
-        Target::InProject(node, source) => {
+        Target::InProject(node, source, inherited_doc) => {
             let sig = signature(node, source)?;
             let mut value = format!("```java\n{sig}\n```");
-            if let Some(doc_text) = javadoc(node, source) {
+            if let Some(doc_text) = javadoc(node, source).or(inherited_doc) {
                 value.push_str("\n\n");
                 value.push_str(&doc_text);
             }
@@ -104,7 +107,13 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
 
     if let Some(parent) = name_node.parent() {
         if is_decl_name(parent, name_node) {
-            return Some(Target::InProject(parent, ctx.doc.source));
+            // An overriding method declared without its own doc (or with
+            // only `{@inheritDoc}`) inherits the supertype's.
+            let inherited = (parent.kind() == "method_declaration"
+                && javadoc(parent, ctx.doc.source).is_none())
+            .then(|| inherited_member_doc(parent, ctx.doc.source, ctx, name))
+            .flatten();
+            return Some(Target::InProject(parent, ctx.doc.source, inherited));
         }
         match parent.kind() {
             "field_access" if field_is(parent, "field", name_node) => {
@@ -149,23 +158,29 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
         ctx.table,
         ctx.current,
     ) {
-        return Some(Target::InProject(binding.decl_node, binding.source));
+        return Some(Target::InProject(binding.decl_node, binding.source, None));
     }
     ctx.table
         .get(name)
-        .map(|td| Target::InProject(td.node, td.source))
+        .map(|td| Target::InProject(td.node, td.source, None))
 }
 
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     match &resolved.ty {
-        ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source)),
+        ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source, None)),
         ResolvedType::External { .. } | ResolvedType::Array { .. } => None,
     }
 }
 
 fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> Option<Target<'t>> {
     match resolve::find_member_hier(resolved, ctx, name)? {
-        HierMember::InProject(m) => Some(Target::InProject(m.node, m.source)),
+        HierMember::InProject(m) => {
+            let inherited = javadoc(m.node, m.source)
+                .is_none()
+                .then(|| inherited_member_doc(m.node, m.source, ctx, name))
+                .flatten();
+            Some(Target::InProject(m.node, m.source, inherited))
+        }
         HierMember::External(m) => {
             // Javadoc only when the receiver itself is external (we have its FQN).
             let doc = match &resolved.ty {
@@ -175,6 +190,46 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
             Some(Target::External(m.signature, doc))
         }
     }
+}
+
+/// M7.5: the Javadoc a member would *inherit* — walk the declaring type's
+/// supertype chain, open documents and external symbols alike, for a
+/// same-named member's doc; first hit wins. The external branch delegates
+/// to [`SymbolSource::doc`], which continues the walk within its own world
+/// (`ClasspathSymbols` climbs bytecode supers; the server's combined layer
+/// crosses the project/classpath boundary). Depth-capped: a hostile
+/// hierarchy must not stall a hover.
+fn inherited_member_doc(
+    member_node: Node,
+    member_source: &str,
+    ctx: &Ctx,
+    name: &str,
+) -> Option<String> {
+    let type_node = resolve::enclosing_type_node(member_node)?;
+    // Document index 0 is a placeholder — nothing below reads decl sites.
+    let td = TypeDecl::from_node(type_node, member_source, 0)?;
+    let mut queue: Vec<&str> = td.supers.clone();
+    let mut budget = 32usize;
+    while let Some(simple) = queue.pop() {
+        if budget == 0 {
+            return None;
+        }
+        budget -= 1;
+        if let Some(sd) = ctx.table.get(simple) {
+            if let Some(m) = sd.own_members().into_iter().find(|m| m.name == name) {
+                if let Some(doc) = javadoc(m.node, m.source) {
+                    return Some(doc);
+                }
+            }
+            let supers: Vec<&str> = sd.supers.clone();
+            queue.extend(supers);
+        } else if let Some(fqn) = resolve::resolve_simple_to_fqn(simple, ctx) {
+            if let Some(doc) = ctx.symbols.doc(&fqn, Some(name)) {
+                return Some(doc);
+            }
+        }
+    }
+    None
 }
 
 /// Walk up from `name_node` through the type-node shapes that can wrap a
@@ -420,6 +475,79 @@ mod tests {
         );
         assert!(text.contains("**Returns:** the greeting"), "{text}");
         assert!(!text.contains("@param"), "raw tag leaked: {text}");
+    }
+
+    /// M7.5: an override with no doc of its own — or only `{@inheritDoc}` —
+    /// inherits the supertype's Javadoc, at both the call site and the
+    /// declaration name.
+    #[test]
+    fn hover_inherits_javadoc_from_in_project_supertype() {
+        let src = "class Base { /** Runs the base behavior. */ void go() {} }\n\
+                   class Sub extends Base { @Override void go() {} }\n\
+                   class C { void m() { Sub s; s.go(); } }\n";
+        let text = hover_text(src, "go();").expect("hover");
+        assert!(text.contains("Runs the base behavior."), "{text}");
+
+        let src = "class Base { /** Runs it. */ void go() {} }\n\
+                   class Sub extends Base { /** {@inheritDoc} */ void go() {} }\n\
+                   class C { void m() { Sub s; s.go(); } }\n";
+        let text = hover_text(src, "go();").expect("hover");
+        assert!(text.contains("Runs it."), "inheritDoc-only: {text}");
+
+        // Hover on the overriding declaration itself inherits too.
+        let text = hover_text(src, "go() {} }\nclass C").expect("hover");
+        assert!(text.contains("Runs it."), "decl name: {text}");
+
+        // A method with its OWN doc never shows the super's.
+        let src = "class Base { /** Base doc. */ void go() {} }\n\
+                   class Sub extends Base { /** Own doc. */ void go() {} }\n\
+                   class C { void m() { Sub s; s.go(); } }\n";
+        let text = hover_text(src, "go();").expect("hover");
+        assert!(text.contains("Own doc."), "{text}");
+        assert!(!text.contains("Base doc."), "{text}");
+    }
+
+    /// M7.5: the inherited-doc walk crosses into the external world — an
+    /// undocumented override of a JDK/dependency method asks the symbol
+    /// source for the supertype member's doc.
+    #[test]
+    fn hover_inherits_javadoc_from_external_supertype() {
+        struct DocSource;
+        impl SymbolSource for DocSource {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                (fqn == "java.lang.Runnable").then(|| ExternalClass {
+                    supers: Vec::new(),
+                    type_params: Vec::new(),
+                    members: vec![ExternalMember {
+                        name: "run".to_string(),
+                        kind: ExternalMemberKind::Method,
+                        signature: "void run()".to_string(),
+                        template: None,
+                        is_static: false,
+                        ret_fqn: None,
+                        ret_display: None,
+                    }],
+                })
+            }
+            fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+                (fqn == "java.lang.Runnable" && member == Some("run"))
+                    .then(|| "Runs the task.".to_string())
+            }
+        }
+        let src = "class Task implements Runnable { public void run() {} }\n\
+                   class C { void m() { Task t; t.run(); } }\n";
+        let tree = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &tree,
+        }];
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let at = src.find("run();").expect("marker");
+        let h = hover(&docs, 0, &index, index.position(at), &DocSource).expect("hover");
+        let HoverContents::Markup(m) = h.contents else {
+            panic!("markup expected");
+        };
+        assert!(m.value.contains("Runs the task."), "{}", m.value);
     }
 
     #[test]

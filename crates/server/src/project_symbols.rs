@@ -143,8 +143,37 @@ impl<P: SymbolSource, C: SymbolSource> SymbolSource for CombinedSymbols<P, C> {
         }
     }
 
+    /// M7.5: member docs inherit across the project/classpath boundary — a
+    /// project class overriding a JDK/dependency method (or vice versa)
+    /// shows the supertype's Javadoc when its own layer has none. Each
+    /// layer's own `doc` may walk supers *within* its world
+    /// (`ClasspathSymbols` does); this walk is what carries the lookup
+    /// *between* worlds. Bounded + cycle-guarded.
     fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
-        self.0.doc(fqn, member).or_else(|| self.1.doc(fqn, member))
+        if let Some(direct) = self.0.doc(fqn, member).or_else(|| self.1.doc(fqn, member)) {
+            return Some(direct);
+        }
+        let member = member?; // type-level docs never inherit
+        let mut queue = self.class(fqn)?.supers;
+        let mut visited = std::collections::HashSet::new();
+        let mut budget = 64usize;
+        while let Some(super_fqn) = queue.pop() {
+            if budget == 0 || !visited.insert(super_fqn.clone()) {
+                continue;
+            }
+            budget -= 1;
+            if let Some(doc) = self
+                .0
+                .doc(&super_fqn, Some(member))
+                .or_else(|| self.1.doc(&super_fqn, Some(member)))
+            {
+                return Some(doc);
+            }
+            if let Some(class) = self.class(&super_fqn) {
+                queue.extend(class.supers);
+            }
+        }
+        None
     }
 
     fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeCandidate>, bool) {
@@ -168,5 +197,76 @@ impl<P: SymbolSource, C: SymbolSource> SymbolSource for CombinedSymbols<P, C> {
         let seen: std::collections::HashSet<String> = types.iter().map(|c| c.fqn.clone()).collect();
         types.extend(more_types.into_iter().filter(|c| !seen.contains(&c.fqn)));
         (subpackages, types)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A layer with fixed classes and member docs, standing in for either
+    /// side of the combined source.
+    struct Stub {
+        classes: Vec<(&'static str, Vec<&'static str>)>, // (fqn, supers)
+        docs: Vec<((&'static str, &'static str), &'static str)>,
+    }
+
+    impl SymbolSource for Stub {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            self.classes
+                .iter()
+                .find(|(f, _)| *f == fqn)
+                .map(|(_, supers)| ExternalClass {
+                    supers: supers.iter().map(|s| s.to_string()).collect(),
+                    type_params: Vec::new(),
+                    members: Vec::new(),
+                })
+        }
+        fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
+            let member = member?;
+            self.docs
+                .iter()
+                .find(|((f, m), _)| *f == fqn && *m == member)
+                .map(|(_, d)| (*d).to_string())
+        }
+    }
+
+    /// M7.5: a project class overriding a classpath method inherits the
+    /// classpath supertype's member doc — the walk crosses layer worlds.
+    #[test]
+    fn combined_doc_walks_supers_across_layers() {
+        let project = Stub {
+            classes: vec![("demo.Task", vec!["java.lang.Runnable"])],
+            docs: vec![],
+        };
+        let classpath = Stub {
+            classes: vec![("java.lang.Runnable", vec![])],
+            docs: vec![(("java.lang.Runnable", "run"), "Runs the task.")],
+        };
+        let combined = CombinedSymbols(project, classpath);
+        assert_eq!(
+            combined.doc("demo.Task", Some("run")).as_deref(),
+            Some("Runs the task.")
+        );
+        // Type-level docs never inherit.
+        assert_eq!(combined.doc("demo.Task", None), None);
+        // A miss everywhere stays a miss (bounded, no panic).
+        assert_eq!(combined.doc("demo.Task", Some("nope")), None);
+        assert_eq!(combined.doc("no.such.Type", Some("run")), None);
+    }
+
+    /// A supertype cycle must terminate (visited set + budget).
+    #[test]
+    fn combined_doc_survives_supertype_cycles() {
+        let project = Stub {
+            classes: vec![("a.A", vec!["b.B"]), ("b.B", vec!["a.A"])],
+            docs: vec![],
+        };
+        let classpath = Stub {
+            classes: vec![],
+            docs: vec![],
+        };
+        let combined = CombinedSymbols(project, classpath);
+        assert_eq!(combined.doc("a.A", Some("m")), None);
     }
 }

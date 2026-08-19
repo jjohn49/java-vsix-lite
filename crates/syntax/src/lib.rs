@@ -532,6 +532,12 @@ fn selection_range_at(tree: &Tree, index: &LineIndex, position: Position) -> Sel
 // [`semantic_token_types`], which the server passes to the client as the legend.
 const TT_TYPE: u32 = 0;
 const TT_METHOD: u32 = 1;
+/// M7.5: deliberately no longer emitted — kept in the legend so the other
+/// indices stay stable. Parameters are classified [`TT_VARIABLE`] instead:
+/// several popular themes style the `parameter` semantic token greyed/italic,
+/// which users read as "unused", and the parameter/variable distinction isn't
+/// worth that confusion (user directive).
+#[allow(dead_code)]
 const TT_PARAMETER: u32 = 2;
 const TT_PROPERTY: u32 = 3;
 const TT_VARIABLE: u32 = 4;
@@ -584,8 +590,9 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
             "method_declaration" | "method_invocation" => {
                 emit_named(node, "name", TT_METHOD, index, &mut raw)
             }
+            // Parameters classify as plain variables — see [`TT_PARAMETER`].
             "formal_parameter" | "spread_parameter" | "catch_formal_parameter" => {
-                emit_named(node, "name", TT_PARAMETER, index, &mut raw)
+                emit_named(node, "name", TT_VARIABLE, index, &mut raw)
             }
             "enhanced_for_statement" => emit_named(node, "name", TT_VARIABLE, index, &mut raw),
             "variable_declarator" => {
@@ -604,14 +611,23 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
                     }
                 }
             }
-            "package_declaration" => emit_namespace_path(node, false, index, &mut raw),
-            "import_declaration" => emit_namespace_path(node, true, index, &mut raw),
+            "package_declaration" => emit_namespace_path(node, false, source, index, &mut raw),
+            "import_declaration" => emit_namespace_path(node, true, source, index, &mut raw),
             // A plain identifier *usage* (not a declaration name handled above):
             // classify it from the file's declared names so references are lit.
             "identifier" => {
                 if !is_classified_elsewhere(node) {
-                    if let Some(&token_type) = roles.get(node_text(node, source)) {
+                    let text = node_text(node, source);
+                    if let Some(&token_type) = roles.get(text) {
                         emit(node, token_type, index, &mut raw);
+                    } else if looks_like_type_name(text) {
+                        // M7.5: an undeclared, type-cased name (`Math` in
+                        // `Math.abs()`, `Person` in an expression) is a type
+                        // reference by Java convention — without this it
+                        // falls to TextMate's variable color (user report:
+                        // "Math turns light blue"). SCREAMING_CASE constants
+                        // don't match (no lowercase char) and stay untouched.
+                        emit(node, TT_TYPE, index, &mut raw);
                     }
                 }
             }
@@ -646,9 +662,10 @@ fn declared_roles<'t>(tree: &'t Tree, source: &'t str) -> HashMap<&'t str, u32> 
                     );
                 }
             }
+            // Parameters classify as plain variables — see [`TT_PARAMETER`].
             "formal_parameter" | "catch_formal_parameter" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    roles.insert(node_text(name, source), TT_PARAMETER);
+                    roles.insert(node_text(name, source), TT_VARIABLE);
                 }
             }
             "enhanced_for_statement" => {
@@ -692,22 +709,48 @@ fn is_classified_elsewhere(node: Node) -> bool {
     }
 }
 
-/// Emit namespace tokens for the dotted segments of a `package`/`import` path.
-/// For an import, the final segment is the imported type (unless it is a `*`
-/// wildcard), so it gets a type token instead.
-fn emit_namespace_path(node: Node, is_import: bool, index: &LineIndex, out: &mut Vec<RawToken>) {
+/// Emit tokens for the dotted segments of a `package`/`import` path. A
+/// `package` header's segments are namespaces. An `import`'s segments are
+/// ALL type tokens (M7.5, user directive: the whole imported path colors
+/// like the class, not just its final segment) — except a static import's
+/// final lowercase segment, which is the imported *member* and gets a
+/// method token.
+fn emit_namespace_path(
+    node: Node,
+    is_import: bool,
+    source: &str,
+    index: &LineIndex,
+    out: &mut Vec<RawToken>,
+) {
     let mut ids = Vec::new();
     collect_identifiers(node, &mut ids);
-    let wildcard = is_import && has_child_kind(node, "asterisk");
+    if !is_import {
+        for id in &ids {
+            emit(*id, TT_NAMESPACE, index, out);
+        }
+        return;
+    }
+    let is_static = has_child_kind(node, "static");
     let last = ids.len().saturating_sub(1);
     for (i, id) in ids.iter().enumerate() {
-        let token_type = if is_import && !wildcard && i == last {
-            TT_TYPE
+        let text = node_text(*id, source);
+        let token_type = if is_static
+            && i == last
+            && text.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        {
+            TT_METHOD
         } else {
-            TT_NAMESPACE
+            TT_TYPE
         };
         emit(*id, token_type, index, out);
     }
+}
+
+/// Type-cased by Java convention: starts uppercase and contains at least one
+/// lowercase character (so `Math`/`Person` match, `MAX_VALUE` doesn't).
+fn looks_like_type_name(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && text.chars().any(|c| c.is_ascii_lowercase())
 }
 
 fn collect_identifiers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
@@ -1035,7 +1078,8 @@ mod tests {
             "field: {labeled:?}"
         );
         assert!(labeled.contains(&("m", TT_METHOD)), "method: {labeled:?}");
-        assert!(labeled.contains(&("p", TT_PARAMETER)), "param: {labeled:?}");
+        // Parameters classify as variables — see `TT_PARAMETER`'s doc.
+        assert!(labeled.contains(&("p", TT_VARIABLE)), "param: {labeled:?}");
         // `int` is a primitive (left to TextMate), not emitted as a type token.
         assert!(
             !labeled.contains(&("int", TT_TYPE)),
@@ -1079,12 +1123,73 @@ mod tests {
             "package: {labeled:?}"
         );
         assert!(
-            labeled.contains(&("p", TT_PARAMETER)),
+            labeled.contains(&("p", TT_VARIABLE)),
             "param usage: {labeled:?}"
         );
         assert!(
             labeled.contains(&("field", TT_PROPERTY)),
             "field usage: {labeled:?}"
+        );
+    }
+
+    /// M7.5: an undeclared type-cased receiver (`Math.abs()`) is a type
+    /// token, never left for TextMate's variable color; SCREAMING_CASE and
+    /// unknown lowercase names stay unclassified.
+    #[test]
+    fn semantic_tokens_static_receiver_is_a_type() {
+        let src = "class A { void m() { Math.abs(1); use(MAX_LIMIT); } }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let decoded = decode_line0(&semantic_tokens(&tree, src, &index));
+        let labeled: Vec<(&str, u32)> = decoded
+            .iter()
+            .map(|&(ch, len, tt)| (&src[ch as usize..(ch + len) as usize], tt))
+            .collect();
+        assert!(
+            labeled.contains(&("Math", TT_TYPE)),
+            "static receiver: {labeled:?}"
+        );
+        assert!(labeled.contains(&("abs", TT_METHOD)), "{labeled:?}");
+        assert!(
+            !labeled.iter().any(|(text, _)| *text == "MAX_LIMIT"),
+            "constants left to TextMate: {labeled:?}"
+        );
+    }
+
+    /// M7.5: every segment of an import path is a type token (user
+    /// directive: the whole path colors like the class); a static import's
+    /// lowercase member segment is a method token; package headers keep
+    /// namespace tokens.
+    #[test]
+    fn semantic_tokens_import_paths_are_type_colored() {
+        let src = "import java.util.List;\nimport static java.lang.Math.abs;\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let data = semantic_tokens(&tree, src, &index);
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let (mut line, mut ch) = (0u32, 0u32);
+        let mut labeled: Vec<(&str, u32)> = Vec::new();
+        for t in &data {
+            if t.delta_line != 0 {
+                line += t.delta_line;
+                ch = t.delta_start;
+            } else {
+                ch += t.delta_start;
+            }
+            let start = line_starts[line as usize] + ch as usize;
+            labeled.push((&src[start..start + t.length as usize], t.token_type));
+        }
+        for segment in ["java", "util", "List", "lang", "Math"] {
+            assert!(
+                labeled.contains(&(segment, TT_TYPE)),
+                "{segment}: {labeled:?}"
+            );
+        }
+        assert!(
+            labeled.contains(&("abs", TT_METHOD)),
+            "static member: {labeled:?}"
         );
     }
 }
