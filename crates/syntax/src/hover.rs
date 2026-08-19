@@ -399,6 +399,29 @@ mod tests {
         assert!(text.contains("the user's name"), "{text}");
     }
 
+    /// M7.5: Javadoc block/inline tags reach the hover as rendered Markdown
+    /// sections, not raw `@param` tag soup.
+    #[test]
+    fn hover_renders_javadoc_tags_as_markdown() {
+        let src = "class C {\n\
+                   /**\n\
+                   \u{20}* Greets a person.\n\
+                   \u{20}*\n\
+                   \u{20}* @param name who to greet, never {@code null}\n\
+                   \u{20}* @return the greeting\n\
+                   \u{20}*/\n\
+                   String greet(String name) { return name; }\n\
+                   void m() { greet(\"x\"); } }\n";
+        let text = hover_text(src, "greet(\"x\"").expect("hover");
+        assert!(text.contains("**Parameters:**"), "{text}");
+        assert!(
+            text.contains("- `name` — who to greet, never `null`"),
+            "{text}"
+        );
+        assert!(text.contains("**Returns:** the greeting"), "{text}");
+        assert!(!text.contains("@param"), "raw tag leaked: {text}");
+    }
+
     #[test]
     fn hover_on_local_reference() {
         let src = "class C { void m() { int count = 0; count++; } }\n";

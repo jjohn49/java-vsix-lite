@@ -36,6 +36,7 @@ mod external;
 mod hover;
 mod implementation;
 mod imports;
+mod jdoc;
 mod model;
 mod references;
 mod rename;

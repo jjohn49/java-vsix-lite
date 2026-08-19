@@ -401,7 +401,7 @@ fn strip_javadoc(raw: &str) -> String {
         .unwrap_or(raw)
         .strip_suffix("*/")
         .unwrap_or(raw);
-    inner
+    let cleaned = inner
         .lines()
         .map(|line| {
             let t = line.trim_start();
@@ -411,7 +411,12 @@ fn strip_javadoc(raw: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
-        .to_string()
+        .to_string();
+    // M7.5: render Javadoc block/inline tags and the common HTML subset as
+    // Markdown — this is the single choke point every doc surface funnels
+    // through (hover, completion resolve, closed project files via
+    // `docsrc::javadoc_in_source`, JDK `src.zip`, dependency sources jars).
+    crate::jdoc::render_markdown(&cleaned)
 }
 
 #[cfg(test)]

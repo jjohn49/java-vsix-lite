@@ -1624,6 +1624,37 @@ mod tests {
         );
     }
 
+    /// A field's *declared* type drives completion — whether or not any
+    /// constructor (or initializer) ever assigns it, and whether it's
+    /// reached bare, via `this.`, or through a generic container type.
+    /// (User-reported concern re: an uninitialized `byName` map field.)
+    #[test]
+    fn uninitialized_field_completes_from_declared_type() {
+        let src = "import java.util.Map;\n\
+                   class Repo {\n\
+                   private Map<String, String> byName;\n\
+                   void m() { byName.x; }\n\
+                   void n() { this.byName.x; }\n\
+                   }\n";
+        let symbols = mock(vec![(
+            "java.util.Map",
+            ext_generic_class(
+                &["K", "V"],
+                &[],
+                vec![ext_generic_method(
+                    "get",
+                    "Object get(Object)",
+                    "{1} get({0})",
+                )],
+            ),
+        )]);
+        let items = complete_ext(src, "{ byName.", &symbols);
+        assert!(has(&items, "get"), "bare field: {:?}", labels(&items));
+        assert_eq!(detail_of(&items, "get"), Some("String get(String)"));
+        let items = complete_ext(src, "this.byName.", &symbols);
+        assert!(has(&items, "get"), "via this.: {:?}", labels(&items));
+    }
+
     #[test]
     fn nested_class_static_walk() {
         let src = "import java.util.Map;\n\
