@@ -41,6 +41,38 @@ export interface Coordinate {
 
 export const MAVEN_CENTRAL_BASE = "https://repo.maven.apache.org/maven2";
 
+/**
+ * M8f (Foundry): validate + normalize a user/machine-configured repository
+ * base URL (an internal Maven proxy, e.g. Artifactory/Nexus). Empty input
+ * means Maven Central. Fail-closed: anything that isn't a clean `https:`
+ * URL — wrong scheme, embedded credentials, query, fragment — returns
+ * `undefined` and the caller must refuse to download, never fall back
+ * silently. Trailing slashes are stripped so path joining stays uniform.
+ */
+export function normalizeRepositoryBase(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return MAVEN_CENTRAL_BASE;
+  }
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    return undefined;
+  }
+  const base = url.origin + url.pathname.replace(/\/+$/, "");
+  return base;
+}
+
 /** Checksum sidecars, tried in preference order (strongest first). */
 const CHECKSUM_ALGOS: ReadonlyArray<{ ext: string; algo: string }> = [
   { ext: "sha512", algo: "sha512" },
@@ -112,9 +144,13 @@ function groupPath(group: string): string {
   return group.split(".").join("/");
 }
 
-/** `https://repo.maven.apache.org/maven2/<g-path>/<a>/<v>/<a>-<v>.<ext>`. */
-export function artifactFileUrl(coord: Coordinate, ext: "pom" | "jar"): string {
-  return `${MAVEN_CENTRAL_BASE}/${groupPath(coord.group)}/${coord.artifact}/${coord.version}/${coord.artifact}-${coord.version}.${ext}`;
+/** `<repoBase>/<g-path>/<a>/<v>/<a>-<v>.<ext>`. */
+export function artifactFileUrl(
+  coord: Coordinate,
+  ext: "pom" | "jar",
+  repoBase: string = MAVEN_CENTRAL_BASE,
+): string {
+  return `${repoBase}/${groupPath(coord.group)}/${coord.artifact}/${coord.version}/${coord.artifact}-${coord.version}.${ext}`;
 }
 
 /**
@@ -200,8 +236,9 @@ export async function fetchVerifiedFile(
   coord: Coordinate,
   ext: "pom" | "jar",
   maxBytes: number,
+  repoBase: string = MAVEN_CENTRAL_BASE,
 ): Promise<VerifiedFile> {
-  const fileUrl = artifactFileUrl(coord, ext);
+  const fileUrl = artifactFileUrl(coord, ext, repoBase);
   const data = await httpsGetBuffer(fileUrl, maxBytes);
   for (const { ext: checksumExt, algo } of CHECKSUM_ALGOS) {
     let checksumText: string;
@@ -265,9 +302,9 @@ export type FetchOutcome =
 function classifyError(err: unknown): string {
   if (err instanceof HttpStatusError) {
     if (err.statusCode === 404) {
-      return "not found on Maven Central — may require a custom repository (not supported yet)";
+      return "not found in the configured repository";
     }
-    return `Maven Central returned HTTP ${err.statusCode}`;
+    return `the repository returned HTTP ${err.statusCode}`;
   }
   if (err instanceof NoChecksumError || err instanceof ChecksumMismatchError) {
     return err.message;
@@ -291,6 +328,7 @@ export async function fetchAndInstallArtifact(
   coord: Coordinate,
   m2Root: string,
   remainingBytesBudget: number,
+  repoBase: string = MAVEN_CENTRAL_BASE,
 ): Promise<FetchOutcome> {
   if (!isSafeCoordinate(coord)) {
     return {
@@ -300,7 +338,7 @@ export async function fetchAndInstallArtifact(
     };
   }
   try {
-    const pom = await fetchVerifiedFile(coord, "pom", remainingBytesBudget);
+    const pom = await fetchVerifiedFile(coord, "pom", remainingBytesBudget, repoBase);
     const jarBudget = remainingBytesBudget - pom.data.length;
     if (jarBudget <= 0) {
       return {
@@ -309,7 +347,7 @@ export async function fetchAndInstallArtifact(
         reason: "would exceed this invocation's download size cap",
       };
     }
-    const jar = await fetchVerifiedFile(coord, "jar", jarBudget);
+    const jar = await fetchVerifiedFile(coord, "jar", jarBudget, repoBase);
     // Only now, with both verified, install both — see the doc comment above.
     await installVerifiedFile(m2FilePath(m2Root, coord, "pom"), pom.data);
     await installVerifiedFile(m2FilePath(m2Root, coord, "jar"), jar.data);

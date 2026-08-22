@@ -74,6 +74,12 @@
           "default": true,
           "markdownDescription": "Run `Check Project (javac)` automatically when the project loads and after saving a Java file (M8b), publishing real compiler errors to Problems. Debounced, one run at a time, and silent (no pop-ups — results land in Problems only). Only active in a **trusted** workspace, because it spawns the JDK's `javac`; in an untrusted workspace saves never trigger it. Uses the same JDK resolution and timeout as the manual command."
         },
+        "java-vsix-lite.dependencies.repository": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Base URL of the Maven repository to download missing dependencies from (M8f), e.g. an internal Artifactory/Nexus proxy in a governed network: `https://artifacts.example.com/maven2`. Empty means Maven Central. Must be a plain `https://` URL — no credentials, query, or fragment; anything else disables downloads rather than silently falling back. **Machine-scoped on purpose**: a workspace (repository) must never be able to redirect where your dependency downloads come from. Checksum sidecar verification applies to any repository, unchanged."
+        },
         "java-vsix-lite.dependencies.autoDownload": {
           "type": "string",
           "enum": ["prompt", "always", "never"],

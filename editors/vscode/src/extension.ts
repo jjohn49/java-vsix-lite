@@ -534,11 +534,15 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
     return;
   }
 
-  if (!(await confirmDownloadConsent(initial))) {
+  const repo = configuredRepository();
+  if (repo === undefined) {
+    return; // invalid setting — refuse, never fall back to Central silently
+  }
+  if (!(await confirmDownloadConsent(initial, repo.host))) {
     return;
   }
 
-  await startDownloadProgress(activeClient, initial);
+  await startDownloadProgress(activeClient, initial, repo.base);
 }
 
 /**
@@ -551,6 +555,7 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
 async function startDownloadProgress(
   activeClient: LanguageClient,
   initial: MissingDependenciesResult,
+  repoBase: string,
 ): Promise<void> {
   await vscode.window.withProgress(
     {
@@ -558,7 +563,7 @@ async function startDownloadProgress(
       title: "java-vsix-lite: downloading dependencies",
       cancellable: true,
     },
-    (progress, token) => runDownloadLoop(activeClient, initial, progress, token),
+    (progress, token) => runDownloadLoop(activeClient, initial, progress, token, repoBase),
   );
 }
 
@@ -621,10 +626,15 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
     return;
   }
 
+  const repo = configuredRepository();
+  if (repo === undefined) {
+    return; // invalid repository setting — the error message already showed
+  }
+
   if (setting === "always") {
     downloadInFlight = true;
     try {
-      await startDownloadProgress(activeClient, initial);
+      await startDownloadProgress(activeClient, initial, repo.base);
     } finally {
       downloadInFlight = false;
     }
@@ -638,7 +648,7 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
   // next session rather than silently deciding "never".
   const count = initial.missing.length;
   const choice = await vscode.window.showInformationMessage(
-    `java-vsix-lite: ${count} missing dependenc${count === 1 ? "y" : "ies"} can be downloaded from Maven Central.`,
+    `java-vsix-lite: ${count} missing dependenc${count === 1 ? "y" : "ies"} can be downloaded from ${repo.host}.`,
     "Download",
     "Always for this workspace",
     "Never",
@@ -655,10 +665,33 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
   }
   downloadInFlight = true;
   try {
-    await startDownloadProgress(activeClient, initial);
+    await startDownloadProgress(activeClient, initial, repo.base);
   } finally {
     downloadInFlight = false;
   }
+}
+
+/**
+ * M8f (Foundry): the effective download repository. Read from the
+ * machine-scoped `dependencies.repository` setting (an internal Maven proxy
+ * for governed networks); empty means Maven Central. `undefined` means the
+ * configured value is invalid (non-HTTPS, credentials, query/fragment) —
+ * callers must refuse to download, with the message below, never fall back
+ * to Central silently (the user's intent was clearly "not the internet").
+ */
+function configuredRepository(): { base: string; host: string } | undefined {
+  const raw = vscode.workspace
+    .getConfiguration("java-vsix-lite")
+    .get<string>("dependencies.repository", "");
+  const base = mavenFetch.normalizeRepositoryBase(raw);
+  if (base === undefined) {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: the java-vsix-lite.dependencies.repository setting must be a plain https:// URL " +
+        "(no credentials, query, or fragment). Downloads are disabled until it is fixed or cleared.",
+    );
+    return undefined;
+  }
+  return { base, host: new URL(base).host };
 }
 
 /**
@@ -667,7 +700,10 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
  * transitives may follow under this same consent. Cancel (or dismissing the
  * dialog) does nothing — only the "Download" choice proceeds.
  */
-async function confirmDownloadConsent(initial: MissingDependenciesResult): Promise<boolean> {
+async function confirmDownloadConsent(
+  initial: MissingDependenciesResult,
+  repoHost: string,
+): Promise<boolean> {
   const shown = initial.missing.slice(0, CONSENT_DISPLAY_CAP).map(coordLabel);
   const more = initial.missing.length - shown.length;
   const list = shown.join("\n") + (more > 0 ? `\n… and ${more} more` : "");
@@ -676,8 +712,8 @@ async function confirmDownloadConsent(initial: MissingDependenciesResult): Promi
       ? `\n\n${initial.skipped.length} other degraded dependency(ies) can't be downloaded automatically and will be left as-is.`
       : "";
   const detail =
-    `This downloads ${initial.missing.length} artifact(s) over HTTPS from Maven Central ` +
-    `(repo.maven.apache.org) and installs them into ~/.m2/repository:\n\n${list}\n\n` +
+    `This downloads ${initial.missing.length} artifact(s) over HTTPS from ` +
+    `${repoHost} and installs them into ~/.m2/repository:\n\n${list}\n\n` +
     "A downloaded artifact's own transitive dependencies may be discovered and downloaded " +
     "automatically afterward, under this same consent. Every file's checksum is verified " +
     `before it's installed; nothing downloaded is ever executed.${skippedNote}`;
@@ -704,6 +740,7 @@ async function runDownloadLoop(
   initial: MissingDependenciesResult,
   progress: vscode.Progress<{ message?: string; increment?: number }>,
   token: vscode.CancellationToken,
+  repoBase: string,
 ): Promise<void> {
   const m2Root = path.join(os.homedir(), ".m2", "repository");
   const downloaded: string[] = [];
@@ -749,7 +786,12 @@ async function runDownloadLoop(
 
       attempted.add(key);
       progress.report({ message: key });
-      const outcome = await mavenFetch.fetchAndInstallArtifact(coord, m2Root, remainingBytes);
+      const outcome = await mavenFetch.fetchAndInstallArtifact(
+        coord,
+        m2Root,
+        remainingBytes,
+        repoBase,
+      );
       if (outcome.status === "downloaded") {
         downloaded.push(key);
         downloadedThisRound++;
