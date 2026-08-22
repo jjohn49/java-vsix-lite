@@ -65,6 +65,8 @@ pub fn code_actions(
     };
 
     let mut out = add_import_actions(&ctx, index, range.start);
+    // M8d: extract variable/constant + source-generate actions.
+    out.extend(crate::generate::refactor_actions(doc, index, range));
     if let Some(edit) = organize_imports_edit(doc, index) {
         out.push(ActionSketch {
             title: "Organize imports".to_string(),
@@ -224,8 +226,9 @@ fn parse_import(text: &str, start: usize, end: usize) -> Option<ImportDecl> {
 }
 
 /// Whether `word` occurs in `hay` with non-identifier characters (or the
-/// text's edges) on both sides.
-fn contains_word(hay: &str, word: &str) -> bool {
+/// text's edges) on both sides. `pub(crate)`: `generate.rs` uses the same
+/// check for its name-collision scans.
+pub(crate) fn contains_word(hay: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
     }

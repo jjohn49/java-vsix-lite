@@ -1712,12 +1712,16 @@ impl LanguageServer for Backend {
                 })),
                 // M8a: add-import quick fixes + "Organize Imports" (VS Code's
                 // shift+alt+O and `source.organizeImports` on save both work
-                // through this).
+                // through this). M8d: extract variable/constant and
+                // source-generate actions (accessors, constructor,
+                // equals/hashCode, toString).
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![
                             CodeActionKind::QUICKFIX,
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                            CodeActionKind::REFACTOR_EXTRACT,
+                            CodeActionKind::new("source.generate"),
                         ]),
                         resolve_provider: Some(false),
                         work_done_progress_options: Default::default(),

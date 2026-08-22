@@ -34,6 +34,7 @@ mod definition;
 mod diagnostics;
 mod docsrc;
 mod external;
+mod generate;
 mod hover;
 mod implementation;
 mod imports;
