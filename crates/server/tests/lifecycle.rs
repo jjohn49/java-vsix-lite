@@ -3183,3 +3183,175 @@ fn lombok_members_from_closed_file_round_trip() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M8e: call + type hierarchy end-to-end — prepare/incoming/outgoing on a
+/// method, prepare/supertypes/subtypes on a type, with the subtype scan
+/// finding an implementor in a **closed** workspace file.
+#[test]
+fn call_and_type_hierarchy_round_trip() {
+    let root = temp_root("hierarchy");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("Closed.java"),
+        "package demo;\n\npublic class Closed extends Base {\n}\n",
+    )
+    .expect("write Closed.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{"textDocument":{{"typeHierarchy":{{"dynamicRegistration":true}}}}}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"callHierarchyProvider\""),
+        "missing callHierarchyProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+    // Dynamic registration request for type hierarchy arrives as a
+    // client/registerCapability server→client request.
+    let reg = read_until(&mut reader, "client/registerCapability", &mut seen);
+    assert!(
+        reg.contains("textDocument/prepareTypeHierarchy"),
+        "expected dynamic type-hierarchy registration: {reg}"
+    );
+    // Answer the server->client request — `initialized` awaits the response.
+    let reg_json: Value = serde_json::from_str(&reg).expect("parse registration");
+    send(
+        &serde_json::json!({ "jsonrpc": "2.0", "id": reg_json["id"], "result": null }).to_string(),
+    );
+
+    let base_uri = format!(
+        "file://{}",
+        root.join("src/main/java/demo/Base.java").display()
+    );
+    let base_text = "package demo; public class Base { void helper() {} void caller() { helper(); String.valueOf(1); } }\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{base_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(base_text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // A: prepare on the `helper` declaration.
+    let at_helper = base_text.find("helper").unwrap() + 3;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/prepareCallHierarchy","params":{{"textDocument":{{"uri":"{base_uri}"}},"position":{{"line":0,"character":{at_helper}}}}}}}"#
+    ));
+    let prepared = read_until(&mut reader, "\"id\":2", &mut seen);
+    let prepared_json: Value = serde_json::from_str(&prepared).expect("parse prepare");
+    let item = prepared_json["result"][0].clone();
+    assert_eq!(item["name"], "helper", "{prepared}");
+    assert_eq!(item["detail"], "void helper()", "{prepared}");
+
+    // B: incoming calls — `caller` calls `helper` once.
+    send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "callHierarchy/incomingCalls",
+            "params": { "item": item },
+        })
+        .to_string(),
+    );
+    let incoming = read_until(&mut reader, "\"id\":3", &mut seen);
+    let incoming_json: Value = serde_json::from_str(&incoming).expect("parse incoming");
+    let from = &incoming_json["result"][0]["from"];
+    assert_eq!(from["name"], "caller", "{incoming}");
+    assert_eq!(
+        incoming_json["result"][0]["fromRanges"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "{incoming}"
+    );
+
+    // C: outgoing calls from `caller` — resolves `helper` (open doc); the
+    // JDK-less environment simply omits `String.valueOf`.
+    let at_caller = base_text.find("caller").unwrap() + 3;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/prepareCallHierarchy","params":{{"textDocument":{{"uri":"{base_uri}"}},"position":{{"line":0,"character":{at_caller}}}}}}}"#
+    ));
+    let caller_prepared = read_until(&mut reader, "\"id\":4", &mut seen);
+    let caller_item: Value = serde_json::from_str::<Value>(&caller_prepared)
+        .expect("parse caller prepare")["result"][0]
+        .clone();
+    send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "callHierarchy/outgoingCalls",
+            "params": { "item": caller_item },
+        })
+        .to_string(),
+    );
+    let outgoing = read_until(&mut reader, "\"id\":5", &mut seen);
+    assert!(
+        outgoing.contains(r#""name":"helper""#),
+        "expected helper among outgoing calls: {outgoing}"
+    );
+
+    // D: type hierarchy — prepare on `Base`, then subtypes finds the
+    // closed file's `Closed extends Base`.
+    let at_base = base_text.find("Base").unwrap() + 2;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"textDocument/prepareTypeHierarchy","params":{{"textDocument":{{"uri":"{base_uri}"}},"position":{{"line":0,"character":{at_base}}}}}}}"#
+    ));
+    let type_prepared = read_until(&mut reader, "\"id\":6", &mut seen);
+    let type_item: Value = serde_json::from_str::<Value>(&type_prepared)
+        .expect("parse type prepare")["result"][0]
+        .clone();
+    assert_eq!(type_item["name"], "Base", "{type_prepared}");
+
+    send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "typeHierarchy/subtypes",
+            "params": { "item": type_item },
+        })
+        .to_string(),
+    );
+    let subtypes = read_until(&mut reader, "\"id\":7", &mut seen);
+    assert!(
+        subtypes.contains(r#""name":"Closed""#) && subtypes.contains("Closed.java"),
+        "expected the closed implementor: {subtypes}"
+    );
+
+    // E: supertypes of `Closed` (a closed file's item) resolves back to the
+    // open `Base` declaration.
+    let subtypes_json: Value = serde_json::from_str(&subtypes).expect("parse subtypes");
+    let closed_item = subtypes_json["result"][0].clone();
+    send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 8, "method": "typeHierarchy/supertypes",
+            "params": { "item": closed_item },
+        })
+        .to_string(),
+    );
+    let supers = read_until(&mut reader, "\"id\":8", &mut seen);
+    assert!(
+        supers.contains(r#""name":"Base""#),
+        "expected Base as supertype: {supers}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

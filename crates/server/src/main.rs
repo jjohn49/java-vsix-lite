@@ -200,6 +200,12 @@ struct Backend {
     /// watch at all; the LSP spec has no static alternative for this
     /// capability, so a client without it simply never gets watched.
     classpath_watch_dynamic: OnceLock<bool>,
+    /// M8e: whether the client supports dynamic registration for type
+    /// hierarchy. `ls-types` 0.0.6's `ServerCapabilities` has no
+    /// `typeHierarchyProvider` field to advertise statically, so the
+    /// feature is registered dynamically in `initialized` instead — VS Code
+    /// supports exactly that.
+    type_hierarchy_dynamic: OnceLock<bool>,
     /// Debounce window for a classpath rebuild after a watched build-file
     /// change (`classpath_debounce_ms_opt`) — 2s by default, overridable via
     /// `initializationOptions.classpathDebounceMs` so tests aren't forced to
@@ -276,6 +282,7 @@ impl Backend {
             snippet_support: OnceLock::new(),
             classpath: StdRwLock::new(None),
             classpath_watch_dynamic: OnceLock::new(),
+            type_hierarchy_dynamic: OnceLock::new(),
             classpath_debounce_ms: OnceLock::new(),
             classpath_rebuild: StdMutex::new(RebuildCoalescer::new()),
             workspace_root: OnceLock::new(),
@@ -688,6 +695,22 @@ impl Backend {
         }
     }
 
+    /// M8e: the text + tree behind a hierarchy item's file — the open
+    /// document if there is one, else the on-disk file through
+    /// `parsed_project_file`'s cache (hierarchy items can point at files the
+    /// user never opened, e.g. a supertype found through the workspace
+    /// index).
+    async fn hierarchy_doc(&self, uri: &str) -> Option<(Arc<String>, Tree)> {
+        {
+            let docs = self.documents.lock().await;
+            if let Some(d) = docs.get(uri) {
+                return Some((Arc::new(d.text.clone()), d.tree.clone()));
+            }
+        }
+        let path = open_doc_path(uri)?;
+        self.parsed_project_file(&path)
+    }
+
     /// Parse `text`, reusing `old` for an incremental reparse when the caller has
     /// already applied the corresponding `InputEdit`s to it.
     fn parse(&self, text: &str, old: Option<&Tree>) -> Tree {
@@ -1073,6 +1096,48 @@ fn insert_bounded_project_file(
 }
 
 /// Convert a byte range (from `jvl-syntax`) into an LSP `Range` via `index`.
+/// M8e: wrap a located callable into a `CallHierarchyItem`.
+fn callable_item(
+    info: &jvl_syntax::CallableInfo,
+    uri: Uri,
+    index: &LineIndex,
+) -> CallHierarchyItem {
+    CallHierarchyItem {
+        name: info.name.clone(),
+        kind: match info.kind {
+            jvl_syntax::CallableKind::Method => SymbolKind::METHOD,
+            jvl_syntax::CallableKind::Constructor => SymbolKind::CONSTRUCTOR,
+            jvl_syntax::CallableKind::Type => SymbolKind::CLASS,
+        },
+        tags: None,
+        detail: info.detail.clone(),
+        uri,
+        range: byte_range_to_lsp(index, info.decl_range.clone()),
+        selection_range: byte_range_to_lsp(index, info.name_range.clone()),
+        data: None,
+    }
+}
+
+/// M8e: wrap a located type into a `TypeHierarchyItem`.
+fn type_item(info: &jvl_syntax::TypeInfo, uri: Uri, index: &LineIndex) -> TypeHierarchyItem {
+    TypeHierarchyItem {
+        name: info.name.clone(),
+        kind: match info.kind {
+            jvl_syntax::TypeInfoKind::Class => SymbolKind::CLASS,
+            jvl_syntax::TypeInfoKind::Interface => SymbolKind::INTERFACE,
+            jvl_syntax::TypeInfoKind::Enum => SymbolKind::ENUM,
+            jvl_syntax::TypeInfoKind::Record => SymbolKind::STRUCT,
+            jvl_syntax::TypeInfoKind::Annotation => SymbolKind::INTERFACE,
+        },
+        tags: None,
+        detail: None,
+        uri,
+        range: byte_range_to_lsp(index, info.decl_range.clone()),
+        selection_range: byte_range_to_lsp(index, info.name_range.clone()),
+        data: None,
+    }
+}
+
 fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Range {
     Range {
         start: index.position(range.start),
@@ -1149,6 +1214,19 @@ fn javac_timeout_secs_opt(params: &InitializeParams) -> u64 {
 /// `workspace/didChangeWatchedFiles` — if not, M5.2's build-file watch is
 /// simply never registered (graceful fallback; the LSP spec gives servers
 /// no static-capability alternative for this one).
+/// M8e: whether the client can dynamically register type hierarchy — the
+/// only way to enable it, since `ls-types` 0.0.6 has no static
+/// `typeHierarchyProvider` capability field (see `type_hierarchy_dynamic`).
+fn supports_type_hierarchy_registration(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.type_hierarchy.as_ref())
+        .and_then(|c| c.dynamic_registration)
+        .unwrap_or(false)
+}
+
 fn supports_watched_files_registration(params: &InitializeParams) -> bool {
     params
         .capabilities
@@ -1671,6 +1749,9 @@ impl LanguageServer for Backend {
             .classpath_watch_dynamic
             .set(supports_watched_files_registration(&params));
         let _ = self
+            .type_hierarchy_dynamic
+            .set(supports_type_hierarchy_registration(&params));
+        let _ = self
             .classpath_debounce_ms
             .set(classpath_debounce_ms_opt(&params));
         let _ = self.jdk_home_override.set(jdk_home_opt(&params));
@@ -1759,6 +1840,10 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                // M8e: call hierarchy (incoming/outgoing calls). Its type-
+                // hierarchy sibling is registered dynamically in
+                // `initialized` — see `type_hierarchy_dynamic`.
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 // M5.4/M6.2: the one-shot, trust-gated `javac` check command
                 // and the M6.2 classpath-rebuild command. The extension only
                 // sends either after confirming Workspace Trust; see
@@ -1781,6 +1866,26 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "java-vsix-lite server initialized")
             .await;
+
+        // M8e: type hierarchy is registered dynamically, client permitting —
+        // `ls-types` 0.0.6's `ServerCapabilities` cannot advertise it
+        // statically (no `typeHierarchyProvider` field).
+        if self.type_hierarchy_dynamic.get().copied().unwrap_or(false) {
+            let registration = Registration {
+                id: "jvl-type-hierarchy".to_string(),
+                method: "textDocument/prepareTypeHierarchy".to_string(),
+                register_options: serde_json::to_value(TypeHierarchyRegistrationOptions::default())
+                    .ok(),
+            };
+            if let Err(err) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to register type hierarchy: {err}"),
+                    )
+                    .await;
+            }
+        }
 
         // M5.2: watch build files for classpath invalidation, client
         // permitting. VS Code supports dynamic registration; a client that
@@ -2407,6 +2512,292 @@ impl LanguageServer for Backend {
     /// `jvl_syntax::reference_target` answers `None` for anything else
     /// (an external/JDK symbol, an unopened project file, `this`/`super`, a
     /// non-identifier), and this handler answers `Ok(None)` in that case.
+    /// M8e: `textDocument/prepareCallHierarchy` — the cursor must resolve
+    /// (via the M4.3 reference machinery) to a method/constructor
+    /// **declared in an open document**; anything else answers `None`, the
+    /// same open-files-first refusal shape as references/rename.
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(snapshot) = self.target_snapshot(uri.as_str(), position).await else {
+            return Ok(None);
+        };
+        let doc = jvl_syntax::OpenDoc {
+            source: &snapshot.target_text,
+            tree: &snapshot.target_tree,
+        };
+        let Some(info) = jvl_syntax::callable_decl_at_name(&doc, snapshot.target.name_range.start)
+        else {
+            return Ok(None); // the target is a field/type/local, not a callable
+        };
+        let index = LineIndex::new(&snapshot.target_text, self.encoding());
+        let Ok(item_uri) = snapshot.target_uri.parse::<Uri>() else {
+            return Ok(None);
+        };
+        Ok(Some(vec![callable_item(&info, item_uri, &index)]))
+    }
+
+    /// M8e: `callHierarchy/incomingCalls` — the M4.3 bounded reference scan,
+    /// with every confirmed call site grouped under its enclosing
+    /// method/constructor (or type, for field-initializer references).
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let item = params.item;
+        let Some(snapshot) = self
+            .target_snapshot(item.uri.as_str(), item.selection_range.start)
+            .await
+        else {
+            return Ok(Some(Vec::new())); // file closed since prepare — empty, not an error
+        };
+        let outcome = self
+            .scan_references(
+                &snapshot.target,
+                &snapshot.target_uri,
+                &snapshot.target_text,
+                &snapshot.target_tree,
+                snapshot.target_version,
+                &snapshot.roots,
+                snapshot.project_root.as_deref(),
+                &snapshot.open_snapshot,
+                false,
+            )
+            .await;
+        let mut calls: Vec<CallHierarchyIncomingCall> = Vec::new();
+        for hit in outcome.hits {
+            let tree = self.parse(&hit.text, None);
+            let index = LineIndex::new(&hit.text, self.encoding());
+            let doc = jvl_syntax::OpenDoc {
+                source: &hit.text,
+                tree: &tree,
+            };
+            for range in hit.ranges {
+                let Some(info) = jvl_syntax::enclosing_callable(&doc, range.start) else {
+                    continue;
+                };
+                let from = callable_item(&info, hit.uri.clone(), &index);
+                let from_range = byte_range_to_lsp(&index, range.clone());
+                if let Some(existing) = calls.iter_mut().find(|c| {
+                    c.from.uri == from.uri && c.from.selection_range == from.selection_range
+                }) {
+                    existing.from_ranges.push(from_range);
+                } else {
+                    calls.push(CallHierarchyIncomingCall {
+                        from,
+                        from_ranges: vec![from_range],
+                    });
+                }
+            }
+        }
+        Ok(Some(calls))
+    }
+
+    /// M8e: `callHierarchy/outgoingCalls` — every call site inside the
+    /// item's body, each resolved through the same ladder as
+    /// go-to-definition (open docs, closed project files, JDK/dependency
+    /// stubs as `jvl-src` virtual documents). Unresolvable callees are
+    /// silently omitted rather than guessed.
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let item = params.item;
+        let docs = self.documents.lock().await;
+        let Some((open, uris)) = open_docs_and_uris(&docs, item.uri.as_str()) else {
+            return Ok(Some(Vec::new()));
+        };
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let decl_byte = index.offset(item.selection_range.start);
+        let sites = jvl_syntax::outgoing_call_sites(&open[0], decl_byte);
+        // ClasspathSymbols-only for the same reason as `goto_definition` —
+        // see that handler's comment on the ladder's step (c).
+        let symbols = ClasspathSymbols(self.classpath());
+        let mut calls: Vec<CallHierarchyOutgoingCall> = Vec::new();
+        for site in sites {
+            let pos = index.position(site.name_range.start);
+            let Some(def) = jvl_syntax::definition(&open, 0, &index, pos, &symbols) else {
+                continue;
+            };
+            let Some(loc) = self.resolve_location(def, &docs, &uris) else {
+                continue;
+            };
+            let from_range = byte_range_to_lsp(&index, site.name_range.clone());
+            if let Some(existing) = calls
+                .iter_mut()
+                .find(|c| c.to.uri == loc.uri && c.to.selection_range == loc.range)
+            {
+                existing.from_ranges.push(from_range);
+                continue;
+            }
+            calls.push(CallHierarchyOutgoingCall {
+                to: CallHierarchyItem {
+                    name: site.name.clone(),
+                    kind: SymbolKind::METHOD,
+                    tags: None,
+                    detail: None,
+                    uri: loc.uri,
+                    range: loc.range,
+                    selection_range: loc.range,
+                    data: None,
+                },
+                from_ranges: vec![from_range],
+            });
+        }
+        Ok(Some(calls))
+    }
+
+    /// M8e: `textDocument/prepareTypeHierarchy` — the cursor must name a
+    /// type declared in an open document (its declaration or any reference
+    /// the open-document table resolves).
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
+            return Ok(None);
+        };
+        let index = LineIndex::new(open[0].source, self.encoding());
+        let Some((doc_idx, info)) = jvl_syntax::type_decl_at(&open, 0, &index, position) else {
+            return Ok(None);
+        };
+        let decl_index = LineIndex::new(open[doc_idx].source, self.encoding());
+        let Some(item_uri) = uris.get(doc_idx).and_then(|u| u.parse::<Uri>().ok()) else {
+            return Ok(None);
+        };
+        Ok(Some(vec![type_item(&info, item_uri, &decl_index)]))
+    }
+
+    /// M8e: `typeHierarchy/supertypes` — the item's `extends`/`implements`
+    /// simple names, located open-files-first, then in closed workspace
+    /// files through the declaring file's import candidates + the workspace
+    /// index. JDK/dependency supertypes are omitted (no real file to point
+    /// at) — a documented gap, not a guess.
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let item = params.item;
+        self.ensure_workspace_index().await;
+        let Some((text, tree)) = self.hierarchy_doc(item.uri.as_str()).await else {
+            return Ok(Some(Vec::new()));
+        };
+        let doc = jvl_syntax::OpenDoc {
+            source: &text,
+            tree: &tree,
+        };
+        let Some(info) = jvl_syntax::type_info_in(&doc, &item.name) else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut out = Vec::new();
+        let docs = self.documents.lock().await;
+        'supers: for sup in &info.supers {
+            for (doc_uri, d) in docs.iter() {
+                let sdoc = jvl_syntax::OpenDoc {
+                    source: &d.text,
+                    tree: &d.tree,
+                };
+                if let Some(sinfo) = jvl_syntax::type_info_in(&sdoc, &sup.simple) {
+                    if let Ok(u) = doc_uri.parse::<Uri>() {
+                        let sindex = LineIndex::new(&d.text, self.encoding());
+                        out.push(type_item(&sinfo, u, &sindex));
+                        continue 'supers;
+                    }
+                }
+            }
+            for fqn in &sup.candidates {
+                let Some((pkg, simple)) = fqn.rsplit_once('.') else {
+                    continue;
+                };
+                let Some(path) = self.workspace_index().find_type(pkg, simple) else {
+                    continue;
+                };
+                let Some((stext, stree)) = self.parsed_project_file(&path) else {
+                    continue;
+                };
+                let sdoc = jvl_syntax::OpenDoc {
+                    source: &stext,
+                    tree: &stree,
+                };
+                if let Some(sinfo) = jvl_syntax::type_info_in(&sdoc, simple) {
+                    if let Some(u) = Uri::from_file_path(&path) {
+                        let sindex = LineIndex::new(&stext, self.encoding());
+                        out.push(type_item(&sinfo, u, &sindex));
+                        continue 'supers;
+                    }
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// M8e: `typeHierarchy/subtypes` — the M4.6 bounded implementation scan
+    /// (same prefilter, same confirm-by-resolution), each hit wrapped back
+    /// into its enclosing type declaration.
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let item = params.item;
+        self.ensure_workspace_index().await;
+        let Some((text, tree)) = self.hierarchy_doc(item.uri.as_str()).await else {
+            return Ok(Some(Vec::new()));
+        };
+        let (roots, project_root, open_snapshot) = {
+            let docs = self.documents.lock().await;
+            let project_root = self.project_root();
+            let roots = project_root
+                .as_deref()
+                .map(|root| self.source_roots(&docs, root))
+                .unwrap_or_default();
+            let mut open_snapshot = HashMap::new();
+            for (doc_uri, doc) in docs.iter() {
+                if let Some(path) = open_doc_path(doc_uri) {
+                    let key = std::fs::canonicalize(&path).unwrap_or(path);
+                    open_snapshot.insert(key, (doc.version, doc.text.clone(), doc.tree.clone()));
+                }
+            }
+            (roots, project_root, open_snapshot)
+        };
+        let target = jvl_syntax::ImplementationTarget {
+            type_name: item.name.clone(),
+            type_doc: 0,
+            method_name: None,
+        };
+        let outcome = self
+            .scan_implementations(
+                &target,
+                item.uri.as_str(),
+                &text,
+                &tree,
+                &roots,
+                project_root.as_deref(),
+                &open_snapshot,
+            )
+            .await;
+        let mut out = Vec::new();
+        for hit in outcome.hits {
+            let tree = self.parse(&hit.text, None);
+            let index = LineIndex::new(&hit.text, self.encoding());
+            let doc = jvl_syntax::OpenDoc {
+                source: &hit.text,
+                tree: &tree,
+            };
+            for range in hit.ranges {
+                if let Some(sinfo) = jvl_syntax::type_decl_at_byte(&doc, range.start) {
+                    out.push(type_item(&sinfo, hit.uri.clone(), &index));
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;

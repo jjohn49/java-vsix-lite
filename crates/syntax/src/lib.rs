@@ -35,6 +35,7 @@ mod diagnostics;
 mod docsrc;
 mod external;
 mod generate;
+mod hierarchy;
 mod hover;
 mod implementation;
 mod imports;
@@ -56,6 +57,11 @@ pub use diagnostics::member_diagnostics;
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{
     ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource, TypeCandidate,
+};
+pub use hierarchy::{
+    callable_decl_at_name, enclosing_callable, outgoing_call_sites, type_decl_at,
+    type_decl_at_byte, type_info_in, CallSite, CallableInfo, CallableKind, SuperRef, TypeInfo,
+    TypeInfoKind,
 };
 pub use hover::hover;
 pub use implementation::{

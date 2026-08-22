@@ -17,6 +17,7 @@ java-vsix-lite provides core Java editing features without the overhead of a JVM
 - **Find references** — bounded, confirm-by-resolution workspace search that never reports a match it can't verify
 - **Rename** — conservative by design: refuses (with the reason) rather than producing a partial or wrong edit; renames the file along with a public type
 - **Go to implementation** — from an interface or abstract method to its implementors
+- **Call & type hierarchy** — incoming/outgoing calls for a method (Peek Call Hierarchy) and supertype/subtype trees for a class or interface, powered by the same bounded confirm-by-resolution scans as Find References
 - **Workspace symbols** — jump to any top-level type by name (lazy, bounded index; nothing scans until you ask)
 - **Signature help** — parameter hints with overloads and active-parameter highlighting
 - **Document outline, folding, and selection ranges**
