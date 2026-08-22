@@ -26,8 +26,20 @@ pub fn class_from_source(
 ) -> Option<ExternalClass> {
     let tree = parse(&mut new_parser(), source, None)?;
     let imports = Imports::parse(&tree, source);
-    let td = find_type_by_path(tree.root_node(), source, type_path)?;
-    Some(to_external_class(&td, source, &imports, pick_fqn))
+    if let Some(td) = find_type_by_path(tree.root_node(), source, type_path) {
+        return Some(to_external_class(&td, source, &imports, pick_fqn));
+    }
+    // M8c: `Outer.OuterBuilder` — the `@Builder` companion type that exists
+    // only in Lombok's generated code, synthesized on demand so builder
+    // chains (`Person.builder().name("x").build()`) resolve.
+    let (outer_path, last) = type_path.rsplit_once('.')?;
+    let outer = find_type_by_path(tree.root_node(), source, outer_path)?;
+    if last != format!("{}Builder", outer.name)
+        || !crate::lombok::file_uses_lombok(outer.node, source)
+    {
+        return None;
+    }
+    crate::lombok::builder_class(&outer, source)
 }
 
 /// Walk from the file's top-level type declarations through `.`-separated
@@ -74,6 +86,24 @@ fn to_external_class(
             if let Some(m) = constructor_member(ctor, td.name, source) {
                 members.push(m);
             }
+        }
+    }
+
+    // M8c: Lombok-generated accessors, under the same gate as open documents.
+    // `synthesize` never duplicates a declared method; the erased return FQN
+    // is recovered from the display type through the declaring file's own
+    // imports, exactly like `member_from_node` does for real members.
+    if crate::lombok::file_uses_lombok(td.node, source) {
+        for sm in crate::lombok::synthesize(td.node, source) {
+            let mut m = sm.into_external();
+            if m.ret_fqn.is_none() {
+                m.ret_fqn = m
+                    .ret_display
+                    .as_deref()
+                    .and_then(display_base_simple)
+                    .and_then(|simple| pick_fqn(&imports.candidates(simple)));
+            }
+            members.push(m);
         }
     }
 
@@ -178,6 +208,22 @@ fn resolve_ret_fqn(
 ) -> Option<String> {
     let simple = crate::model::base_type_name(type_node, source)?;
     pick_fqn(&imports.candidates(simple))
+}
+
+/// The base simple type name of a rendered display type: `List<String>` →
+/// `List`, `demo.Person` → `Person`. `None` for primitives (lowercase
+/// first letter) and arrays — neither carries an importable FQN.
+fn display_base_simple(display: &str) -> Option<&str> {
+    let base = display.split('<').next()?.trim();
+    if base.ends_with("[]") {
+        return None;
+    }
+    let simple = base.rsplit('.').next()?;
+    simple
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        .then_some(simple)
 }
 
 fn constructor_member(node: Node, class_name: &str, source: &str) -> Option<ExternalMember> {
@@ -345,6 +391,52 @@ mod tests {
         assert!(names.contains(&"MAX"), "{names:?}");
         assert!(names.contains(&"greet"), "{names:?}");
         assert!(!names.contains(&"helper"), "explicit private: {names:?}");
+    }
+
+    #[test]
+    fn lombok_accessors_synthesized_for_closed_file() {
+        let src = "package demo;\nimport lombok.Data;\n\
+                   @Data public class Person {\n\
+                   private String name;\n\
+                   private final int age;\n\
+                   }\n";
+        let class = class_from_source(src, "Person", &pick_first).unwrap();
+        let names: Vec<&str> = class.members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"getName"), "{names:?}");
+        assert!(names.contains(&"setName"), "{names:?}");
+        assert!(names.contains(&"getAge"), "{names:?}");
+        assert!(!names.contains(&"setAge"), "final: {names:?}");
+        let get_name = class.members.iter().find(|m| m.name == "getName").unwrap();
+        // Return FQN recovered through the declaring file's imports
+        // (pick_first hands back the first candidate — the package-local one).
+        assert_eq!(get_name.ret_fqn.as_deref(), Some("demo.String"));
+        assert_eq!(get_name.ret_display.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn lombok_builder_companion_class_resolves_by_nested_path() {
+        let src = "package demo;\nimport lombok.Builder;\n\
+                   @Builder public class Person {\n\
+                   private String name;\n\
+                   }\n";
+        // The @Builder entry point on the class itself…
+        let class = class_from_source(src, "Person", &pick_first).unwrap();
+        let builder = class.members.iter().find(|m| m.name == "builder").unwrap();
+        assert!(builder.is_static);
+        assert_eq!(
+            builder.ret_fqn.as_deref(),
+            Some("demo.Person$PersonBuilder")
+        );
+        // …and the synthesized companion type by its nested path.
+        let companion = class_from_source(src, "Person.PersonBuilder", &pick_first)
+            .expect("synthesized builder class");
+        let fluent = companion.members.iter().find(|m| m.name == "name").unwrap();
+        assert_eq!(fluent.ret_fqn.as_deref(), Some("demo.Person$PersonBuilder"));
+        assert!(companion.members.iter().any(|m| m.name == "build"));
+        // Without @Builder, the nested path stays unknown.
+        let no_builder = "package demo;\nimport lombok.Getter;\n\
+                          @Getter public class Person { private String name; }\n";
+        assert!(class_from_source(no_builder, "Person.PersonBuilder", &pick_first).is_none());
     }
 
     #[test]

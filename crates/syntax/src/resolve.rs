@@ -886,6 +886,21 @@ fn walk_members<'t>(
                     acc.out.push(HierMember::InProject(m));
                 }
             }
+            // M8c: Lombok-generated accessors join the class's declared
+            // members. Synthesized, not declared — no AST node to point at —
+            // so they travel as External members; their result types resolve
+            // through `ret_display`/`ret_fqn` like any bytecode member's.
+            if crate::lombok::file_uses_lombok(td.node, td.source) {
+                for sm in crate::lombok::synthesize(td.node, td.source) {
+                    if static_only && !sm.is_static {
+                        continue;
+                    }
+                    let m = sm.into_external();
+                    if acc.seen.insert(m.signature.clone()) {
+                        acc.out.push(HierMember::External(m));
+                    }
+                }
+            }
             for sup in &td.supers {
                 if let Some(sd) = ctx.table.get(sup) {
                     walk_members(

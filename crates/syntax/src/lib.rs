@@ -38,6 +38,7 @@ mod hover;
 mod implementation;
 mod imports;
 mod jdoc;
+mod lombok;
 mod model;
 mod references;
 mod rename;

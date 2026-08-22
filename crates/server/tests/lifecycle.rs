@@ -3089,3 +3089,97 @@ fn code_actions_add_import_and_organize_imports_round_trip() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M8c: Lombok synthesis end-to-end for a **closed** project file — `@Data`
+/// getters complete on `p.`, and a `@Builder` chain resolves through the
+/// synthesized `Person.PersonBuilder` companion type.
+#[test]
+fn lombok_members_from_closed_file_round_trip() {
+    let root = temp_root("lombok");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("Person.java"),
+        "package demo;\n\
+         import lombok.Builder;\n\
+         import lombok.Data;\n\
+         @Data\n\
+         @Builder\n\
+         public class Person {\n\
+         \u{20}   private String name;\n\
+         }\n",
+    )
+    .expect("write Person.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let main_uri = format!(
+        "file://{}",
+        root.join("src/main/java/demo/Main.java").display()
+    );
+    let main_text = "package demo; class Main { void m(Person p) { p.getName(); Person.builder().name(\"x\").build(); } }\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{main_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(main_text)
+    ));
+    let diags = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        !diags.contains("getName"),
+        "synthesized getter must not be flagged unresolved: {diags}"
+    );
+
+    // A: `p.` completes the @Data getter/setter from the closed file.
+    let dot_after_p = main_text.find("p.getName").unwrap() + 2;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{main_uri}"}},"position":{{"line":0,"character":{dot_after_p}}}}}}}"#
+    ));
+    let completion = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        completion.contains(r#""label":"getName""#) && completion.contains(r#""label":"setName""#),
+        "expected Lombok accessors from the closed Person.java: {completion}"
+    );
+
+    // B: the builder chain — members of the synthesized PersonBuilder.
+    let dot_after_builder = main_text.find("builder().name").unwrap() + "builder().".len();
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{main_uri}"}},"position":{{"line":0,"character":{dot_after_builder}}}}}}}"#
+    ));
+    let builder_completion = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        builder_completion.contains(r#""label":"build""#)
+            && builder_completion.contains(r#""label":"name""#),
+        "expected the synthesized builder members: {builder_completion}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

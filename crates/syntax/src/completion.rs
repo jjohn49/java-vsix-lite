@@ -1079,6 +1079,34 @@ mod tests {
         completion(&docs, 0, &index, index.position(at), true, symbols).items
     }
 
+    /// M8c: Lombok-synthesized accessors appear in member completion and
+    /// chain like any other member (`p.getName().` resolves to `String`).
+    #[test]
+    fn lombok_getter_completes_and_chains() {
+        let symbols = mock(vec![(
+            "java.lang.String",
+            ext_class(&[], vec![ext_method("length", "int length()")]),
+        )]);
+        let src = "import lombok.Getter;\n\
+                   @Getter class Person { private String name; void m(Person p) { p. } }\n";
+        let items = complete_ext(src, "{ p.", &symbols);
+        assert!(has(&items, "getName"), "{:?}", labels(&items));
+
+        let src = "import lombok.Getter;\n\
+                   @Getter class Person { private String name; void m(Person p) { p.getName().x; } }\n";
+        let items = complete_ext(src, "p.getName().", &symbols);
+        assert!(
+            has(&items, "length"),
+            "chain through the synthesized getter: {:?}",
+            labels(&items)
+        );
+
+        // Without the lombok import, the same annotation synthesizes nothing.
+        let src = "@Getter class Person { private String name; void m(Person p) { p. } }\n";
+        let items = complete_ext(src, "{ p.", &symbols);
+        assert!(!has(&items, "getName"), "{:?}", labels(&items));
+    }
+
     fn mock(entries: Vec<(&str, ExternalClass)>) -> MockSymbols {
         MockSymbols(
             entries
