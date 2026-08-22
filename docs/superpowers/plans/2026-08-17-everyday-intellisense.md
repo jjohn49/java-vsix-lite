@@ -134,3 +134,41 @@
 - Spec coverage: §1→Task 1, §2→Task 2, §3→Task 3, §4→Task 4, §5+testing→Tasks 3–5. Lazy type-item Javadoc (`doc(fqn, None)`) folded into Task 4. ✓
 - No placeholders; types named consistently (`TypeEntry`/`TypeCandidate` mirror across crates; `ret_fqn`/`ret_display` everywhere). ✓
 - Risk noted: `ResolvedType::Array` exhaustive-match ripple across feature files — bounded, compiler-driven.
+
+## Addendum (2026-08-22): M8 — closing the Red Hat gap, wave 1
+
+User directive: "Add all of those into the extension" (the priority list from
+the gap analysis vs vscode-java). Shipped as five milestones, all default-on:
+
+- **M8a — code actions**: add-import quick fix for unresolved type names
+  (project + classpath candidates, `isPreferred` when unambiguous) and
+  `source.organizeImports` (sort static-first, dedupe, drop unused; a name
+  referenced only in comments/Javadoc counts as used; bails rather than
+  deleting comments between imports). `crates/syntax/src/codeaction.rs`.
+- **M8b — javac on save**: the extension triggers the existing trust-gated
+  `checkProject` command after Java saves — debounced 1.5s, single-flight
+  with one queued follow-up, completely silent (Problems only). Setting
+  `java-vsix-lite.javac.checkOnSave`, default true.
+- **M8c — Lombok**: `@Getter`/`@Setter`/`@Data`/`@Value`/`@With`/`@Builder`
+  members synthesized for open docs (`resolve.rs::walk_members`) and closed
+  files (`srcclass.rs`), including the `Outer.OuterBuilder` companion class
+  so builder chains resolve. Gated on the declaring file importing
+  `lombok.*`. `crates/syntax/src/lombok.rs`.
+- **M8d — extract + generate**: extract selected expression to `var` local
+  (derived, collision-free name) or literal to `private static final`
+  constant; generate getters/setters, all-fields constructor (only when none
+  exists), `equals`/`hashCode` (Objects-based), `toString`.
+  `crates/syntax/src/generate.rs`.
+- **M8e — call & type hierarchy**: incoming calls = reference scan grouped
+  by enclosing callable; outgoing calls = call sites resolved through the
+  definition ladder; supertypes via import candidates + workspace index;
+  subtypes = implementation scan. Type hierarchy is dynamically registered
+  (ls-types 0.0.6 has no static `typeHierarchyProvider` field).
+  `crates/syntax/src/hierarchy.rs`.
+
+Known accepted gaps: no extract-method; Lombok constructors not synthesized
+(constructors aren't in the member model); external (JDK/dependency)
+supertypes omitted from the type-hierarchy tree; call hierarchy requires the
+starting file to be open (open-files-first, like references/rename).
+Suite: 462 Rust tests green, clippy -D warnings clean, extension lint +
+tsc clean.
