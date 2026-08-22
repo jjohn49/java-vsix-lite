@@ -21,7 +21,8 @@ java-vsix-lite provides core Java editing features without the overhead of a JVM
 - **Document outline, folding, and selection ranges**
 - **Maven & Gradle awareness** — dependencies resolved statically and offline from `pom.xml` / `build.gradle` / version catalogs, including transitive dependencies, from your local `~/.m2` and `~/.gradle` caches; re-resolved automatically when build files change. Build scripts are **never executed**
 - **Missing dependency download** — a declared dependency not yet in `~/.m2` can be fetched from Maven Central: run **Java: Download Missing Dependencies**, or accept the one-time prompt shown after opening a project with unresolved dependencies (see `java-vsix-lite.dependencies.autoDownload`). Workspace-trust-gated; HTTPS with checksum verification; nothing downloaded is ever executed
-- **Check Project (javac)** — an explicit, workspace-trust-gated command that runs a one-shot `javac` check (annotation processing disabled) and reports real compiler errors in the Problems panel — no resident JVM
+- **Code actions** — add-import quick fixes for unresolved type names (lightbulb on the name) and **Organize Imports** (sorts, dedupes, drops unused — conservatively: a name referenced only in Javadoc keeps its import)
+- **Check Project (javac)** — a workspace-trust-gated `javac` check (annotation processing disabled) reporting real compiler errors in the Problems panel — no resident JVM. Runs on demand via the command, and automatically after saving a Java file (debounced and silent; disable with `java-vsix-lite.javac.checkOnSave`)
 
 ## Security posture
 

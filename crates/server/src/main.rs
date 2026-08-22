@@ -1933,10 +1933,13 @@ impl LanguageServer for Backend {
     }
 
     /// M5.4/M6.2: `workspace/executeCommand` — `javac::CHECK_PROJECT_COMMAND`
-    /// or `REBUILD_CLASSPATH_COMMAND`. Explicit, one-shot, never automatic;
-    /// the extension only sends either after confirming Workspace Trust (the
-    /// server itself has no notion of that and just does what it's told —
-    /// see `javac`'s module doc comment).
+    /// or `REBUILD_CLASSPATH_COMMAND`. One-shot per invocation; the extension
+    /// only sends either after confirming Workspace Trust (the server itself
+    /// has no notion of that and just does what it's told — see `javac`'s
+    /// module doc comment). M8b: the extension additionally sends the javac
+    /// check after Java file saves (debounced, still trust-gated, opt-out via
+    /// `javac.checkOnSave`) — the single-flight guard below is what makes
+    /// that safe against overlapping saves.
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,

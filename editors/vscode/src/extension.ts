@@ -134,6 +134,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.registerTextDocumentContentProvider("jvl-src", new ExternalSourceProvider()),
   );
 
+  // M8b: real compiler errors on save — a debounced, silent `checkProject`
+  // run after every Java file save, in trusted workspaces only (the same
+  // trust gate as the manual command; `javac` is a spawned process). Silent
+  // means silent: results reach Problems via the server's published
+  // diagnostics, never a pop-up.
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (
+        doc.languageId === "java" &&
+        doc.uri.scheme === "file" &&
+        vscode.workspace.isTrusted &&
+        vscode.workspace
+          .getConfiguration("java-vsix-lite")
+          .get<boolean>("javac.checkOnSave", true)
+      ) {
+        scheduleSaveCheck();
+      }
+    }),
+  );
+
   // VS Code normally infers the `java` language id from the `.java` extension
   // in a jvl-src URI's path, but that inference is what the documentSelector
   // match (and thus server sync) hinges on — pin it explicitly so the virtual
@@ -362,6 +382,54 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
       void vscode.window.showErrorMessage(
         `java-vsix-lite: Check Project failed: ${result.message ?? result.status}`,
       );
+  }
+}
+
+// M8b: check-on-save plumbing. Debounce coalesces a burst of saves ("save
+// all") into one run; the running/queued pair coalesces saves that land
+// mid-run into exactly one follow-up run (the server would answer
+// `already-running` to a concurrent request, and the *last* save's state
+// must still get compiled).
+let saveCheckTimer: ReturnType<typeof setTimeout> | undefined;
+let saveCheckRunning = false;
+let saveCheckQueued = false;
+const SAVE_CHECK_DEBOUNCE_MS = 1500;
+
+function scheduleSaveCheck(): void {
+  if (saveCheckTimer !== undefined) {
+    clearTimeout(saveCheckTimer);
+  }
+  saveCheckTimer = setTimeout(() => {
+    saveCheckTimer = undefined;
+    void runSaveCheck();
+  }, SAVE_CHECK_DEBOUNCE_MS);
+}
+
+async function runSaveCheck(): Promise<void> {
+  if (saveCheckRunning) {
+    saveCheckQueued = true;
+    return;
+  }
+  // Re-checked here (not just at schedule time): trust or the running client
+  // can be gone by the time the debounce fires.
+  if (!client || !vscode.workspace.isTrusted) {
+    return;
+  }
+  saveCheckRunning = true;
+  try {
+    await client.sendRequest(ExecuteCommandRequest.type, {
+      command: SERVER_CHECK_PROJECT_COMMAND,
+      arguments: [],
+    });
+  } catch {
+    // Silent by design — a failed background check must never toast on save.
+    // The manual `Java: Check Project (javac)` command reports errors.
+  } finally {
+    saveCheckRunning = false;
+    if (saveCheckQueued) {
+      saveCheckQueued = false;
+      scheduleSaveCheck();
+    }
   }
 }
 
