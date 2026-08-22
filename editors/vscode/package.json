@@ -23,7 +23,13 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, build commands, and the consent-gated dependency download all stay disabled until the workspace is trusted."
+      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, build commands, and the consent-gated dependency download all stay disabled until the workspace is trusted.",
+      "restrictedConfigurations": [
+        "java-vsix-lite.server.path",
+        "java-vsix-lite.jdk.home",
+        "java-vsix-lite.dependencies.repository",
+        "java-vsix-lite.dependencies.autoDownload"
+      ]
     }
   },
   "contributes": {
@@ -39,8 +45,8 @@
         "java-vsix-lite.server.path": {
           "type": "string",
           "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Absolute path to the `jvl-server` binary. Leave empty to use the bundled binary. The `JVL_SERVER_PATH` environment variable overrides this."
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the `jvl-server` binary. Leave empty to use the bundled binary. The `JVL_SERVER_PATH` environment variable overrides this. **Machine-scoped on purpose**: a workspace must never be able to redirect which binary is launched as the language server."
         },
         "java-vsix-lite.trace.server": {
           "type": "string",
@@ -60,7 +66,8 @@
         "java-vsix-lite.jdk.home": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Absolute path to a JDK home to use for `Check Project (javac)` (M5.4), tried before `$JAVA_HOME`. Leave empty to use `$JAVA_HOME`. Never downloaded — if neither resolves to a real `javac`, the check fails with a clear error."
+          "scope": "machine",
+          "markdownDescription": "Absolute path to a JDK home to use for `Check Project (javac)` (M5.4), tried before `$JAVA_HOME`. Leave empty to use `$JAVA_HOME`. Never downloaded — if neither resolves to a real `javac`, the check fails with a clear error. **Machine-scoped on purpose**: a workspace must never be able to point `javac` at a binary it ships."
         },
         "java-vsix-lite.javac.timeoutSecs": {
           "type": "number",

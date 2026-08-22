@@ -117,30 +117,39 @@ pub fn outgoing_call_sites(doc: &OpenDoc, byte: usize) -> Vec<CallSite> {
     out
 }
 
-fn collect_call_sites(node: Node, source: &str, out: &mut Vec<CallSite>) {
-    match node.kind() {
-        "method_invocation" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                out.push(CallSite {
-                    name: node_text(name, source).to_string(),
-                    name_range: name.start_byte()..name.end_byte(),
-                });
-            }
-        }
-        "object_creation_expression" => {
-            if let Some(ty) = node.child_by_field_name("type") {
-                if let Some(base) = crate::model::base_type_name(ty, source) {
+/// Iterative pre-order walk — NOT native recursion. A method body can nest
+/// arbitrarily deep (`((((…))))`) from untrusted project source, and Rust
+/// cannot catch a stack overflow (it aborts the whole server); every other
+/// whole-subtree walk in this crate uses a work-stack for the same reason.
+/// Children are pushed reversed so the pop order stays pre-order (left to
+/// right), matching what callers/tests expect.
+fn collect_call_sites(root: Node, source: &str, out: &mut Vec<CallSite>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "method_invocation" => {
+                if let Some(name) = node.child_by_field_name("name") {
                     out.push(CallSite {
-                        name: base.to_string(),
-                        name_range: ty.start_byte()..ty.end_byte(),
+                        name: node_text(name, source).to_string(),
+                        name_range: name.start_byte()..name.end_byte(),
                     });
                 }
             }
+            "object_creation_expression" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    if let Some(base) = crate::model::base_type_name(ty, source) {
+                        out.push(CallSite {
+                            name: base.to_string(),
+                            name_range: ty.start_byte()..ty.end_byte(),
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    for child in named_children(node) {
-        collect_call_sites(child, source, out);
+        for child in named_children(node).into_iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
