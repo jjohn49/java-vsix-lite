@@ -508,14 +508,16 @@ fn import_status(c: &crate::external::TypeCandidate, imports: &Imports) -> Impor
 /// M7: where to insert a new `import`, computed once per request from the
 /// tree: after the last existing import, else after the `package`
 /// declaration, else at the very top.
-struct ImportInsertion {
+///
+/// `pub(crate)` (M8a): also used by `codeaction.rs`'s add-import quick fix.
+pub(crate) struct ImportInsertion {
     position: Position,
     /// Text template around the path: `(before, after)`.
     wrap: (&'static str, &'static str),
 }
 
 impl ImportInsertion {
-    fn compute(doc: &OpenDoc, index: &LineIndex) -> ImportInsertion {
+    pub(crate) fn compute(doc: &OpenDoc, index: &LineIndex) -> ImportInsertion {
         let mut last_import_end = None;
         let mut package_end = None;
         for child in crate::model::named_children(doc.tree.root_node()) {
@@ -543,7 +545,7 @@ impl ImportInsertion {
         }
     }
 
-    fn edit(&self, import_path: &str) -> TextEdit {
+    pub(crate) fn edit(&self, import_path: &str) -> TextEdit {
         TextEdit {
             range: ls_types::Range {
                 start: self.position,

@@ -2970,3 +2970,122 @@ fn project_source_symbols_closed_file_round_trip() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M8a: `textDocument/codeAction` end-to-end — an add-import quick fix for a
+/// closed project type used from another package, and "Organize Imports"
+/// rewriting an unsorted import block with an unused entry.
+#[test]
+fn code_actions_add_import_and_organize_imports_round_trip() {
+    let root = temp_root("code-actions");
+    let util_dir = root.join("src/main/java/demo/util");
+    std::fs::create_dir_all(&util_dir).expect("create temp project dirs");
+    std::fs::write(
+        util_dir.join("Person.java"),
+        "package demo.util;\n\npublic class Person { }\n",
+    )
+    .expect("write Person.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let init = read_until(&mut reader, "\"id\":1", &mut seen);
+    assert!(
+        init.contains("\"codeActionProvider\"") && init.contains("source.organizeImports"),
+        "missing codeActionProvider capability: {init}"
+    );
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // `Person` referenced from package `demo` with no import — unresolved.
+    let main_uri = format!(
+        "file://{}",
+        root.join("src/main/java/demo/Main.java").display()
+    );
+    let main_text = "package demo; class Main { Person p; }\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{main_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(main_text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // A: quick fix on `Person` offers the closed project type's import.
+    let at_person = main_text.find("Person").unwrap() + 3;
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{{"textDocument":{{"uri":"{main_uri}"}},"range":{{"start":{{"line":0,"character":{at_person}}},"end":{{"line":0,"character":{at_person}}}}},"context":{{"diagnostics":[]}}}}}}"#
+    ));
+    let fixes = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        fixes.contains(r#""title":"Import 'demo.util.Person'""#),
+        "expected the add-import fix: {fixes}"
+    );
+    assert!(
+        fixes.contains(r#""isPreferred":true"#),
+        "a lone candidate is preferred: {fixes}"
+    );
+    assert!(
+        fixes.contains("import demo.util.Person;"),
+        "fix must carry the import edit: {fixes}"
+    );
+
+    // B: organize imports on a messy block — `Map` unused, order reversed.
+    let messy_uri = format!(
+        "file://{}",
+        root.join("src/main/java/demo/Messy.java").display()
+    );
+    let messy_text = "package demo;\n\nimport java.util.Map;\nimport java.util.List;\nimport java.io.File;\n\nclass Messy { List<File> l; }\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{messy_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(messy_text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/codeAction","params":{{"textDocument":{{"uri":"{messy_uri}"}},"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":0}}}},"context":{{"diagnostics":[],"only":["source.organizeImports"]}}}}}}"#
+    ));
+    let organize = read_until(&mut reader, "\"id\":3", &mut seen);
+    assert!(
+        organize.contains(r#""title":"Organize imports""#),
+        "expected the organize action: {organize}"
+    );
+    let organize_json: Value = serde_json::from_str(&organize).expect("parse organize response");
+    let new_text = organize_json["result"][0]["edit"]["changes"][&messy_uri][0]["newText"]
+        .as_str()
+        .expect("organize edit newText");
+    assert_eq!(
+        new_text, "import java.io.File;\nimport java.util.List;",
+        "unused Map dropped, rest sorted"
+    );
+
+    // C: the `only` filter excludes quick fixes from an organize request.
+    assert!(
+        !organize.contains("Import '"),
+        "only=source.organizeImports must filter out quick fixes: {organize}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":4", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

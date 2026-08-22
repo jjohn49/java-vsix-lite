@@ -1710,6 +1710,19 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                // M8a: add-import quick fixes + "Organize Imports" (VS Code's
+                // shift+alt+O and `source.organizeImports` on save both work
+                // through this).
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                        ]),
+                        resolve_provider: Some(false),
+                        work_done_progress_options: Default::default(),
+                    },
+                )),
                 completion_provider: Some(CompletionOptions {
                     // `.` requests member completion; identifier/keyword
                     // completion is requested explicitly (Ctrl-Space) or by the
@@ -2173,6 +2186,49 @@ impl LanguageServer for Backend {
                 },
             )),
         )
+    }
+
+    /// M8a: code actions — add-import quick fixes for the identifier under
+    /// the cursor plus "Organize Imports". `jvl_syntax::code_actions` returns
+    /// URI-less sketches; the request's own document URI is stamped on here.
+    /// The client's `context.only` filter is honored hierarchically (a
+    /// requested `source` matches our `source.organizeImports`).
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.ensure_workspace_index().await;
+        let uri = params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let Some(current) = docs.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let open = open_docs(&docs, uri.as_str(), current);
+        let index = LineIndex::new(&current.text, self.encoding());
+        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let sketches = jvl_syntax::code_actions(&open, 0, &index, params.range, &symbols);
+
+        let allowed = |kind: &str| match &params.context.only {
+            None => true,
+            Some(only) => only.iter().any(|k| {
+                let k = k.as_str();
+                k.is_empty() || kind == k || kind.starts_with(k) && kind.as_bytes()[k.len()] == b'.'
+            }),
+        };
+        let actions: Vec<CodeActionOrCommand> = sketches
+            .into_iter()
+            .filter(|s| allowed(s.kind))
+            .map(|s| {
+                CodeActionOrCommand::CodeAction(CodeAction {
+                    title: s.title,
+                    kind: Some(CodeActionKind::new(s.kind)),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri.clone(), s.edits)])),
+                        ..Default::default()
+                    }),
+                    is_preferred: s.is_preferred.then_some(true),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     /// M6.3: the strictly-lazy counterpart to `completion` — Javadoc is

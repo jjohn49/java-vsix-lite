@@ -28,6 +28,7 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 /// dependency on a specific tree-sitter version.
 pub use tree_sitter;
 
+mod codeaction;
 mod completion;
 mod definition;
 mod diagnostics;
@@ -46,6 +47,7 @@ mod signature_help;
 mod srcclass;
 mod structural;
 
+pub use codeaction::{code_actions, ActionSketch, KIND_ORGANIZE_IMPORTS, KIND_QUICKFIX};
 pub use completion::{completion, resolve_documentation, CompletionResult};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::member_diagnostics;
@@ -748,7 +750,9 @@ fn emit_namespace_path(
 
 /// Type-cased by Java convention: starts uppercase and contains at least one
 /// lowercase character (so `Math`/`Person` match, `MAX_VALUE` doesn't).
-fn looks_like_type_name(text: &str) -> bool {
+///
+/// `pub(crate)` (M8a): also gates `codeaction.rs`'s add-import quick fix.
+pub(crate) fn looks_like_type_name(text: &str) -> bool {
     text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && text.chars().any(|c| c.is_ascii_lowercase())
 }
