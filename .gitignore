@@ -24,3 +24,4 @@ bin/
 Thumbs.db
 *.swp
 .idea/
+editors/vscode/server/
