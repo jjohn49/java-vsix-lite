@@ -76,3 +76,51 @@ jobs:
         # which is unnecessary (and would need network) since node_modules is
         # already excluded from the VSIX via .vscodeignore.
         run: npx --no-install @vscode/vsce package --no-dependencies --out /tmp/java-vsix-lite-ci.vsix
+
+  # M8g: alpine/musl is a shipped release target (code-server hosts) — run
+  # the full Rust suite against it, not just a cross-build.
+  rust-alpine:
+    name: Rust tests (alpine/musl)
+    runs-on: ubuntu-latest
+    container: rust:alpine
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: apk add --no-cache build-base
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Test
+        run: cargo test --workspace --locked --offline
+
+  # M8g: extension integration tests — a real VS Code host loads the built
+  # extension + server and the suite asserts on the editor-side diagnostics
+  # collection (the layer the M7 publishDiagnostics-swallowing bug broke
+  # while every server-side test stayed green).
+  extension-integration:
+    name: VS Code extension (integration)
+    runs-on: ubuntu-latest
+    env:
+      # A JDK is installed below — the javac test must run, never skip.
+      JVL_TEST_REQUIRE_JAVAC: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build server
+        run: cargo build -p jvl-server --locked
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install (locked)
+        working-directory: editors/vscode
+        run: npm ci
+      - name: Integration tests
+        working-directory: editors/vscode
+        run: xvfb-run -a npm test

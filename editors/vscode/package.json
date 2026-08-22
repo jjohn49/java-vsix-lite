@@ -82,7 +82,11 @@
         },
         "java-vsix-lite.dependencies.autoDownload": {
           "type": "string",
-          "enum": ["prompt", "always", "never"],
+          "enum": [
+            "prompt",
+            "always",
+            "never"
+          ],
           "default": "prompt",
           "markdownDescription": "What to do when missing dependencies are detected (M7), in a trusted workspace: `prompt` asks once per session with a Download / Always / Never choice; `always` downloads silently from then on (same HTTPS + checksum verification, Maven Central only, as `Java: Download Missing Dependencies`); `never` disables the automatic check (the manual command still works). Choosing Always or Never from the prompt updates this setting for the current workspace."
         }
@@ -112,16 +116,20 @@
     "watch": "npm run build -- --sourcemap --watch",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "node ./out/test/runTest.js"
+    "test": "node ./out/test/runTest.js",
+    "pretest": "npm run build && tsc -p tsconfig.test.json"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.8",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.84.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.25.0",
     "eslint": "^8.56.0",
+    "mocha": "^10.7.3",
     "typescript": "^5.4.0",
     "vscode-languageclient": "^9.0.1"
   }
