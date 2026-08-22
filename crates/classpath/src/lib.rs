@@ -26,6 +26,10 @@ mod zip;
 
 pub use index::TypeEntry;
 use index::TypeIndex;
+/// Re-exported (M8b fix) so the server's `javac` locator can fall back to
+/// the same filesystem-probing JDK discovery the classpath layer uses — a
+/// GUI-launched editor has no `$JAVA_HOME`, but the JDK is still findable.
+pub use jdk::best_jdk;
 use zip::ZipArchive;
 
 /// A type read from bytecode: its fully-qualified name, its direct supertypes

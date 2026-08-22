@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 /// The best available JDK home (highest major version with jmods), or `None`.
-pub(crate) fn best_jdk() -> Option<PathBuf> {
+pub fn best_jdk() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("JAVA_HOME") {
         let home = PathBuf::from(home);
         if has_jmods(&home) {

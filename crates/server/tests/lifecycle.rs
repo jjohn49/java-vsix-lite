@@ -3355,3 +3355,77 @@ fn call_and_type_hierarchy_round_trip() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M8b fix: `checkProject` must locate `javac` with **no** `$JAVA_HOME` and
+/// no `jdk.home` override — the GUI-launched-editor environment — via the
+/// classpath layer's filesystem JDK discovery. This was a field failure:
+/// intellisense worked (jmods discovered by probing) while check-on-save
+/// reported "could not locate javac".
+#[test]
+fn check_project_locates_javac_without_java_home() {
+    if jvl_classpath::best_jdk()
+        .map(|h| h.join("bin").join("javac"))
+        .filter(|p| p.is_file())
+        .is_none()
+    {
+        eprintln!("skipping check_project_locates_javac_without_java_home: no JDK discoverable");
+        return;
+    }
+
+    let root = temp_root("javac-no-home");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    std::fs::write(
+        src_dir.join("Broken.java"),
+        "package demo;\n\npublic class Broken {\n    void m() {\n        int x = \"hello\";\n    }\n}\n",
+    )
+    .expect("write Broken.java");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env_remove("JAVA_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
+    );
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        result.contains("\"status\":\"ok\""),
+        "javac must be discoverable without $JAVA_HOME: {result}"
+    );
+    assert!(
+        result.contains("\"errorCount\":1"),
+        "expected the type error to be reported: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

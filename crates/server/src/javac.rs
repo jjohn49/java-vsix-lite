@@ -99,8 +99,20 @@ pub(crate) fn locate_javac(jdk_home_override: Option<&Path>) -> Option<PathBuf> 
         let candidate = home.join("bin").join(exe_name);
         return candidate.is_file().then_some(candidate);
     }
-    let home = std::env::var_os("JAVA_HOME")?;
-    let candidate = PathBuf::from(home).join("bin").join(exe_name);
+    if let Some(home) = std::env::var_os("JAVA_HOME") {
+        let candidate = PathBuf::from(home).join("bin").join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // M8b fix: a GUI-launched editor (macOS especially) has no `$JAVA_HOME`
+    // in its environment even when a JDK is installed. Fall back to the
+    // classpath layer's JDK discovery — the same filesystem probing
+    // (`/Library/Java/JavaVirtualMachines`, `/usr/lib/jvm`, `java` on PATH)
+    // that already found the jmods powering intellisense; it never spawns a
+    // process, and a jmods-bearing JDK always ships `javac`.
+    let home = jvl_classpath::best_jdk()?;
+    let candidate = home.join("bin").join(exe_name);
     candidate.is_file().then_some(candidate)
 }
 
