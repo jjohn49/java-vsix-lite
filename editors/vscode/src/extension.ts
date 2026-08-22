@@ -266,6 +266,25 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
         .getConfiguration("java-vsix-lite")
         .get<number>("javac.timeoutSecs", 120),
     },
+    middleware: {
+      // M7 (fixed): the first `publishDiagnostics` after startup signals
+      // that the classpath has been built at least once — the proactive
+      // dependency check's trigger. This MUST be middleware, never
+      // `client.onNotification("textDocument/publishDiagnostics", …)`:
+      // the underlying jsonrpc connection keeps ONE handler per method, so
+      // a user-registered handler *replaces* the client's built-in
+      // diagnostics handling and silently kills every squiggle, Problems
+      // entry, and error file-name decoration (field-reported).
+      handleDiagnostics: (uri, diagnostics, next) => {
+        next(uri, diagnostics);
+        if (!proactiveTriggerFired) {
+          proactiveTriggerFired = true;
+          if (client) {
+            void maybeProactiveDependencyCheck(client);
+          }
+        }
+      },
+    },
   };
 
   client = new LanguageClient(
@@ -285,21 +304,6 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
 
   client.onDidChangeState((event) => updateStatus(event.newState));
   context.subscriptions.push(client);
-
-  // M7: the first `publishDiagnostics` after startup is this session's
-  // signal that the classpath has been built at least once (see
-  // `maybeProactiveDependencyCheck`'s doc comment) — disposed after firing
-  // once, since the check itself is also one-shot per session.
-  const proactiveCheckListener = client.onNotification(
-    "textDocument/publishDiagnostics",
-    () => {
-      proactiveCheckListener.dispose();
-      if (client) {
-        void maybeProactiveDependencyCheck(client);
-      }
-    },
-  );
-  context.subscriptions.push(proactiveCheckListener);
 
   await client.start();
 }
@@ -538,6 +542,12 @@ async function startDownloadProgress(
 // still-empty classpath). Trust-gated and single-flight-guarded exactly like
 // the manual command, since it can trigger the same network + `~/.m2` write.
 let proactiveDependencyCheckDone = false;
+
+// M7 (fixed): set by the diagnostics middleware the first time the server
+// publishes diagnostics — the "classpath built at least once" trigger for
+// the proactive check. Session-scoped like `proactiveDependencyCheckDone`
+// (the check itself is one-shot regardless).
+let proactiveTriggerFired = false;
 
 type AutoDownloadSetting = "prompt" | "always" | "never";
 
