@@ -25,7 +25,7 @@ java-vsix-lite provides core Java editing features without the overhead of a JVM
 - **Missing dependency download** — a declared dependency not yet in `~/.m2` can be fetched from Maven Central: run **Java: Download Missing Dependencies**, or accept the one-time prompt shown after opening a project with unresolved dependencies (see `java-vsix-lite.dependencies.autoDownload`). Workspace-trust-gated; HTTPS with checksum verification; nothing downloaded is ever executed
 - **Code actions** — add-import quick fixes for unresolved type names (lightbulb on the name) and **Organize Imports** (sorts, dedupes, drops unused — conservatively: a name referenced only in Javadoc keeps its import)
 - **Refactoring & code generation** — extract a selected expression to a local variable or a `private static final` constant; generate getters/setters, an all-fields constructor, `equals()`/`hashCode()`, and `toString()` from the Source Action menu
-- **Check Project (javac)** — a workspace-trust-gated `javac` check (annotation processing disabled) reporting real compiler errors in the Problems panel — no resident JVM. Runs on demand via the command, and automatically after saving a Java file (debounced and silent; disable with `java-vsix-lite.javac.checkOnSave`)
+- **Check Project (javac)** — a workspace-trust-gated `javac` check (annotation processing disabled) reporting real compiler errors in the Problems panel — no resident JVM. Runs on demand via the command, and automatically on project load and after saving a Java file (debounced and silent; disable with `java-vsix-lite.javac.checkOnSave`)
 
 ## Security posture
 

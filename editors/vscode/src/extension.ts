@@ -144,11 +144,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (
         doc.languageId === "java" &&
         doc.uri.scheme === "file" &&
-        vscode.workspace.isTrusted &&
-        vscode.workspace
-          .getConfiguration("java-vsix-lite")
-          .get<boolean>("javac.checkOnSave", true)
+        javacBackgroundCheckEnabled()
       ) {
+        scheduleSaveCheck();
+      }
+    }),
+  );
+
+  // M8b follow-up: granting trust mid-session unlocks the background check
+  // — run the on-load pass then, since activation skipped it.
+  context.subscriptions.push(
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      if (javacBackgroundCheckEnabled()) {
         scheduleSaveCheck();
       }
     }),
@@ -306,6 +313,27 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(client);
 
   await client.start();
+
+  // M8b follow-up: one silent check when the project loads (and again after
+  // a server restart), so pre-existing errors surface without waiting for
+  // the first save. Same gate, debounce, and single-flight as the on-save
+  // path — a save landing during startup simply coalesces with this run.
+  if (javacBackgroundCheckEnabled()) {
+    scheduleSaveCheck();
+  }
+}
+
+// Shared gate for the background (save/load-triggered) javac checks:
+// trusted workspace + the `javac.checkOnSave` setting + a real workspace
+// folder to collect sources from.
+function javacBackgroundCheckEnabled(): boolean {
+  return (
+    vscode.workspace.isTrusted &&
+    (vscode.workspace.workspaceFolders?.length ?? 0) > 0 &&
+    vscode.workspace
+      .getConfiguration("java-vsix-lite")
+      .get<boolean>("javac.checkOnSave", true)
+  );
 }
 
 async function restart(context: vscode.ExtensionContext): Promise<void> {
