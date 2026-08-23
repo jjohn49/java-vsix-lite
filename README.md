@@ -12,18 +12,11 @@ CPU/RAM usage.
 
 ## Measured footprint
 
-On an Apple Silicon Mac, a release-build microbenchmark against a clean, single-file temporary workspace produced these results. Latencies are medians from three fresh server launches; memory is resident set size sampled after completion.
+On an Apple Silicon Mac, a release-build benchmark across five established small Maven projects (Spring PetClinic, Apache Commons CLI, Gson, Joda-Time, JUnit 4) compared a first-use workflow — fresh server start, readiness, diagnostics, JDK/project completions, and workspace symbols — against the full JDT server in Red Hat Java 1.55.0.
 
-| Measurement | java-vsix-lite | Red Hat Java / JDT LS |
-|---|---:|---:|
-| Server initialization | 2.4 ms | 2.65 s |
-| First diagnostics after opening the file | 14 ms | 436 ms |
-| First completion | 0.65 ms | 3.01 s |
-| Repeated warm completion | 0.49 ms | 33 ms |
-| Idle resident memory after completion | 15 MB | 685 MB |
-| Installed language-server/client payload | approximately 4.1 MiB | 176 MiB |
+Across all measured runs the workflow averaged **≈157 ms and ≈17.9 MiB RSS** for java-vsix-lite versus **≈9.4 s and ≈931 MiB RSS** for Red Hat — roughly **60× faster and 52× lower-memory** for the shared operations tested. The installed payload is **≈4.1 MiB** versus **176 MiB**.
 
-The comparison used the full JDT server from Red Hat Java 1.54.0 with its normal heap settings, but excluded the additional syntax server started temporarily by Red Hat's default Hybrid mode. These figures demonstrate lower cold-start and idle overhead; they do not claim superiority for every large-project semantic operation. See the [full methodology, limitations, and transient `javac` measurement](editors/vscode/README.md#measured-footprint).
+These figures demonstrate substantially lower cold-start, idle-memory, and basic-editing overhead; they do **not** claim feature equivalence — Red Hat's Eclipse JDT engine provides broader refactoring and large-project semantic analysis. See the [full per-project results, methodology, and limits](editors/vscode/README.md#measured-footprint) in the extension README.
 
 ## Goals
 
@@ -33,9 +26,10 @@ The comparison used the full JDT server from Red Hat Java 1.54.0 with its normal
 - **Basic IntelliSense** — completion, hover, go-to-definition at a "good enough"
   level, including **signature-level IntelliSense for imported modules** (types,
   methods, fields, and signatures from dependency/JDK JARs).
-- **Compute-minded by default** — avoid indexing the entire project. Prefer lazy /
-  on-demand / open-files-only analysis. Any indexing must be incremental, bounded,
-  and cancellable.
+- **Compute-minded by default** — avoid eagerly indexing the entire project. Prefer
+  lazy / on-demand analysis; where closed project files must be consulted (references,
+  rename, workspace symbols, cross-file completion), the scan is lazy, bounded,
+  cancellable, and never executes project code.
 - **Maven & Gradle awareness** — detect the build system, surface dependencies, and
   provide a way to *pull and check that builds work*, while being mindful of compute.
 

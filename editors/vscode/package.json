@@ -9,6 +9,20 @@
     "type": "git",
     "url": "https://github.com/jjohn49/java-vsix-lite"
   },
+  "homepage": "https://github.com/jjohn49/java-vsix-lite#readme",
+  "bugs": {
+    "url": "https://github.com/jjohn49/java-vsix-lite/issues"
+  },
+  "keywords": [
+    "java",
+    "language-server",
+    "lsp",
+    "intellisense",
+    "lightweight"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
   "engines": {
     "vscode": "^1.84.0"
   },
@@ -21,6 +35,10 @@
   ],
   "main": "./dist/extension.js",
   "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "This extension launches a native language-server process and reads project files from a physical filesystem, so it does not run in virtual (non-filesystem) workspaces."
+    },
     "untrustedWorkspaces": {
       "supported": "limited",
       "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, the consent-gated dependency download, and Install Dependencies (which runs the project's Maven/Gradle build scripts) all stay disabled until the workspace is trusted.",
@@ -174,7 +192,11 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "test": "node ./out/test/runTest.js",
-    "pretest": "npm run build && tsc -p tsconfig.test.json"
+    "pretest": "npm run build && tsc -p tsconfig.test.json",
+    "package:vsix": "node scripts/package-vsix.mjs"
+  },
+  "overrides": {
+    "serialize-javascript": ">=7.0.5"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.8",

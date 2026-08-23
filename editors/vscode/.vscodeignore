@@ -10,4 +10,5 @@ package-lock.json
 **/*.map
 **/*.ts
 test-fixture/**
+test-fixture-untrusted/**
 tsconfig.test.json

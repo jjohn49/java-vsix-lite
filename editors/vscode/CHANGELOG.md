@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-08-22
 
-First tagged release. Pure-Rust language server (no JVM resident), thin
+First release. Pure-Rust language server (no JVM resident), thin
 TypeScript shell, security-first design: build scripts are never executed,
 network access is consent-gated, nothing downloaded is ever executed.
 
@@ -73,5 +73,7 @@ network access is consent-gated, nothing downloaded is ever executed.
   overridable via machine-scoped `maven.path` / `gradle.path`
 
 ### Platforms
-- Prebuilt for linux x64/arm64/alpine, macOS x64/arm64, windows x64;
-  published to the VS Code Marketplace and Open VSX
+- Prebuilt for linux x64/arm64, linux-alpine x64, macOS x64/arm64, and
+  windows x64; the release workflow packages a platform-specific VSIX for
+  each and publishes to the VS Code Marketplace and Open VSX on a version
+  tag. (Windows arm64 and alpine arm64 are not currently built.)

@@ -122,6 +122,25 @@ Everything works out of the box: the JDK, Maven, Gradle, and the server binary a
 
 This extension declares `untrustedWorkspaces.supported: "limited"`. Core features (highlighting, semantic tokens, diagnostics, outline, folding, hover, completion) work in untrusted workspaces. Features that require workspace trust (javac tier, build integration, dependency download) stay disabled until trust is granted.
 
+## Supported platforms
+
+Platform-specific builds are published for:
+
+- Linux x64 and arm64
+- Linux (Alpine/musl) x64
+- macOS x64 (Intel) and arm64 (Apple Silicon)
+- Windows x64
+
+Windows arm64 and Alpine arm64 are not currently built. The correct native server for your platform is bundled in the VSIX you install — no separate download or toolchain is needed at install time.
+
+## Using alongside other Java extensions
+
+java-vsix-lite is a standalone language server, not a companion to the Red Hat Java (Eclipse JDT) extension. Running both at once means two sets of diagnostics, completions, and hovers for the same files. For the lightweight experience this extension is designed for, **disable Red Hat Java (`redhat.java`) for the workspace** (Extensions view → Red Hat Java → Disable (Workspace)) so providers don't compete. Use Red Hat Java instead when you need its deeper, project-model-based refactoring and analysis.
+
+## Building from source
+
+Requires the Rust toolchain (to build `jvl-server`) and **Node.js 20 or newer** (the packaging tool `@vscode/vsce` needs Node 20+; it fails under Node 18). From `editors/vscode`, `npm run package:vsix` builds the release server, copies it into the bundled `server/` directory, and produces a `.vsix` — failing loudly if the server binary is missing rather than shipping a serverless package.
+
 ## License
 
 MIT — see the [LICENSE](LICENSE) file.
