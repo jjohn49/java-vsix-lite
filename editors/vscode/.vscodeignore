@@ -2,6 +2,7 @@
 .vscode-test/**
 src/**
 out/**
+scripts/**
 node_modules/**
 .gitignore
 .eslintrc.json
