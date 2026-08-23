@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1 — 2026-08-23
+
+### Fixed
+- Test-scope dependencies are now on the classpath. `src/test/java` is
+  analyzed like `src/main/java`, but the resolver was dropping the
+  project's own test-scope dependencies, so imports such as
+  `org.assertj.core.api.Assertions`, JUnit, Mockito, and the rest of
+  `spring-boot-starter-test` all reported as unresolved in test files.
+  Root test-scope deps (and their compile/runtime transitives) are now
+  included; transitive test scope is still dropped, so a compile
+  dependency never pulls in another library's test dependencies.
+
 ## 0.1.0 — 2026-08-22
 
 First release. Pure-Rust language server (no JVM resident), thin
