@@ -6,8 +6,8 @@ members = ["crates/classpath", "crates/server", "crates/syntax"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/john-h-johnston4/java-vsix-lite"
+license = "MIT"
+repository = "https://github.com/jjohn49/java-vsix-lite"
 publish = false
 
 # Pinned, shared dependency versions live here so every crate in the workspace

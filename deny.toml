@@ -10,7 +10,9 @@ ignore = []
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Permissive licenses only; this project is MIT OR Apache-2.0.
+# Permissive licenses only. This project is MIT-licensed; the entries below are
+# the licenses permitted for third-party dependencies (many Rust crates are
+# Apache-2.0 / BSD / etc.), not the license of this project.
 allow = [
     "MIT",
     "MIT-0",

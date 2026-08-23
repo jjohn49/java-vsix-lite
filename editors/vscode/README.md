@@ -124,4 +124,4 @@ This extension declares `untrustedWorkspaces.supported: "limited"`. Core feature
 
 ## License
 
-MIT OR Apache-2.0 — see the [LICENSE](LICENSE) file.
+MIT — see the [LICENSE](LICENSE) file.
