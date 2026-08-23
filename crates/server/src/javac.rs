@@ -275,10 +275,9 @@ pub(crate) fn parse_stderr(stderr: &str) -> Vec<RawDiagnostic> {
 fn parse_header(line: &str) -> Option<(String, u32, DiagnosticSeverity, String)> {
     let (marker_pos, marker_len, severity) = if let Some(p) = line.find(": error: ") {
         (p, ": error: ".len(), DiagnosticSeverity::ERROR)
-    } else if let Some(p) = line.find(": warning: ") {
-        (p, ": warning: ".len(), DiagnosticSeverity::WARNING)
     } else {
-        return None;
+        let p = line.find(": warning: ")?;
+        (p, ": warning: ".len(), DiagnosticSeverity::WARNING)
     };
     let before = &line[..marker_pos];
     let colon = before.rfind(':')?;
