@@ -168,7 +168,7 @@ jobs:
         # above); stamp it into package.json right before packaging.
         shell: bash
         working-directory: editors/vscode
-        run: npm version --no-git-tag-version "${VERSION}"
+        run: npm version --no-git-tag-version --allow-same-version "${VERSION}"
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
 
