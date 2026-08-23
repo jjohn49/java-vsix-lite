@@ -244,6 +244,53 @@ fn root_test_scope_dependency_and_its_compile_transitive_are_included() {
 }
 
 #[test]
+fn transitive_dep_versioned_by_project_parent_version_resolves() {
+    // A transitive dep whose <version> is the Maven built-in
+    // ${project.parent.version} must resolve to the parent's version. This is
+    // how swagger-core-jakarta versions swagger-annotations-jakarta, so getting
+    // it wrong drops the swagger v3 annotations from Spring/springdoc projects.
+    let f = fixture("parentver");
+    put_pom_only(
+        &f.m2,
+        "g",
+        "P",
+        "2.0",
+        "<project><groupId>g</groupId><artifactId>P</artifactId><version>2.0</version></project>",
+    );
+    put_artifact(
+        &f.m2,
+        "g",
+        "B",
+        "1.0",
+        "<project>\
+             <parent><groupId>g</groupId><artifactId>P</artifactId><version>2.0</version></parent>\
+             <groupId>g</groupId><artifactId>B</artifactId><version>1.0</version>\
+             <dependencies>\
+                 <dependency><groupId>g</groupId><artifactId>C</artifactId>\
+                     <version>${project.parent.version}</version></dependency>\
+             </dependencies>\
+         </project>",
+    );
+    put_artifact(&f.m2, "g", "C", "2.0", &simple_dep_pom(""));
+    std::fs::write(
+        f.root.join("pom.xml"),
+        simple_dep_pom(
+            "<dependency><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version></dependency>",
+        ),
+    )
+    .unwrap();
+
+    let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+    let result = resolve_maven_like_project(&f.root, &locator);
+    let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+    assert!(names.contains(&"B-1.0.jar".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"C-2.0.jar".to_string()),
+        "C versioned via project.parent.version resolved: {names:?}"
+    );
+}
+
+#[test]
 fn parent_pom_properties_resolve_version() {
     let f = fixture("parent-props");
     put_pom_only(

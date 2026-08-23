@@ -316,6 +316,15 @@ fn parse_effective_pom_raw_from_doc(
         .unwrap_or_default();
     let own_version = child_text(project, "version").map(|v| substitute(&v, &props));
 
+    // Capture the parent's coordinates before `.or()` consumes them below:
+    // Maven exposes them as the built-in `${project.parent.version}` /
+    // `${project.parent.groupId}` properties, and real POMs use them to version
+    // a dependency against their own parent (e.g. swagger-core-jakarta declares
+    // swagger-annotations-jakarta at `${project.parent.version}`). Without these
+    // the dependency version stays unresolved and the artifact is dropped.
+    let parent_group_prop = parent_group.clone();
+    let parent_version_prop = parent_version.clone();
+
     let group = own_group.or(parent_group).unwrap_or_default();
     let version = own_version.or(parent_version).unwrap_or_default();
 
@@ -325,6 +334,13 @@ fn parse_effective_pom_raw_from_doc(
     props.insert("project.groupId".into(), group.clone());
     props.insert("project.artifactId".into(), own_artifact.clone());
     props.insert("pom.version".into(), version.clone());
+    if let Some(pv) = &parent_version_prop {
+        props.insert("project.parent.version".into(), pv.clone());
+        props.insert("pom.parent.version".into(), pv.clone());
+    }
+    if let Some(pg) = &parent_group_prop {
+        props.insert("project.parent.groupId".into(), pg.clone());
+    }
 
     // dependencyManagement: parent's, overlaid with this pom's own entries
     // (including scope=import BOM merges) — this pom's declarations always
