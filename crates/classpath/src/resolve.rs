@@ -521,15 +521,18 @@ fn record_unresolved_version(dep: &RawDep, degraded: &mut Vec<String>) {
 
 /// Seed the graph from a pom's own direct dependencies (root pom, or a
 /// sibling multi-module pom — both are "depth 0" for nearest-wins purposes).
-/// Root-level filter: drop `test`; keep `compile`/`runtime`/`provided`.
-/// Root-declared `optional` deps are still included (the owning project
-/// itself compiles against them). Deps that can't be seeded (classifier
-/// variant, unresolved version) are recorded in `degraded`.
+/// Root-level scope policy: include the project's own dependencies of every
+/// scope, `test` included. The project's own test sources (`src/test/java`)
+/// are analyzed just like `src/main/java`, so their test-scope libraries
+/// (JUnit, AssertJ, Mockito, …) must be on the classpath or every test import
+/// resolves as missing. Test scope is still dropped *transitively* (see
+/// `resolve_transitive`), so seeding a root test dep pulls in its own
+/// compile/runtime dependencies but never another library's test deps.
+/// Root-declared `optional` deps are likewise kept (the owning project itself
+/// compiles against them). Deps that can't be seeded (classifier variant,
+/// unresolved version) are recorded in `degraded`.
 fn root_seeds(effective: &EffectivePom, seeds: &mut Vec<Seed>, degraded: &mut Vec<String>) {
     for dep in &effective.dependencies {
-        if dep.scope == "test" {
-            continue;
-        }
         if let Some(classifier) = &dep.classifier {
             record_classifier_skip(dep, classifier, degraded);
             continue;

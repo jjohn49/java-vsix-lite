@@ -205,6 +205,45 @@ fn test_scope_transitive_dropped_runtime_kept() {
 }
 
 #[test]
+fn root_test_scope_dependency_and_its_compile_transitive_are_included() {
+    // The project's own test-scope deps must be on the classpath: src/test/java
+    // is analyzed too, so JUnit/AssertJ/Mockito imports would otherwise all
+    // resolve as missing. Seeding a root test dep also pulls in that dep's own
+    // compile-scope transitives.
+    let f = fixture("roottest");
+    put_artifact(
+        &f.m2,
+        "g",
+        "T",
+        "1.0",
+        &simple_dep_pom(
+            "<dependency><groupId>g</groupId><artifactId>U</artifactId><version>1.0</version></dependency>",
+        ),
+    );
+    put_artifact(&f.m2, "g", "U", "1.0", &simple_dep_pom(""));
+    std::fs::write(
+        f.root.join("pom.xml"),
+        simple_dep_pom(
+            "<dependency><groupId>g</groupId><artifactId>T</artifactId><version>1.0</version>\
+                 <scope>test</scope></dependency>",
+        ),
+    )
+    .unwrap();
+
+    let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+    let result = resolve_maven_like_project(&f.root, &locator);
+    let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+    assert!(
+        names.contains(&"T-1.0.jar".to_string()),
+        "root test dep present: {names:?}"
+    );
+    assert!(
+        names.contains(&"U-1.0.jar".to_string()),
+        "root test dep's compile transitive present: {names:?}"
+    );
+}
+
+#[test]
 fn parent_pom_properties_resolve_version() {
     let f = fixture("parent-props");
     put_pom_only(
