@@ -221,6 +221,7 @@ fn parse_effective_pom_raw(
         .find(|n| n.is_element() && n.has_tag_name("parent"));
     let mut parent_props: HashMap<String, String> = HashMap::new();
     let mut parent_managed: HashMap<(String, String), ManagedDep> = HashMap::new();
+    let mut parent_dependencies: Vec<RawDep> = Vec::new();
     let mut parent_group = None;
     let mut parent_version = None;
     let mut degraded: Vec<String> = Vec::new();
@@ -251,6 +252,7 @@ fn parse_effective_pom_raw(
             Some(parent_effective) => {
                 parent_props = parent_effective.props;
                 parent_managed = parent_effective.managed;
+                parent_dependencies = parent_effective.dependencies;
                 parent_group = Some(parent_effective.group);
                 parent_version = Some(parent_effective.version);
                 degraded.extend(parent_effective.degraded);
@@ -279,6 +281,7 @@ fn parse_effective_pom_raw(
         chain_depth,
         parent_props,
         parent_managed,
+        parent_dependencies,
         parent_group,
         parent_version,
     );
@@ -294,6 +297,7 @@ fn parse_effective_pom_raw_from_doc(
     chain_depth: usize,
     parent_props: HashMap<String, String>,
     parent_managed: HashMap<(String, String), ManagedDep>,
+    parent_dependencies: Vec<RawDep>,
     parent_group: Option<String>,
     parent_version: Option<String>,
 ) -> RawEffective {
@@ -459,6 +463,25 @@ fn parse_effective_pom_raw_from_doc(
                 exclusions,
             });
         }
+    }
+
+    // Inherit the parent POM's <dependencies>: Maven adds them to the child
+    // (unlike <dependencyManagement>, which only supplies versions). Real POMs
+    // rely on this — e.g. datumbox-framework-storage declares
+    // datumbox-framework-common, so its child storage modules depend on it by
+    // inheritance alone. The child's own declaration of the same
+    // group:artifact wins over the inherited one.
+    if !parent_dependencies.is_empty() {
+        let own: HashSet<(String, String)> = dependencies
+            .iter()
+            .map(|d| (d.group.clone(), d.artifact.clone()))
+            .collect();
+        let mut merged: Vec<RawDep> = parent_dependencies
+            .into_iter()
+            .filter(|d| !own.contains(&(d.group.clone(), d.artifact.clone())))
+            .collect();
+        merged.append(&mut dependencies);
+        dependencies = merged;
     }
 
     // <modules> (multi-module aggregator poms).

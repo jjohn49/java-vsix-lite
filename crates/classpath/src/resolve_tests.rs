@@ -291,6 +291,54 @@ fn transitive_dep_versioned_by_project_parent_version_resolves() {
 }
 
 #[test]
+fn child_inherits_parent_pom_dependencies() {
+    // Maven adds a parent POM's <dependencies> to the child (not just
+    // <dependencyManagement>). datumbox relies on this: datumbox-framework-storage
+    // declares datumbox-framework-common, so its child storage modules depend on
+    // it by inheritance alone. Missing this dropped the whole common package.
+    let f = fixture("inheritdeps");
+    put_pom_only(
+        &f.m2,
+        "g",
+        "P",
+        "1.0",
+        "<project><groupId>g</groupId><artifactId>P</artifactId><version>1.0</version>\
+             <dependencies>\
+                 <dependency><groupId>g</groupId><artifactId>L</artifactId><version>1.0</version></dependency>\
+             </dependencies>\
+         </project>",
+    );
+    put_artifact(&f.m2, "g", "L", "1.0", &simple_dep_pom(""));
+    // Child B has parent P and no dependencies of its own; it must inherit L.
+    put_artifact(
+        &f.m2,
+        "g",
+        "B",
+        "1.0",
+        "<project>\
+             <parent><groupId>g</groupId><artifactId>P</artifactId><version>1.0</version></parent>\
+             <groupId>g</groupId><artifactId>B</artifactId><version>1.0</version>\
+         </project>",
+    );
+    std::fs::write(
+        f.root.join("pom.xml"),
+        simple_dep_pom(
+            "<dependency><groupId>g</groupId><artifactId>B</artifactId><version>1.0</version></dependency>",
+        ),
+    )
+    .unwrap();
+
+    let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+    let result = resolve_maven_like_project(&f.root, &locator);
+    let names: Vec<String> = result.jars.iter().map(|p| jar_name(p)).collect();
+    assert!(names.contains(&"B-1.0.jar".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"L-1.0.jar".to_string()),
+        "child inherits parent's dependency L: {names:?}"
+    );
+}
+
+#[test]
 fn parent_pom_properties_resolve_version() {
     let f = fixture("parent-props");
     put_pom_only(

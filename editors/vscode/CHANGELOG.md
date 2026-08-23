@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.2 — 2026-08-23
+
+### Fixed
+- Resolve the Maven built-in `${project.parent.version}` /
+  `${project.parent.groupId}` properties when computing dependency
+  versions. Some libraries version a dependency against their own parent
+  this way — notably `swagger-core-jakarta`, which declares
+  `swagger-annotations-jakarta` at `${project.parent.version}` — so the
+  version was left unresolved and the artifact dropped. This made
+  `io.swagger.v3.oas.annotations.*` (pulled in via springdoc-openapi)
+  report as unresolved in Spring projects such as cBioPortal. The full
+  swagger/springdoc chain now resolves.
+- Inherit a parent POM's `<dependencies>` into its child modules (Maven
+  adds them to the child, not only `<dependencyManagement>`). Some
+  multi-module libraries depend on a sibling only through the parent —
+  e.g. `datumbox-framework-storage` declares `datumbox-framework-common`,
+  which its storage child modules inherit — so without this the artifact
+  was never resolved and its whole package (`com.datumbox.framework.common.*`)
+  reported as unresolved.
+
 ## 0.1.1 — 2026-08-23
 
 ### Fixed

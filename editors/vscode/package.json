@@ -3,7 +3,7 @@
   "displayName": "java-vsix-lite",
   "description": "Minimal, low-compute Java language support for VS Code (pure-Rust default tier; optional opt-in javac tier).",
   "icon": "icon.png",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "java-vsix-lite",
   "license": "MIT",
   "repository": {
