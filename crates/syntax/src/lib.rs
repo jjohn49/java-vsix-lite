@@ -642,20 +642,18 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
             "import_declaration" => emit_namespace_path(node, true, source, index, &mut raw),
             // A plain identifier *usage* (not a declaration name handled above):
             // classify it from the file's declared names so references are lit.
-            "identifier" => {
-                if !is_classified_elsewhere(node) {
-                    let text = node_text(node, source);
-                    if let Some(&token_type) = roles.get(text) {
-                        emit(node, token_type, index, &mut raw);
-                    } else if looks_like_type_name(text) {
-                        // An undeclared, type-cased name (`Math` in
-                        // `Math.abs()`, `Person` in an expression) is a type
-                        // reference by Java convention — without this it
-                        // falls to TextMate's variable color (user report:
-                        // "Math turns light blue"). SCREAMING_CASE constants
-                        // don't match (no lowercase char) and stay untouched.
-                        emit(node, TT_TYPE, index, &mut raw);
-                    }
+            "identifier" if !is_classified_elsewhere(node) => {
+                let text = node_text(node, source);
+                if let Some(&token_type) = roles.get(text) {
+                    emit(node, token_type, index, &mut raw);
+                } else if looks_like_type_name(text) {
+                    // An undeclared, type-cased name (`Math` in
+                    // `Math.abs()`, `Person` in an expression) is a type
+                    // reference by Java convention — without this it
+                    // falls to TextMate's variable color (user report:
+                    // "Math turns light blue"). SCREAMING_CASE constants
+                    // don't match (no lowercase char) and stay untouched.
+                    emit(node, TT_TYPE, index, &mut raw);
                 }
             }
             _ => {}

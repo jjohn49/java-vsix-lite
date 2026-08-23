@@ -1391,10 +1391,8 @@ pub(crate) fn collect_bindings<'t>(
             | "constructor_declaration"
             | "compact_constructor_declaration"
             | "lambda_expression" => push_params(n, source, doc, &mut out),
-            k if is_type_decl(k) => {
-                if enclosing_type.is_none() {
-                    enclosing_type = Some(n);
-                }
+            k if is_type_decl(k) && enclosing_type.is_none() => {
+                enclosing_type = Some(n);
             }
             _ => {}
         }
