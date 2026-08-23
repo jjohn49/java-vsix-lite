@@ -1,4 +1,4 @@
-//! M8c: Lombok awareness — synthesize the members Lombok's annotation
+//! Lombok awareness — synthesize the members Lombok's annotation
 //! processor would generate (`@Getter`/`@Setter`/`@Data`/`@Value`/`@With`/
 //! `@Builder` accessors, fluent builders) so a project class using Lombok
 //! still completes, chains, and passes the unresolved-member check, even

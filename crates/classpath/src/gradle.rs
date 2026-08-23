@@ -19,7 +19,7 @@ const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 /// can be statically scraped out of its build files, located first in
 /// `gradle_cache` (`~/.gradle/caches`) and, failing that, in `m2_repo`
 /// (`~/.m2/repository`) — see [`FallbackLocator`]. The `~/.m2` fallback
-/// matters for M6.2: dependencies the user consents to download are always
+/// matters because dependencies the user consents to download are always
 /// installed into `~/.m2` (repo-agnostic `g:a:v` coordinates), regardless of
 /// whether the project is Maven or Gradle, so a Gradle project must also be
 /// able to *find* them there after a rebuild.
@@ -374,7 +374,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// M6.2: a dependency the user has downloaded lands in `~/.m2/repository`
+    /// A dependency the user has downloaded lands in `~/.m2/repository`
     /// (repo-agnostic `g:a:v` coordinates), regardless of whether the
     /// project is Maven or Gradle. A Gradle project must therefore be able to
     /// find it there too when the Gradle module cache doesn't have it —

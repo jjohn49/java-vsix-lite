@@ -1,4 +1,4 @@
-//! M8a: code actions — the "Organize Imports" source action and add-import
+//! Code actions — the "Organize Imports" source action and add-import
 //! quick fixes for unresolved type names.
 //!
 //! Both are pure text-edit producers over the open document; the server wraps
@@ -65,7 +65,7 @@ pub fn code_actions(
     };
 
     let mut out = add_import_actions(&ctx, index, range.start);
-    // M8d: extract variable/constant + source-generate actions.
+    // Extract variable/constant + source-generate actions.
     out.extend(crate::generate::refactor_actions(doc, index, range));
     if let Some(edit) = organize_imports_edit(doc, index) {
         out.push(ActionSketch {

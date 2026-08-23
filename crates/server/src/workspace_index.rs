@@ -1,4 +1,4 @@
-//! M4.5: workspace symbols via a lazy, bounded index of top-level Java types.
+//! Workspace symbols via a lazy, bounded index of top-level Java types.
 //!
 //! The index is built the first time a `workspace/symbol` request arrives —
 //! never at startup (open-files-first: zero cost until asked for) — and is
@@ -7,8 +7,10 @@
 //! - **Discovery** walks only the workspace's source roots (the conventional
 //!   `src/main/java`/`src/test/java`, plus any root inferred from an open
 //!   document's package declaration — see `Backend::source_roots` in
-//!   `main.rs`, reused as-is). `target/`, `build/`, `.git`, and any hidden
-//!   (dot-prefixed) directory are skipped.
+//!   `main.rs`, reused as-is), using the shared traversal in `fs_scan`
+//!   (`fs_scan::walk_java_files`) — the same walk `references`'s workspace
+//!   prefilter uses, just with a different per-file callback. `target/`,
+//!   `build/`, `.git`, and any hidden (dot-prefixed) directory are skipped.
 //! - **Per file**, the *filename* gives the public type's simple name — by
 //!   Java convention a `.java` file's name matches the type it declares — so
 //!   there is no parse at all. Only the first [`HEADER_BYTES`] of the file
@@ -24,13 +26,15 @@
 //!   walk). A monotonic generation counter marks each rebuild.
 //! - **Safety**: every path is canonicalized and checked against the
 //!   workspace boundary before being followed or indexed, so a symlink that
-//!   escapes the workspace root is skipped rather than read.
+//!   escapes the workspace root is skipped rather than read — see
+//!   `fs_scan::walk_java_files` for the shared symlink-escape and
+//!   symlink-cycle protection this and `references` both rely on.
 //!
 //! Open documents are *not* looked up here — `jvl_syntax::document_symbols`
 //! is always more precise (a real parse) and must shadow whatever the index
 //! says about that same file; see the `symbol` handler in `main.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -48,11 +52,6 @@ pub(crate) const DEFAULT_CAP: usize = 5_000;
 /// Bytes read from the head of each candidate `.java` file — enough for a
 /// `package` declaration and the type's own keyword, never a full parse.
 const HEADER_BYTES: usize = 4096;
-
-/// Directory names skipped unconditionally while walking (build output and
-/// VCS metadata never contain source worth indexing). Hidden (dot-prefixed)
-/// directories are skipped separately, by name pattern.
-const SKIPPED_DIR_NAMES: [&str; 3] = ["target", "build", ".git"];
 
 /// One top-level Java type discovered by filename + header scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,8 +136,9 @@ impl WorkspaceIndex {
     ///
     /// Cancellable in practice via tower-lsp's own request-cancellation
     /// (dropping this future mid-walk): the walk yields to the runtime
-    /// periodically (see [`walk_root`]) instead of running one uninterrupted
-    /// synchronous burst, so a dropped future actually stops promptly.
+    /// periodically (see [`crate::fs_scan::walk_java_files`]) instead of
+    /// running one uninterrupted synchronous burst, so a dropped future
+    /// actually stops promptly.
     pub(crate) async fn ensure_built(&self, roots: &[PathBuf], boundary: Option<&Path>) {
         let should_rebuild = {
             let inner = self.inner.lock().expect("workspace index poisoned");
@@ -158,7 +158,19 @@ impl WorkspaceIndex {
                 truncated = true;
                 continue; // still record every root's mtime, just stop scanning
             }
-            if walk_root(root, boundary_canon.as_deref(), self.cap, &mut entries).await {
+            let cap = self.cap;
+            let stopped_early =
+                crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
+                    if entries.len() >= cap {
+                        return false;
+                    }
+                    if let Some(entry) = index_file(path) {
+                        entries.push(entry);
+                    }
+                    true
+                })
+                .await;
+            if stopped_early {
                 truncated = true;
             }
         }
@@ -187,7 +199,7 @@ impl WorkspaceIndex {
     /// paths" lookup a future add-import feature (and, if it doesn't already
     /// have one, go-to-definition's unopened-file ladder step) can reuse
     /// rather than re-walking the workspace itself. `project_symbols`
-    /// (M7) needed package-exact lookup instead (see `find_type`), so this
+    /// needed package-exact lookup instead (see `find_type`), so this
     /// still has no production caller — only this module's own tests.
     #[allow(dead_code)]
     pub(crate) fn paths_for_simple_name(&self, name: &str) -> Vec<PathBuf> {
@@ -200,7 +212,7 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    /// M7: the file declaring the exact `(package, simple_name)` pair —
+    /// The file declaring the exact `(package, simple_name)` pair —
     /// `project_symbols`'s FQN-to-file lookup for closed-file completion.
     /// The first match wins (two same-named top-level types in the same
     /// package is invalid Java; ambiguity here just means "one of them").
@@ -213,7 +225,7 @@ impl WorkspaceIndex {
             .map(|e| e.path.clone())
     }
 
-    /// M7: entries whose simple name starts with `prefix` (case-insensitive),
+    /// Entries whose simple name starts with `prefix` (case-insensitive),
     /// shortest-name-first, capped at `limit`; the bool reports whether the
     /// cap cut candidates off. The classpath-index counterpart to
     /// `jvl_classpath::Classpath::types_with_prefix`, so project types
@@ -239,7 +251,7 @@ impl WorkspaceIndex {
         (hits.into_iter().take(limit).cloned().collect(), truncated)
     }
 
-    /// M7: immediate child packages and top-level types of a dotted package
+    /// Immediate child packages and top-level types of a dotted package
     /// (`""` = roots) — the project-source counterpart to
     /// `jvl_classpath::Classpath::package_children`, for import-path
     /// completion across project files. Nested types aren't tracked by this
@@ -291,90 +303,6 @@ fn needs_rebuild(inner: &Inner, roots: &[PathBuf]) -> bool {
     roots
         .iter()
         .any(|root| inner.root_mtimes.get(root).copied() != Some(root_mtime(root)))
-}
-
-/// Walk `root` for `.java` files, pushing an entry per file into `entries`
-/// (stopping at `cap`). Returns whether the walk was truncated by the cap.
-/// Yields to the tokio runtime every so often so a cancelled (dropped)
-/// caller future actually stops rather than running to completion.
-async fn walk_root(
-    root: &Path,
-    boundary: Option<&Path>,
-    cap: usize,
-    entries: &mut Vec<SymbolEntry>,
-) -> bool {
-    let mut truncated = false;
-    let mut stack = vec![root.to_path_buf()];
-    let mut since_yield = 0usize;
-    // Canonical directory paths already walked: a symlink inside the root
-    // that points at a sibling directory (already-visited or not-yet-visited
-    // — either way, the same canonical target) would otherwise index its
-    // contents twice, and one pointing at an ancestor would re-walk the same
-    // subtree indefinitely (bounded only by `cap`, and filling the index
-    // with duplicates before hitting it). Recording the canonical path here
-    // — already computed for the boundary check below — and skipping an
-    // already-seen one closes both holes.
-    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-    if let Ok(root_canon) = fs::canonicalize(root) {
-        visited_dirs.insert(root_canon);
-    }
-
-    while let Some(dir) = stack.pop() {
-        if entries.len() >= cap {
-            truncated = true;
-            break;
-        }
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for dir_entry in read_dir.flatten() {
-            if entries.len() >= cap {
-                truncated = true;
-                break;
-            }
-
-            let path = dir_entry.path();
-            let name = dir_entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name_str.as_ref()) {
-                continue;
-            }
-
-            // Canonicalize + boundary check up front: this is also what
-            // keeps a symlink escaping the workspace root from being
-            // followed (a dir) or read (a file).
-            let Ok(canon) = fs::canonicalize(&path) else {
-                continue;
-            };
-            if let Some(boundary) = boundary {
-                if !canon.starts_with(boundary) {
-                    continue;
-                }
-            }
-
-            if canon.is_dir() {
-                if !visited_dirs.insert(canon) {
-                    // Already-walked canonical directory: a same-root
-                    // sibling symlink (would duplicate every file under it)
-                    // or an ancestor symlink (would cycle). Skip either way.
-                    continue;
-                }
-                stack.push(path);
-            } else if name_str.ends_with(".java") {
-                if let Some(entry) = index_file(&path) {
-                    entries.push(entry);
-                }
-            }
-
-            since_yield += 1;
-            if since_yield >= 64 {
-                since_yield = 0;
-                tokio::task::yield_now().await;
-            }
-        }
-    }
-
-    truncated
 }
 
 /// Index a single `.java` file: simple name from the filename (no parse),
@@ -793,7 +721,7 @@ mod tests {
         );
     }
 
-    // --- M7: project-source symbol layer query methods ---
+    // --- Project-source symbol layer query methods ---
 
     async fn person_index() -> (WorkspaceIndex, PathBuf) {
         let root = temp_dir("project-symbols");

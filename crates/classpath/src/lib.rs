@@ -26,10 +26,10 @@ mod zip;
 
 pub use index::TypeEntry;
 use index::TypeIndex;
-/// Re-exported (M8b fix) so the server's `javac` locator can fall back to
+/// Re-exported so the server's `javac` locator can fall back to
 /// the same filesystem-probing JDK discovery the classpath layer uses — a
 /// GUI-launched editor has no `$JAVA_HOME`, but the JDK is still findable.
-pub use jdk::best_jdk;
+pub use jdk::{best_jdk, jdk_feature_version};
 use zip::ZipArchive;
 
 /// A type read from bytecode: its fully-qualified name, its direct supertypes
@@ -66,12 +66,12 @@ pub struct Member {
     /// e.g. `boolean add({0})`. `None` when the member uses no type variables.
     pub template: Option<String>,
     pub is_static: bool,
-    /// M7: dotted FQN of the **erased** method return type / field declared
+    /// Dotted FQN of the **erased** method return type / field declared
     /// type, from the descriptor (`Ljava/util/stream/Stream;` →
     /// `java.util.stream.Stream`) — what a `recv.member().` chain resolves
     /// through. `None` for primitives, `void`, arrays, and constructors.
     pub ret_fqn: Option<String>,
-    /// M7: the generic return/field type alone, in the same `{i}` template
+    /// The generic return/field type alone, in the same `{i}` template
     /// convention as [`Member::template`] (`Stream<{0}>`, `{0}`), so a chain
     /// can substitute use-site type arguments before re-resolving. `None`
     /// without a `Signature` attribute, for `void`, and for constructors.
@@ -120,7 +120,7 @@ pub struct Classpath {
     /// local cache, or a resolution bound was hit) — e.g. for surfacing
     /// "IntelliSense partial: N unresolved deps" to the user.
     degraded: Vec<String>,
-    /// M5.4: every dependency jar path added via [`Classpath::add_jar`], in
+    /// Every dependency jar path added via [`Classpath::add_jar`], in
     /// the order added — a record of what was already resolved, not a new
     /// resolution path. This is the only external caller of this crate that
     /// needs real filesystem paths rather than bytecode lookups: the one-shot
@@ -128,7 +128,7 @@ pub struct Classpath {
     /// are deliberately excluded — javac's own installation already supplies
     /// its bootclasspath, and jmods aren't valid `-cp` entries anyway).
     entries: Vec<PathBuf>,
-    /// M7: lazily-built type-name index over every archive's central
+    /// Lazily-built type-name index over every archive's central
     /// directory (see [`index`]) — powers classpath type-name completion,
     /// auto-import, and import-path completion. Built at most once per
     /// `Classpath`; a rebuild swaps in a whole new `Classpath`, so the index
@@ -194,11 +194,14 @@ impl Classpath {
             cp.source_roots.extend(maven.source_roots);
             cp.degraded.extend(maven.degraded);
 
-            let gradle = gradle::resolve_project(
-                root,
-                &home.join(".gradle/caches"),
-                &home.join(".m2/repository"),
-            );
+            // Gradle's cache honors `$GRADLE_USER_HOME` (commonly relocated
+            // outside `$HOME` in CI and governed environments like Foundry),
+            // falling back to `~/.gradle`.
+            let gradle_caches = gradle_user_home()
+                .unwrap_or_else(|| home.join(".gradle"))
+                .join("caches");
+            let gradle =
+                gradle::resolve_project(root, &gradle_caches, &home.join(".m2/repository"));
             for jar in &gradle.jars {
                 cp.add_jar(jar);
             }
@@ -215,7 +218,7 @@ impl Classpath {
     }
 
     /// Dependency jar paths added via [`Classpath::add_jar`] (JDK jmods are
-    /// not included — see the field doc on `entries`). M5.4: the one-shot
+    /// not included — see the field doc on `entries`). The one-shot
     /// `javac` check command's `-cp` argument.
     pub fn entries(&self) -> &[PathBuf] {
         &self.entries
@@ -228,7 +231,7 @@ impl Classpath {
         &self.degraded
     }
 
-    /// M6.2: [`degraded`](Self::degraded) entries parsed into structured
+    /// [`degraded`](Self::degraded) entries parsed into structured
     /// coordinates, for the `jvl/missingDependencies` request that backs the
     /// consent-gated dependency download command. Unparseable entries
     /// (project-structure problems like an unreadable parent/module pom, or
@@ -294,7 +297,7 @@ impl Classpath {
         None
     }
 
-    /// M7: the lazily-built name index (see [`index`]). First call walks every
+    /// The lazily-built name index (see [`index`]). First call walks every
     /// archive's central-directory names (strings already in memory — no
     /// bytecode parsing, no extra IO); subsequent calls are free.
     fn name_index(&self) -> &TypeIndex {
@@ -313,14 +316,14 @@ impl Classpath {
         })
     }
 
-    /// M7: classpath types whose simple name starts with `prefix`
+    /// Classpath types whose simple name starts with `prefix`
     /// (case-insensitive), best-first, capped at `limit`; the bool reports
     /// whether the cap cut candidates off (LSP `isIncomplete`).
     pub fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeEntry>, bool) {
         self.name_index().types_with_prefix(prefix, limit)
     }
 
-    /// M7: immediate children of a dotted package (`""` = roots):
+    /// Immediate children of a dotted package (`""` = roots):
     /// `(subpackage segments, types)`, both sorted — the shape import-path
     /// completion walks.
     pub fn package_children(&self, package: &str) -> (Vec<String>, Vec<TypeEntry>) {
@@ -391,6 +394,17 @@ fn sources_jar_path(jar: &Path) -> Option<PathBuf> {
 /// The user's home directory, for locating `~/.m2` and `~/.gradle`.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The Gradle user home — `$GRADLE_USER_HOME` when set to a non-empty path
+/// (Gradle's own override, standard in CI and governed environments where the
+/// cache lives outside `$HOME`), else `~/.gradle`. `None` only when neither is
+/// available.
+fn gradle_user_home() -> Option<PathBuf> {
+    match std::env::var_os("GRADLE_USER_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => home_dir().map(|h| h.join(".gradle")),
+    }
 }
 
 /// A [`Classpath::degraded`] entry parsed into a structured coordinate — see
@@ -556,7 +570,7 @@ mod tests {
         );
     }
 
-    /// M7: real-JDK proof that chains have what they need — `stream()`
+    /// Real-JDK proof that chains have what they need — `stream()`
     /// (declared on `java.util.Collection`; `List` reaches it through the
     /// supers walk) carries its erased return FQN (+ generic display),
     /// `String.trim()` its FQN alone (no `Signature` attribute on a
@@ -595,7 +609,7 @@ mod tests {
         assert!(cp.package_children("").0.is_empty());
     }
 
-    /// M7: the name index over a real JDK — type-name prefix search finds
+    /// The name index over a real JDK — type-name prefix search finds
     /// `ArrayList`, package walking sees `java.util`'s children, and
     /// JDK-internal namespaces never surface.
     #[test]
@@ -668,7 +682,7 @@ mod tests {
         out
     }
 
-    /// M7 (user directive): dependency jars get full name-index IntelliSense
+    /// Dependency jars get full name-index IntelliSense
     /// — including `com.sun.*` namespaces that the JDK-scoped filter would
     /// hide if they came from a jmod.
     #[test]
@@ -704,7 +718,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// M6.3: real JDK bytecode surfaces `<init>` methods as `Constructor`
+    /// Real JDK bytecode surfaces `<init>` methods as `Constructor`
     /// members named after the class, with both a no-arg and a
     /// parameterized overload present.
     #[test]
@@ -854,7 +868,7 @@ mod generic_tests {
         out
     }
 
-    // M6.2: `parse_degraded_entry` must handle every shape `resolve.rs` and
+    // `parse_degraded_entry` must handle every shape `resolve.rs` and
     // `gradle.rs` actually produce (see their `degraded.push(...)` call
     // sites) — one case per distinct format string in this codebase today.
 

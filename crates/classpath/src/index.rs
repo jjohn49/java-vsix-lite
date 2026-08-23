@@ -1,4 +1,4 @@
-//! M7: a name index over every archive's central directory, so completion can
+//! A name index over every archive's central directory, so completion can
 //! offer classpath *type names* (with auto-import) and walk *package paths* —
 //! built lazily from entry-name strings already resident in memory. No
 //! bytecode is parsed here; a name's class is only ever loaded when the user

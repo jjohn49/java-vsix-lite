@@ -54,17 +54,17 @@ impl Imports {
         }
     }
 
-    /// M7: the single-type import path bound to a simple name, if any.
+    /// The single-type import path bound to a simple name, if any.
     pub(crate) fn single_import(&self, simple: &str) -> Option<&str> {
         self.single.get(simple).map(String::as_str)
     }
 
-    /// M7: whether `import <pkg>.*;` is in force.
+    /// Whether `import <pkg>.*;` is in force.
     pub(crate) fn has_wildcard(&self, pkg: &str) -> bool {
         self.wildcards.iter().any(|w| w == pkg)
     }
 
-    /// M7: the file's own package, if declared.
+    /// The file's own package, if declared.
     pub(crate) fn package(&self) -> Option<&str> {
         self.package.as_deref()
     }

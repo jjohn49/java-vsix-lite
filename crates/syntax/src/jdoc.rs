@@ -1,4 +1,4 @@
-//! M7.5: Javadoc → Markdown rendering, so hover and completion docs show
+//! Javadoc → Markdown rendering, so hover and completion docs show
 //! real sections instead of raw `@param`/`@return` tag soup.
 //!
 //! Input is the margin-stripped comment text `signature::strip_javadoc`

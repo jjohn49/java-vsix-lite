@@ -69,10 +69,30 @@ fn check(
     }
     let member = node_text(member_node, ctx.doc.source);
 
+    // A type-cased segment after a dot is a *nested type* or static-member
+    // reference (`Map.Entry`, `Map.Entry::getKey`, `Outer.Inner`), not an
+    // instance member — those live in the type namespace this member check
+    // doesn't model, so never flag them (conservative-by-design). camelCase
+    // members and SCREAMING_CASE constants (no lowercase) stay checked.
+    if member_field == "field" && crate::looks_like_type_name(member) {
+        return;
+    }
+
     // Receiver type must resolve; otherwise we cannot know its members.
     let Some(resolved) = resolve::resolve_receiver_type(object, ctx) else {
         return;
     };
+    // A receiver that resolves to `java.lang.Object` is almost always the
+    // erased fallback of generic inference we couldn't fully carry through a
+    // chain (`list.stream().findFirst().orElseThrow()`, a raw type variable),
+    // not a genuine `Object`-typed value. Flagging members on it produces a
+    // flood of false positives on ordinary generic code, so stay silent —
+    // consistent with this module's conservative-by-design policy.
+    if matches!(&resolved.ty, resolve::ResolvedType::External { fqn, .. } if fqn == "java.lang.Object")
+    {
+        return;
+    }
+
     let (names, complete) = resolve::member_names(&resolved, ctx);
     if complete && !names.contains(member) {
         out.push(diagnostic(
@@ -148,9 +168,9 @@ mod tests {
         assert!(diags(src, &ObjectAware(vec![])).is_empty());
     }
 
-    /// M7: array receivers know their complete member set — `length`/`clone`
+    /// Array receivers know their complete member set — `length`/`clone`
     /// plus Object's — so real members stay silent and bogus ones are
-    /// flagged (the pre-M7 resolver treated `a` as its *element* type).
+    /// flagged (an earlier resolver treated `a` as its *element* type).
     #[test]
     fn array_members_diagnose_correctly() {
         let src = "class C { void m(int[] a) { int n = a.length; a.clone(); a.toString(); } }\n";
@@ -183,6 +203,77 @@ mod tests {
     fn stays_silent_on_unresolved_receiver() {
         let src = "class C { void m() { mystery().nope(); } }\n";
         assert!(diags(src, &ObjectAware(vec![])).is_empty());
+    }
+
+    /// A nested-type reference in a method reference (`Map.Entry::getKey`)
+    /// must not be flagged as a missing field of the receiver.
+    #[test]
+    fn does_not_flag_nested_type_in_method_reference() {
+        let src = "import java.util.Map;\nclass C { void m() { Object r = Map.Entry.class; } }\n";
+        let symbols = ObjectAware(vec![(
+            "java.util.Map",
+            vec!["java.lang.Object"],
+            vec!["get"],
+        )]);
+        let msgs = diags(src, &symbols);
+        assert!(
+            !msgs.iter().any(|m| m.contains("Entry")),
+            "nested type falsely flagged: {msgs:?}"
+        );
+    }
+
+    /// A receiver that erased to `java.lang.Object` (the fallback of
+    /// generic inference we couldn't carry through a chain) is never flagged —
+    /// otherwise ordinary `list.stream().findFirst().orElseThrow().foo()`
+    /// floods with false positives.
+    #[test]
+    fn does_not_flag_members_on_object_receiver() {
+        let src = "class C { void m(Object o) { o.definitelyNotAMethod(); } }\n";
+        assert!(
+            diags(src, &ObjectAware(vec![])).is_empty(),
+            "Object receiver must never be flagged"
+        );
+    }
+
+    /// An enhanced-for `var` binds the element type, so member checks run
+    /// against the element (`Box`), not the array/collection (`Box[]`).
+    #[test]
+    fn enhanced_for_var_checks_element_type() {
+        // A real element member is not flagged (proves `b` is `Box`, not `Box[]`).
+        let ok = "class Box { int width; }\n\
+                  class C { void m(Box[] boxes) { for (var b : boxes) { int w = b.width; } } }\n";
+        assert!(
+            diags(ok, &ObjectAware(vec![])).is_empty(),
+            "element field must resolve: {:?}",
+            diags(ok, &ObjectAware(vec![]))
+        );
+        // A bogus element member is flagged.
+        let bad = "class Box { int width; }\n\
+                   class C { void m(Box[] boxes) { for (var b : boxes) { b.nope(); } } }\n";
+        assert!(
+            diags(bad, &ObjectAware(vec![]))
+                .iter()
+                .any(|m| m.contains("nope")),
+            "bogus element member should flag"
+        );
+    }
+
+    /// An in-project enum's `name()`/`ordinal()` (from the implicit
+    /// `java.lang.Enum` super) and its constants resolve — no false flags.
+    #[test]
+    fn enum_name_ordinal_and_constants_resolve() {
+        let src = "enum E { A, B; }\n\
+                   class C { void u(E e) { e.name(); e.ordinal(); E x = E.A; } }\n";
+        let syms = ObjectAware(vec![(
+            "java.lang.Enum",
+            vec!["java.lang.Object"],
+            vec!["name", "ordinal"],
+        )]);
+        assert!(
+            diags(src, &syms).is_empty(),
+            "enum members must resolve: {:?}",
+            diags(src, &syms)
+        );
     }
 
     #[test]

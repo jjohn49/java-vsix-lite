@@ -6,6 +6,27 @@ Minimal, low-compute Java language support for VS Code — powered by a pure-Rus
 
 java-vsix-lite provides core Java editing features without the overhead of a JVM-based toolchain. The language server (`jvl-server`) is written entirely in Rust and starts instantly. It focuses on the features developers use most, with a security-first design that runs safely in untrusted workspaces.
 
+## Measured footprint
+
+The following is a local microbenchmark on an Apple Silicon Mac, using a release build and a clean temporary single-file Java workspace. Times are the median of three fresh language-server launches; memory is one resident-set sample taken after completion had finished.
+
+| Measurement | java-vsix-lite | Red Hat Java / JDT LS |
+|---|---:|---:|
+| Server initialization | 2.4 ms | 2.65 s |
+| First diagnostics after opening the file | 14 ms | 436 ms |
+| First completion | 0.65 ms | 3.01 s |
+| Repeated warm completion | 0.49 ms | 33 ms |
+| Idle resident memory after completion | 15 MB | 685 MB |
+| Installed language-server/client payload | approximately 4.1 MiB | 176 MiB |
+
+The comparison used the full JDT server bundled with locally installed Red Hat Java 1.54.0, launched with that extension's 100 MiB initial / 2 GiB maximum heap settings. It excludes the common VS Code extension-host process and Red Hat's temporary secondary syntax server; Red Hat's documented default **Hybrid** mode starts that syntax server while the full server is warming up. See [Red Hat Java launch modes](https://github.com/redhat-developer/vscode-java/blob/main/README.md#settings).
+
+The payload row compares java-vsix-lite's 3.73 MiB native server plus 365 KiB minified client bundle (package metadata and licenses add a small amount) with the installed 176 MiB platform-specific Red Hat extension, of which approximately 118 MiB is its embedded JRE and 53 MiB is its JDT server.
+
+This is evidence for substantially lower cold-start, idle-memory, and basic-editing overhead—not a claim that java-vsix-lite wins every workload. Red Hat's Eclipse JDT engine maintains a richer incremental project model and may perform better, and provide more complete results, for large-project semantic operations and refactoring.
+
+The automatic `javac` check is a separate, transient cost: compiling the repository's one-file test fixture took 0.29 s and reached 87 MiB maximum RSS, after which the JVM exited and released that memory. Real cost scales with the project because the check runs across its Java sources. It runs after trusted-project load and Java saves by default; set `java-vsix-lite.javac.checkOnSave` to `false` to disable it.
+
 ## Features
 
 - **Syntax highlighting and semantic tokens** — accurate Java token colouring driven by the Rust parser

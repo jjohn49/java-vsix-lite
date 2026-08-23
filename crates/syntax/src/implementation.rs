@@ -1,4 +1,4 @@
-//! M4 (4.6): go-to-implementation — bounded scan + supers confirm.
+//! Go-to-implementation — bounded scan + supers confirm.
 //!
 //! `textDocument/implementation` answers two related queries:
 //!
@@ -23,7 +23,7 @@
 //!   `model.rs`'s `super_type_nodes` — the same clause entries
 //!   [`TypeDecl::supers`] erases to simple names, so subclassing a concrete
 //!   class and implementing an interface are the same check). An entry
-//!   confirms iff its base simple name is the target's AND (fix round 1):
+//!   confirms iff its base simple name is the target's AND:
 //!   - **unqualified** (`implements Foo`): the name, read in the scanned
 //!     file's own import/package context, actually resolves to the target's
 //!     real declaration — [`crate::references::confirm_bare_type`], the
@@ -40,7 +40,7 @@
 //!   non-`static` method named `method_name` counts — `TypeDecl::own_members`
 //!   already excludes inherited members, so "didn't override, just
 //!   inherited" falls out for free, and a `static` same-named method hides
-//!   rather than overrides (fix round 1), so it is skipped too. Overloads
+//!   rather than overrides, so it is skipped too. Overloads
 //!   are matched by NAME only (no arity/parameter-type comparison — the
 //!   codebase's member model doesn't compare signatures structurally), so
 //!   an implementor declaring several same-named overloads is over-included:
@@ -256,7 +256,7 @@ pub fn implementations_in_doc(
         if td.doc != current {
             continue;
         }
-        // Per-supertype-entry confirm (fix round 1): an erased simple-name
+        // Per-supertype-entry confirm: an erased simple-name
         // match alone is not enough — `implements com.other.Foo` must not
         // pass on the strength of an unrelated `import com.example.Foo`.
         let implements_target = super_type_nodes(td.node).into_iter().any(|ty| {
@@ -291,7 +291,7 @@ fn push_hits_for(td: &TypeDecl, target: &ImplementationTarget, hits: &mut Vec<Im
         Some(method_name) => {
             for m in td.own_members() {
                 // Kind-aware (never a same-named field) and non-static only:
-                // a `static` method hides, it does not override (fix round 1).
+                // a `static` method hides, it does not override.
                 if m.name == method_name && matches!(m.kind, MemberKind::Method) && !m.is_static {
                     if let Some(site) = m.decl_site() {
                         hits.push(ImplementationHit {
@@ -324,7 +324,7 @@ mod tests {
             .expect("implementation target resolved")
     }
 
-    /// M4.6: an interface's type name resolves as a type-level target, and
+    /// An interface's type name resolves as a type-level target, and
     /// scanning a doc with an implementing class finds that class's own
     /// declaration.
     #[test]
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(hits[0].name_range, expected..expected + "Bar".len());
     }
 
-    /// M4.6: a method-level query on the interface's method resolves to the
+    /// A method-level query on the interface's method resolves to the
     /// overriding method declaration in the implementing class.
     #[test]
     fn interface_method_level_query_finds_overriding_method_decl() {
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(hits[0].name_range, expected..expected + "run".len());
     }
 
-    /// M4.6: a same-simple-name interface declared in a *different* package
+    /// A same-simple-name interface declared in a *different* package
     /// in a third doc must NOT be confirmed as the query's target — the
     /// scanned file's own import/package context must actually resolve
     /// `Foo` to the real target (mirrors `references.rs`'s
@@ -451,7 +451,7 @@ mod tests {
         );
     }
 
-    /// M4.6: concrete-class subclassing (not just interface implementing)
+    /// Concrete-class subclassing (not just interface implementing)
     /// works through the same `supers` mechanism, and a subclass that
     /// doesn't override the method is skipped at the method level (it
     /// inherits — nothing new to jump to).
@@ -519,7 +519,7 @@ mod tests {
         );
     }
 
-    /// M4.6 fix round 1 (Important, false positive): a scanned file that
+    /// A scanned file that
     /// imports the target (`com.example.Foo`) but whose `implements` clause
     /// names a *fully-qualified different* type (`com.other.Foo`) must NOT
     /// be reported — the qualified supertype reference bypasses imports
@@ -560,7 +560,7 @@ mod tests {
         );
     }
 
-    /// M4.6 fix round 1 (Important, false negative): a scanned file with NO
+    /// A scanned file with NO
     /// import whose `implements` clause names the target *fully qualified*
     /// (`implements com.example.Foo`, matching the target's real package)
     /// IS a confirmed implementor.
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(hits[0].name_range, expected..expected + "Bar".len());
     }
 
-    /// M4.6 fix round 1 (Minor): a `static` method with the same name in a
+    /// A `static` method with the same name in a
     /// subclass hides — it does not override — so a method-level query must
     /// not report it.
     #[test]

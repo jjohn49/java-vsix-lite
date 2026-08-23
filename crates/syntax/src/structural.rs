@@ -1,8 +1,6 @@
-//! M6.1: structural, purely-syntactic Java-rule diagnostics (JLS file/type/
+//! Structural, purely-syntactic Java-rule diagnostics (JLS file/type/
 //! member "shape" checks) — file naming, package-vs-directory, duplicate
 //! declarations, and a conservative set of illegal modifier combinations.
-//! See the task-21 report for the full JLS survey and the implement/defer
-//! rationale for every rule considered.
 //!
 //! **Zero false positives is a hard requirement**: every check here stays
 //! silent whenever the node(s) it inspects (or a node it must trust, like a

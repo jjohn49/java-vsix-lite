@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(size.template, None);
     }
 
-    /// M6.3: `<init>` methods are surfaced as `Constructor` members named
+    /// `<init>` methods are surfaced as `Constructor` members named
     /// after the declaring class (not `<init>`), rendered `ClassName(params)`
     /// — one plain, one carrying its own generic type parameter (so its
     /// template renders the type variable by name, same shadow-by-name rule
@@ -595,7 +595,7 @@ mod tests {
             .any(|m| m.name == "plain" && matches!(m.kind, MemberKind::Method)));
     }
 
-    // --- M7: structured member result types (chain resolution) ---
+    // --- structured member result types (chain resolution) ---
 
     #[test]
     fn generic_return_carries_erased_fqn_and_display_template() {
@@ -711,7 +711,7 @@ mod tests {
         assert!(info.members.is_empty(), "{:?}", info.members);
     }
 
-    /// M6.3 fix round 1: private and package-private `<init>` methods go
+    /// Private and package-private `<init>` methods go
     /// through the same `method_visible` gate as regular methods — only
     /// public/protected constructors are surfaced as `Constructor` members.
     #[test]

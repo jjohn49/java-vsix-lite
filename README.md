@@ -6,8 +6,24 @@ lightweight alternative to the heavyweight Eclipse JDT–based extensions (e.g. 
 JDT Language Server), trading exhaustive features for a small footprint and low
 CPU/RAM usage.
 
-> Status: **planning — architecture decided** (see below). No implementation yet.
-> This README is the source of truth for the design the implementation plan must satisfy.
+> Status: **active implementation**. Current user-facing features, security behavior,
+> and benchmark methodology are documented in the
+> [VS Code extension README](editors/vscode/README.md).
+
+## Measured footprint
+
+On an Apple Silicon Mac, a release-build microbenchmark against a clean, single-file temporary workspace produced these results. Latencies are medians from three fresh server launches; memory is resident set size sampled after completion.
+
+| Measurement | java-vsix-lite | Red Hat Java / JDT LS |
+|---|---:|---:|
+| Server initialization | 2.4 ms | 2.65 s |
+| First diagnostics after opening the file | 14 ms | 436 ms |
+| First completion | 0.65 ms | 3.01 s |
+| Repeated warm completion | 0.49 ms | 33 ms |
+| Idle resident memory after completion | 15 MB | 685 MB |
+| Installed language-server/client payload | approximately 4.1 MiB | 176 MiB |
+
+The comparison used the full JDT server from Red Hat Java 1.54.0 with its normal heap settings, but excluded the additional syntax server started temporarily by Red Hat's default Hybrid mode. These figures demonstrate lower cold-start and idle overhead; they do not claim superiority for every large-project semantic operation. See the [full methodology, limitations, and transient `javac` measurement](editors/vscode/README.md#measured-footprint).
 
 ## Goals
 

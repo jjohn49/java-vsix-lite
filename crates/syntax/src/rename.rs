@@ -1,9 +1,9 @@
-//! M4.4: rename — conservative, refuse rather than corrupt.
+//! Rename — conservative, refuse rather than corrupt.
 //!
 //! This module supplies the syntax-level primitives the server's
 //! `prepareRename`/`rename` handlers build on; the server owns the
 //! orchestration (scanning, WorkspaceEdit assembly, the file-rename
-//! resource op), same division of labor as M4.3's find-references (see
+//! resource op), same division of labor as find-references (see
 //! `references.rs`'s module doc).
 //!
 //! - [`prepare_rename`] answers `textDocument/prepareRename`: `Some` only
@@ -306,7 +306,7 @@ mod tests {
         assert!(!is_valid_new_name("true"));
     }
 
-    /// M4.4 fix round 1: `goto`/`const` are JLS §3.9 reserved-but-unusable
+    /// `goto`/`const` are JLS §3.9 reserved-but-unusable
     /// keywords and a lone `_` is reserved since Java 9 — none appear in the
     /// completion-oriented `KEYWORDS` list, but a rename must refuse all
     /// three (while `_`-prefixed and `_`-containing names stay legal).
@@ -326,7 +326,7 @@ mod tests {
         assert!(!is_valid_new_name("a b"));
     }
 
-    /// M4.4: `prepareRename` on a local variable resolves to the identifier's
+    /// `prepareRename` on a local variable resolves to the identifier's
     /// own range at the cursor, with the current name as the placeholder.
     #[test]
     fn prepare_rename_on_local_var_returns_its_own_range_and_placeholder() {
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(prep.placeholder, "count");
     }
 
-    /// M4.4: `prepareRename` on an external (JDK) symbol is refused.
+    /// `prepareRename` on an external (JDK) symbol is refused.
     #[test]
     fn prepare_rename_on_external_symbol_is_refused() {
         let src = "import java.util.List;\nclass C { List l; }\n";
@@ -354,7 +354,7 @@ mod tests {
         assert!(prepare_at(&docs, 0, "List l").is_none());
     }
 
-    /// M4.4: `prepareRename` on a keyword or a literal is refused.
+    /// `prepareRename` on a keyword or a literal is refused.
     #[test]
     fn prepare_rename_on_keyword_or_literal_is_refused() {
         let src = "class C { void m() { boolean b = true; } }\n";
@@ -370,7 +370,7 @@ mod tests {
         assert!(prepare_at(&docs, 0, "true;").is_none());
     }
 
-    /// M4.4: a local variable collides with another local of the same name
+    /// A local variable collides with another local of the same name
     /// already bound in the same enclosing scope.
     #[test]
     fn local_var_collides_with_existing_sibling_local() {
@@ -388,7 +388,7 @@ mod tests {
         assert!(!collides_with_existing(&docs, &target, "c"));
     }
 
-    /// M4.4: a field collides with another field of the same name on the
+    /// A field collides with another field of the same name on the
     /// same type, but not with a same-named method (separate namespaces).
     #[test]
     fn field_collides_with_sibling_field_not_method() {
@@ -410,7 +410,7 @@ mod tests {
         assert!(!collides_with_existing(&docs, &target, "d"));
     }
 
-    /// M4.4 fix round 1: renaming a member to its own current name must not
+    /// Renaming a member to its own current name must not
     /// be misreported as a same-scope collision — the target itself is
     /// excluded from the sibling scan (fields and methods alike).
     #[test]
@@ -435,7 +435,7 @@ mod tests {
         assert!(!collides_with_existing(&docs, &method_target, "foo"));
     }
 
-    /// M4.4: a `public` top-level type is recognized as such; a nested type
+    /// A `public` top-level type is recognized as such; a nested type
     /// and a package-private top-level type are not.
     #[test]
     fn is_public_top_level_type_distinguishes_visibility_and_nesting() {

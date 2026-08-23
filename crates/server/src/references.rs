@@ -1,34 +1,39 @@
-//! M4.3: server-side orchestration for `textDocument/references` — the
+//! Server-side orchestration for `textDocument/references` — the
 //! bounded workspace prefilter that finds candidate files for `jvl_syntax`'s
 //! per-file semantic confirm (`jvl_syntax::references_in_doc`) to parse and
 //! check. See `Backend::references` in `main.rs` for the full two-tier
 //! orchestration (Tier 1 — file-local — never reaches this module at all;
 //! only Tier 2 — package-visible/protected/public — needs a workspace scan).
 //!
-//! This walk is structurally the same shape as `workspace_index`'s (skip
-//! `target/`/`build/`/`.git`/hidden dirs, canonicalize + boundary-check every
-//! path so a symlink can't escape the workspace root, de-duplicate visited
-//! canonical directories so an in-boundary symlink can't be walked twice or
-//! cycle forever, yield to the runtime periodically for cancellability) —
-//! it's a separate, independent implementation because its leaf action
-//! differs: a full-content substring search rather than a filename + 4KB
-//! header scan.
+//! The walk itself — skip `target/`/`build/`/`.git`/hidden dirs, canonicalize
+//! and boundary-check every path so a symlink can't escape the workspace
+//! root, de-duplicate visited canonical directories so an in-boundary
+//! symlink can't be walked twice or cycle forever, yield to the runtime
+//! periodically for cancellability — is the shared traversal in `fs_scan`
+//! (`fs_scan::walk_java_files`), the same walk `workspace_index` uses to
+//! build its index; only the leaf action and cap differ here: a full-content
+//! substring search against this scan's own file-count/byte caps, rather
+//! than a filename + 4KB header scan against the index's entry-count cap.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Hard cap on the number of `.java` files read in one prefilter scan.
-/// Hardcoded per the task brief (config-overridable later, not yet).
+/// Hardcoded for now (config-overridable later, not yet).
 pub(crate) const MAX_FILES_SCANNED: usize = 500;
 
 /// Hard cap on total bytes read across all files in one prefilter scan.
 pub(crate) const MAX_BYTES_SCANNED: usize = 20 * 1024 * 1024;
 
-/// Directory names skipped unconditionally while walking (mirrors
-/// `workspace_index::SKIPPED_DIR_NAMES`; kept as its own copy since the two
-/// walks are otherwise independent implementations).
-const SKIPPED_DIR_NAMES: [&str; 3] = ["target", "build", ".git"];
+/// Hard cap on a single candidate file's size for the substring prefilter.
+/// Without this, one pathologically large file (generated code, vendored
+/// source, a stray non-source blob sitting under a `.java` name) would be
+/// read wholesale by a single `fs::read` before [`MAX_BYTES_SCANNED`] ever
+/// gets a chance to notice — checking `metadata().len()` first is a cheap
+/// stat, not a full read, so it catches that case up front. Generous for
+/// real Java source (a few MB) — a guard against a pathology, not a
+/// functional limit.
+pub(crate) const MAX_SINGLE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The result of one bounded prefilter scan: candidate files whose raw bytes
 /// contain the searched identifier, and whether either cap cut the scan
@@ -57,66 +62,40 @@ pub(crate) async fn prefilter(
     let mut files_scanned = 0usize;
     let mut bytes_scanned = 0usize;
     let mut truncated = false;
-    let mut since_yield = 0usize;
 
-    'walk: for root in roots {
-        let mut stack = vec![root.clone()];
-        let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-        if let Ok(root_canon) = fs::canonicalize(root) {
-            visited_dirs.insert(root_canon);
-        }
-
-        while let Some(dir) = stack.pop() {
-            let Ok(read_dir) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for dir_entry in read_dir.flatten() {
+    for root in roots {
+        let stopped_early =
+            crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
                 if files_scanned >= MAX_FILES_SCANNED || bytes_scanned >= MAX_BYTES_SCANNED {
+                    return false;
+                }
+                let oversized = fs::metadata(path)
+                    .map(|meta| meta.len() > MAX_SINGLE_FILE_BYTES)
+                    .unwrap_or(false);
+                if oversized {
+                    // Can't read this file without defeating the point of a
+                    // per-file guard, so whether it contains `needle` is
+                    // genuinely unknown — conservatively mark the whole scan
+                    // incomplete (the same signal a hit aggregate cap sets)
+                    // rather than silently treating it as a non-match. Other
+                    // candidates keep being scanned; only this one is
+                    // skipped.
                     truncated = true;
-                    break 'walk;
+                    return true;
                 }
-
-                let path = dir_entry.path();
-                let name = dir_entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name_str.as_ref()) {
-                    continue;
-                }
-
-                // Canonicalize + boundary check up front — also what keeps a
-                // symlink escaping the workspace root from being followed (a
-                // dir) or read (a file).
-                let Ok(canon) = fs::canonicalize(&path) else {
-                    continue;
-                };
-                if let Some(boundary) = boundary_canon.as_deref() {
-                    if !canon.starts_with(boundary) {
-                        continue;
+                if let Ok(bytes) = fs::read(path) {
+                    files_scanned += 1;
+                    bytes_scanned += bytes.len();
+                    if contains_subslice(&bytes, needle_bytes) {
+                        files.push(path.to_path_buf());
                     }
                 }
-
-                if canon.is_dir() {
-                    if visited_dirs.insert(canon) {
-                        stack.push(path);
-                    }
-                    // Already-walked canonical directory (in-boundary
-                    // sibling symlink, or an ancestor symlink cycle): skip.
-                } else if name_str.ends_with(".java") {
-                    if let Ok(bytes) = fs::read(&path) {
-                        files_scanned += 1;
-                        bytes_scanned += bytes.len();
-                        if contains_subslice(&bytes, needle_bytes) {
-                            files.push(path);
-                        }
-                    }
-                }
-
-                since_yield += 1;
-                if since_yield >= 32 {
-                    since_yield = 0;
-                    tokio::task::yield_now().await;
-                }
-            }
+                true
+            })
+            .await;
+        if stopped_early {
+            truncated = true;
+            break;
         }
     }
 
@@ -170,6 +149,37 @@ mod tests {
         let result = prefilter(std::slice::from_ref(&root), Some(&root), "Widget").await;
         assert_eq!(result.files, vec![hit]);
         assert!(!result.truncated);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_skipped_without_a_full_read_and_marks_truncated() {
+        let root = temp_dir("oversized");
+        // Contains the needle, but too large for the per-file guard — must
+        // be excluded from the results (never read for the substring
+        // search) even though it *would* match, and must mark the scan
+        // `truncated` so a caller needing completeness (`rename`) can't
+        // mistake the skip for "no match".
+        let mut oversized_contents = "Widget".to_string();
+        oversized_contents.push_str(&"x".repeat(MAX_SINGLE_FILE_BYTES as usize));
+        write(&root, "src/Big.java", &oversized_contents);
+        let small_hit = write(
+            &root,
+            "src/Small.java",
+            "class Small { void Widget() {} }\n",
+        );
+
+        let result = prefilter(std::slice::from_ref(&root), Some(&root), "Widget").await;
+        assert_eq!(
+            result.files,
+            vec![small_hit],
+            "the oversized file must be excluded; a normal-sized candidate must still be found"
+        );
+        assert!(
+            result.truncated,
+            "an oversized candidate must mark the scan truncated, not silently skipped"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

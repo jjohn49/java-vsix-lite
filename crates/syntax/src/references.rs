@@ -1,4 +1,4 @@
-//! M4.3: find references — two-tier, bounded, confirm-by-resolution.
+//! Find references — two-tier, bounded, confirm-by-resolution.
 //!
 //! Every reference target falls into one of two visibility tiers, read off
 //! the declaration's modifiers via [`crate::model::has_modifier`] (a missing
@@ -405,7 +405,7 @@ fn bare_type_site<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
 }
 
 /// The confirm-by-resolution core of [`bare_type_site`], factored out so
-/// M4.6's go-to-implementation (`implementation.rs`) can reuse the exact same
+/// go-to-implementation (`implementation.rs`) can reuse the exact same
 /// import/package-aware gate for confirming a supertype (`extends`/
 /// `implements`) reference in a scanned file actually names the target type
 /// declaration, not an unrelated same-simple-name type from a different
@@ -428,7 +428,7 @@ pub(crate) fn confirm_bare_type<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Option<Typ
 /// a *candidate* type's actual package, as opposed to the scanned file's
 /// own, which `Imports::parse` already gives us).
 ///
-/// `pub(crate)` (M4.6): also used by `implementation.rs` to compute the
+/// `pub(crate)`: also used by `implementation.rs` to compute the
 /// TARGET type's real FQN for confirming fully-qualified `extends`/
 /// `implements` entries.
 pub(crate) fn package_of(node: Node, source: &str) -> Option<String> {
@@ -461,7 +461,7 @@ mod tests {
             .expect("reference target resolved")
     }
 
-    /// M4.3: a local variable's target resolves with `Tier::FileLocal`, and
+    /// A local variable's target resolves with `Tier::FileLocal`, and
     /// scanning its declaring document finds exactly its two usages (plus the
     /// declaration when `includeDeclaration` is honored) — an inner shadowing
     /// declaration of the same name is NOT counted for the outer variable.
@@ -505,7 +505,7 @@ mod tests {
         assert!(with_decl.ranges.contains(&(decl..decl + 1)));
     }
 
-    /// M4.3: a `private` method's target resolves with `Tier::FileLocal`;
+    /// A `private` method's target resolves with `Tier::FileLocal`;
     /// calls within the declaring file (unqualified and via `this.`) are all
     /// counted, but a same-named method on a *different* type in the same
     /// file is not.
@@ -535,7 +535,7 @@ mod tests {
         assert!(!hits.ranges.iter().any(|r| r.start == b_helper_decl));
     }
 
-    /// M4.3: a public type's target (declared in one given document) is
+    /// A public type's target (declared in one given document) is
     /// confirmed as a reference from a *second* given document that imports
     /// it, but NOT from a third document that imports a same-simple-name
     /// type from a *different* package — semantic (import-aware) confirm
@@ -598,7 +598,7 @@ mod tests {
         );
     }
 
-    /// M4.3: `this.name` (the field) and a same-named local/parameter are
+    /// `this.name` (the field) and a same-named local/parameter are
     /// disambiguated — referencing the field finds only the qualified use.
     #[test]
     fn field_vs_local_disambiguation() {
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(hits.ranges[0], this_name..this_name + "name".len());
     }
 
-    /// M4.3 fix round 1 (Critical): a field and a method with the SAME name
+    /// A field and a method with the SAME name
     /// in the same class (Java keeps them in separate namespaces) must not
     /// conflate — references on the field find only field occurrences
     /// (declaration + `c.foo`), references on the method only method
@@ -691,7 +691,7 @@ mod tests {
         assert!(method_hits.ranges.contains(&(call..call + 3)));
     }
 
-    /// M4.3 fix round 1 (Critical): cross-kind through the hierarchy — a
+    /// Cross-kind through the hierarchy — a
     /// field `foo` in the superclass (another doc) and a method `foo()` in
     /// the subclass must stay separate: `b.foo` resolves to the inherited
     /// field, `b.foo()` to the subclass method, and neither's references

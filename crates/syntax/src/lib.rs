@@ -542,7 +542,7 @@ fn selection_range_at(tree: &Tree, index: &LineIndex, position: Position) -> Sel
 // [`semantic_token_types`], which the server passes to the client as the legend.
 const TT_TYPE: u32 = 0;
 const TT_METHOD: u32 = 1;
-/// M7.5: deliberately no longer emitted — kept in the legend so the other
+/// Deliberately no longer emitted — kept in the legend so the other
 /// indices stay stable. Parameters are classified [`TT_VARIABLE`] instead:
 /// several popular themes style the `parameter` semantic token greyed/italic,
 /// which users read as "unused", and the parameter/variable distinction isn't
@@ -605,6 +605,23 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
                 emit_named(node, "name", TT_VARIABLE, index, &mut raw)
             }
             "enhanced_for_statement" => emit_named(node, "name", TT_VARIABLE, index, &mut raw),
+            // Java 21 pattern bindings (`case Type name`, record deconstruction
+            // components) — the binding identifier classifies as a variable so
+            // it (and, via `declared_roles`, its uses in the guard/body) get
+            // lit instead of falling to TextMate's default (white) foreground.
+            "type_pattern" | "record_pattern_component" => {
+                if let Some(id) = pattern_binding_identifier(node) {
+                    emit(id, TT_VARIABLE, index, &mut raw);
+                }
+            }
+            // `f instanceof String s` — the `name`-field binding.
+            "instanceof_expression" => emit_named(node, "name", TT_VARIABLE, index, &mut raw),
+            // `Type::method` / `expr::method` — the referenced method name.
+            "method_reference" => {
+                if let Some(m) = method_reference_method(node) {
+                    emit(m, TT_METHOD, index, &mut raw);
+                }
+            }
             "variable_declarator" => {
                 let is_field = node
                     .parent()
@@ -631,7 +648,7 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
                     if let Some(&token_type) = roles.get(text) {
                         emit(node, token_type, index, &mut raw);
                     } else if looks_like_type_name(text) {
-                        // M7.5: an undeclared, type-cased name (`Math` in
+                        // An undeclared, type-cased name (`Math` in
                         // `Math.abs()`, `Person` in an expression) is a type
                         // reference by Java convention — without this it
                         // falls to TextMate's variable color (user report:
@@ -678,7 +695,24 @@ fn declared_roles<'t>(tree: &'t Tree, source: &'t str) -> HashMap<&'t str, u32> 
                     roles.insert(node_text(name, source), TT_VARIABLE);
                 }
             }
+            // Varargs parameter: its name lives on a nested declarator.
+            "spread_parameter" => {
+                if let Some(name) = crate::signature::spread_param_name(node) {
+                    roles.insert(node_text(name, source), TT_VARIABLE);
+                }
+            }
             "enhanced_for_statement" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    roles.insert(node_text(name, source), TT_VARIABLE);
+                }
+            }
+            // Java 21 pattern bindings — so their uses in the guard/body light up.
+            "type_pattern" | "record_pattern_component" => {
+                if let Some(id) = pattern_binding_identifier(node) {
+                    roles.insert(node_text(id, source), TT_VARIABLE);
+                }
+            }
+            "instanceof_expression" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     roles.insert(node_text(name, source), TT_VARIABLE);
                 }
@@ -715,13 +749,19 @@ fn is_classified_elsewhere(node: Node) -> bool {
         | "marker_annotation"
         | "annotation" => parent.child_by_field_name("name") == Some(node),
         "field_access" => parent.child_by_field_name("field") == Some(node),
+        // The binding identifier of a pattern is emitted by the pattern rule.
+        "type_pattern" | "record_pattern_component" => {
+            pattern_binding_identifier(parent) == Some(node)
+        }
+        "instanceof_expression" => parent.child_by_field_name("name") == Some(node),
+        "method_reference" => method_reference_method(parent) == Some(node),
         _ => false,
     }
 }
 
 /// Emit tokens for the dotted segments of a `package`/`import` path. A
 /// `package` header's segments are namespaces. An `import`'s segments are
-/// ALL type tokens (M7.5, user directive: the whole imported path colors
+/// ALL type tokens (user directive: the whole imported path colors
 /// like the class, not just its final segment) — except a static import's
 /// final lowercase segment, which is the imported *member* and gets a
 /// method token.
@@ -759,7 +799,7 @@ fn emit_namespace_path(
 /// Type-cased by Java convention: starts uppercase and contains at least one
 /// lowercase character (so `Math`/`Person` match, `MAX_VALUE` doesn't).
 ///
-/// `pub(crate)` (M8a): also gates `codeaction.rs`'s add-import quick fix.
+/// `pub(crate)`: also gates `codeaction.rs`'s add-import quick fix.
 pub(crate) fn looks_like_type_name(text: &str) -> bool {
     text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && text.chars().any(|c| c.is_ascii_lowercase())
@@ -793,6 +833,35 @@ fn emit_named(
     if let Some(name) = node.child_by_field_name(field) {
         emit(name, token_type, index, out);
     }
+}
+
+/// The binding-name identifier of a Java 21 pattern node (`type_pattern`'s
+/// `String s`, a `record_pattern_component`'s `int x`): its lone child of kind
+/// `identifier`. Neither node exposes a `name` field, and the *type* part is a
+/// `type_identifier`/`generic_type`/`integral_type`/… — never a bare
+/// `identifier` — so the sole `identifier` child is always the binding.
+/// `None` for a component that nests another pattern instead of binding a name
+/// (`case Line(Point(var a, var b), ...)`).
+fn pattern_binding_identifier(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "identifier");
+    found
+}
+
+/// The referenced-method identifier of a `method_reference`
+/// (`Type::method`, `expr::method`): its trailing `identifier` child, after
+/// the qualifier and `::`. `None` for a constructor reference (`Type::new`,
+/// whose trailing child is the `new` keyword) or an incomplete one.
+fn method_reference_method(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let named: Vec<Node> = node.named_children(&mut cursor).collect();
+    if named.len() < 2 {
+        return None;
+    }
+    let last = *named.last()?;
+    (last.kind() == "identifier").then_some(last)
 }
 
 fn emit(node: Node, token_type: u32, index: &LineIndex, out: &mut Vec<RawToken>) {
@@ -1144,7 +1213,98 @@ mod tests {
         );
     }
 
-    /// M7.5: an undeclared type-cased receiver (`Math.abs()`) is a type
+    /// Decode delta-encoded tokens across multiple lines, labeling each by its
+    /// source slice.
+    fn decode_labeled<'s>(src: &'s str, data: &[SemanticToken]) -> Vec<(&'s str, u32)> {
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let (mut line, mut ch) = (0u32, 0u32);
+        let mut out = Vec::new();
+        for t in data {
+            if t.delta_line != 0 {
+                line += t.delta_line;
+                ch = t.delta_start;
+            } else {
+                ch += t.delta_start;
+            }
+            let start = line_starts[line as usize] + ch as usize;
+            out.push((&src[start..start + t.length as usize], t.token_type));
+        }
+        out
+    }
+
+    /// Java 21 pattern bindings (`case Type name`, record deconstruction) get a
+    /// variable token at their declaration *and* every use in the guard/body —
+    /// otherwise they fall to TextMate's default (white) foreground.
+    #[test]
+    fn semantic_tokens_light_up_pattern_bindings() {
+        let src = "class C {\n\
+                   Object m(Object f) {\n\
+                   return switch (f) {\n\
+                   case String s when !s.isEmpty() -> s;\n\
+                   case Point(int x, int y) -> x + y;\n\
+                   default -> null;\n\
+                   };\n\
+                   }\n\
+                   }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let labeled = decode_labeled(src, &semantic_tokens(&tree, src, &index));
+        // `s`: bound in the label, used in the guard and the body.
+        assert_eq!(
+            labeled
+                .iter()
+                .filter(|&&(t, tt)| t == "s" && tt == TT_VARIABLE)
+                .count(),
+            3,
+            "type-pattern binding + its two uses: {labeled:?}"
+        );
+        // Record-deconstruction components and their uses.
+        assert_eq!(
+            labeled
+                .iter()
+                .filter(|&&(t, tt)| t == "x" && tt == TT_VARIABLE)
+                .count(),
+            2,
+            "record component `x` decl + use: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("y", TT_VARIABLE)),
+            "record component `y`: {labeled:?}"
+        );
+        // The pattern *type* is still a type token, never a variable.
+        assert!(
+            labeled.contains(&("String", TT_TYPE)),
+            "pattern type: {labeled:?}"
+        );
+    }
+
+    /// The method name after `::` in a method reference is a method token
+    /// (`Map.Entry::getKey`, `String::valueOf`), not left white.
+    #[test]
+    fn semantic_tokens_method_reference_name_is_a_method() {
+        let src =
+            "class C { void m() { use(String::valueOf); use(java.util.Map.Entry::getKey); } }\n";
+        let tree = parse_str(src);
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        let labeled = decode_labeled(src, &semantic_tokens(&tree, src, &index));
+        assert!(
+            labeled.contains(&("valueOf", TT_METHOD)),
+            "method-ref name: {labeled:?}"
+        );
+        assert!(
+            labeled.contains(&("getKey", TT_METHOD)),
+            "qualified method-ref name: {labeled:?}"
+        );
+        // The receiver type is still a type token, not the method color.
+        assert!(
+            labeled.contains(&("String", TT_TYPE)),
+            "method-ref type: {labeled:?}"
+        );
+    }
+
+    /// An undeclared type-cased receiver (`Math.abs()`) is a type
     /// token, never left for TextMate's variable color; SCREAMING_CASE and
     /// unknown lowercase names stay unclassified.
     #[test]
@@ -1168,7 +1328,7 @@ mod tests {
         );
     }
 
-    /// M7.5: every segment of an import path is a type token (user
+    /// Every segment of an import path is a type token (user
     /// directive: the whole path colors like the class); a static import's
     /// lowercase member segment is a method token; package headers keep
     /// namespace tokens.

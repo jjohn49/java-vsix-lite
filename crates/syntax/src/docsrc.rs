@@ -140,7 +140,7 @@ mod tests {
         );
     }
 
-    /// M6.3: a constructor's Javadoc is recovered by the class's own simple
+    /// A constructor's Javadoc is recovered by the class's own simple
     /// name — the same name a caller passes as `type_simple` — since a
     /// source archive has no `<init>`, only a constructor declaration named
     /// after its class.

@@ -1,4 +1,4 @@
-//! M8d: refactoring code actions — extract variable/constant from a selected
+//! Refactoring code actions — extract variable/constant from a selected
 //! expression, and source-generate actions (getters/setters, constructor,
 //! `equals`/`hashCode`, `toString`) for the class under the cursor.
 //!
@@ -18,7 +18,7 @@ use crate::{node_text, LineIndex, OpenDoc};
 pub(crate) const KIND_REFACTOR_EXTRACT: &str = "refactor.extract";
 pub(crate) const KIND_SOURCE_GENERATE: &str = "source.generate";
 
-/// All M8d actions for `range`: extract actions when the selection is exactly
+/// All refactor actions for `range`: extract actions when the selection is exactly
 /// an expression, generate actions when the cursor sits inside a class.
 pub(crate) fn refactor_actions(
     doc: &OpenDoc,

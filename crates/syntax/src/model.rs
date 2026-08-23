@@ -249,7 +249,7 @@ fn collect_supers<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
 
 /// The raw type NODES of a declaration's `extends`/`implements` clauses —
 /// the same nodes whose base simple names [`collect_supers`] erases into
-/// [`TypeDecl::supers`]. `pub(crate)` for M4.6's go-to-implementation, whose
+/// [`TypeDecl::supers`]. `pub(crate)` for go-to-implementation, whose
 /// per-supertype confirm needs the node itself (not just the erased simple
 /// name) to tell a fully-qualified supertype reference
 /// (`implements com.example.Foo` — confirmed against the target's real FQN,

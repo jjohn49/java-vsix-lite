@@ -23,10 +23,12 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, build commands, and the consent-gated dependency download all stay disabled until the workspace is trusted.",
+      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, the consent-gated dependency download, and Install Dependencies (which runs the project's Maven/Gradle build scripts) all stay disabled until the workspace is trusted.",
       "restrictedConfigurations": [
         "java-vsix-lite.server.path",
         "java-vsix-lite.jdk.home",
+        "java-vsix-lite.maven.path",
+        "java-vsix-lite.gradle.path",
         "java-vsix-lite.dependencies.repository",
         "java-vsix-lite.dependencies.autoDownload"
       ]
@@ -39,6 +41,37 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "configurationDefaults": {
+      "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "rules": {
+          "parameter": "#9CDCFE",
+          "variable": "#9CDCFE",
+          "property": "#9CDCFE"
+        },
+        "[Default Light Modern]": {
+          "rules": {
+            "parameter": "#001080",
+            "variable": "#001080",
+            "property": "#001080"
+          }
+        },
+        "[Default Light+]": {
+          "rules": {
+            "parameter": "#001080",
+            "variable": "#001080",
+            "property": "#001080"
+          }
+        },
+        "[Visual Studio Light]": {
+          "rules": {
+            "parameter": "#001080",
+            "variable": "#001080",
+            "property": "#001080"
+          }
+        }
+      }
+    },
     "configuration": {
       "title": "java-vsix-lite",
       "properties": {
@@ -87,6 +120,18 @@
           "scope": "machine",
           "markdownDescription": "Base URL of the Maven repository to download missing dependencies from (M8f), e.g. an internal Artifactory/Nexus proxy in a governed network: `https://artifacts.example.com/maven2`. Empty means Maven Central. Must be a plain `https://` URL — no credentials, query, or fragment; anything else disables downloads rather than silently falling back. **Machine-scoped on purpose**: a workspace (repository) must never be able to redirect where your dependency downloads come from. Checksum sidecar verification applies to any repository, unchanged."
         },
+        "java-vsix-lite.maven.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the `mvn` executable used by `Install Dependencies (runs build tool)`. Leave empty to use the project's `mvnw` wrapper if present, otherwise `mvn` on `PATH`. **Machine-scoped on purpose**: a workspace must never be able to choose which executable is run on your behalf."
+        },
+        "java-vsix-lite.gradle.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the `gradle` executable used by `Install Dependencies (runs build tool)`. Leave empty to use the project's `gradlew` wrapper if present, otherwise `gradle` on `PATH`. **Machine-scoped on purpose**: a workspace must never be able to choose which executable is run on your behalf."
+        },
         "java-vsix-lite.dependencies.autoDownload": {
           "type": "string",
           "enum": [
@@ -113,6 +158,11 @@
       {
         "command": "java-vsix-lite.downloadDependencies",
         "title": "Java: Download Missing Dependencies",
+        "category": "java-vsix-lite"
+      },
+      {
+        "command": "java-vsix-lite.installDependencies",
+        "title": "Java: Install Dependencies (runs build tool)",
         "category": "java-vsix-lite"
       }
     ]

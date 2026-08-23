@@ -303,7 +303,7 @@ fn throws_clause(node: Node, source: &str) -> Option<String> {
     Some(format!("throws {}", types.join(", ")))
 }
 
-/// M7: the same signature text as [`signature`] but with modifiers dropped —
+/// The same signature text as [`signature`] but with modifiers dropped —
 /// the display convention `jvl-classpath` uses for bytecode-derived members
 /// (`int size()`, not `public int size()`), so a project-source-derived
 /// `ExternalMember` (closed-file completion/hover) renders identically to a
@@ -387,7 +387,7 @@ pub(crate) fn javadoc(decl: Node, source: &str) -> Option<String> {
             "line_comment" => sib = s.prev_sibling(),
             "block_comment" => {
                 let text = node_text(s, source);
-                // M7.5: a comment that renders to nothing — empty, or only
+                // A comment that renders to nothing — empty, or only
                 // `{@inheritDoc}` (which the renderer drops) — reports no
                 // doc, so callers fall through to inherited-doc lookup.
                 return text
@@ -418,7 +418,7 @@ fn strip_javadoc(raw: &str) -> String {
         .join("\n")
         .trim()
         .to_string();
-    // M7.5: render Javadoc block/inline tags and the common HTML subset as
+    // Render Javadoc block/inline tags and the common HTML subset as
     // Markdown — this is the single choke point every doc surface funnels
     // through (hover, completion resolve, closed project files via
     // `docsrc::javadoc_in_source`, JDK `src.zip`, dependency sources jars).

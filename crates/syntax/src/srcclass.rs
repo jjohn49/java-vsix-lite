@@ -1,4 +1,4 @@
-//! M7: turn a **closed** project `.java` file's source text into an
+//! Turn a **closed** project `.java` file's source text into an
 //! [`ExternalClass`] — the same shape `jvl-classpath` produces from bytecode
 //! — so a workspace type the user hasn't opened still gets full member
 //! completion, chains, and hover. `jvl-syntax` stays IO-free: the server
@@ -29,7 +29,7 @@ pub fn class_from_source(
     if let Some(td) = find_type_by_path(tree.root_node(), source, type_path) {
         return Some(to_external_class(&td, source, &imports, pick_fqn));
     }
-    // M8c: `Outer.OuterBuilder` — the `@Builder` companion type that exists
+    // `Outer.OuterBuilder` — the `@Builder` companion type that exists
     // only in Lombok's generated code, synthesized on demand so builder
     // chains (`Person.builder().name("x").build()`) resolve.
     let (outer_path, last) = type_path.rsplit_once('.')?;
@@ -66,14 +66,19 @@ fn to_external_class(
     imports: &Imports,
     pick_fqn: &dyn Fn(&[String]) -> Option<String>,
 ) -> ExternalClass {
-    let supers = if td.supers.is_empty() {
-        vec!["java.lang.Object".to_string()]
-    } else {
-        td.supers
-            .iter()
-            .filter_map(|s| pick_fqn(&imports.candidates(s)))
-            .collect()
-    };
+    let mut supers: Vec<String> = td
+        .supers
+        .iter()
+        .filter_map(|s| pick_fqn(&imports.candidates(s)))
+        .collect();
+    // An enum implicitly extends `java.lang.Enum` — the source of `name()`,
+    // `ordinal()`, `compareTo()`, etc. Without this, every `myEnum.name()`
+    // looks unresolved. Its own `supers` hold only explicit interfaces.
+    if td.kind == TypeKind::Enum {
+        supers.insert(0, "java.lang.Enum".to_string());
+    } else if supers.is_empty() {
+        supers.push("java.lang.Object".to_string());
+    }
 
     let mut members: Vec<ExternalMember> = td
         .own_members()
@@ -89,7 +94,32 @@ fn to_external_class(
         }
     }
 
-    // M8c: Lombok-generated accessors, under the same gate as open documents.
+    // Enums carry two compiler-synthesized static methods, absent from source
+    // text: `values()` and `valueOf(String)`. Add them so `E.values()` /
+    // `E.valueOf(..)` resolve. Instance `name()`/`ordinal()`/… come from
+    // the implicit `java.lang.Enum` supertype set above.
+    if td.kind == TypeKind::Enum {
+        members.push(ExternalMember {
+            name: "values".to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: format!("{}[] values()", td.name),
+            template: None,
+            is_static: true,
+            ret_fqn: None,
+            ret_display: Some(format!("{}[]", td.name)),
+        });
+        members.push(ExternalMember {
+            name: "valueOf".to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: format!("{} valueOf(String)", td.name),
+            template: None,
+            is_static: true,
+            ret_fqn: pick_fqn(&imports.candidates(td.name)),
+            ret_display: Some(td.name.to_string()),
+        });
+    }
+
+    // Lombok-generated accessors, under the same gate as open documents.
     // `synthesize` never duplicates a declared method; the erased return FQN
     // is recovered from the display type through the declaring file's own
     // imports, exactly like `member_from_node` does for real members.
@@ -109,7 +139,7 @@ fn to_external_class(
 
     ExternalClass {
         supers,
-        // M7 project-source scope: type parameters aren't tracked (no
+        // Project-source scope: type parameters aren't tracked (no
         // Signature-attribute equivalent to parse from source text), so
         // generic members render erased, same as a raw-type classpath use.
         type_params: Vec::new(),
@@ -125,6 +155,23 @@ fn member_from_node(
     imports: &Imports,
     pick_fqn: &dyn Fn(&[String]) -> Option<String>,
 ) -> Option<ExternalMember> {
+    // An enum constant has no declared type or parameters, so
+    // `erased_signature` can't render one — handle it directly (its
+    // "signature" is just its name) rather than letting the `?` below drop it,
+    // which would erase every constant and make `Enum.CONSTANT` look
+    // unresolved (a false "Cannot resolve field" on cross-file enums).
+    if kind == MemberKind::EnumConstant {
+        let name = node_text(node.child_by_field_name("name")?, source).to_string();
+        return Some(ExternalMember {
+            name: name.clone(),
+            kind: ExternalMemberKind::Field,
+            signature: name,
+            template: None,
+            is_static, // enum constants are implicitly static
+            ret_fqn: None,
+            ret_display: None,
+        });
+    }
     let ext_kind = match kind {
         MemberKind::Method => ExternalMemberKind::Method,
         MemberKind::Field | MemberKind::EnumConstant => ExternalMemberKind::Field,
@@ -166,17 +213,20 @@ fn member_from_node(
     })
 }
 
-/// Whether a directly-declared member/constructor is visible outside its own
-/// file — mirrors `jvl-classpath`'s bytecode gate (public/protected only,
-/// never private/package-private), so closed-file completion surfaces the
-/// same API surface a compiled dependency would. Interface/annotation
-/// members are implicitly public unless explicitly `private` (Java 9+
-/// private interface methods). A record component has no modifier slot in
-/// the grammar at all — always visible, mirroring its always-public
-/// synthesized accessor.
-fn externally_visible(node: Node, source: &str, enclosing_kind: TypeKind) -> bool {
-    if node.kind() == "formal_parameter" {
-        return true; // record component: no modifier slot in the grammar
+/// Whether a directly-declared member/constructor should be exposed for a
+/// **project** source file — everything except an explicitly `private` member.
+///
+/// This is deliberately looser than `jvl-classpath`'s bytecode gate
+/// (public/protected only): a project's own files aren't compiled
+/// dependencies, and same-package code legitimately uses their
+/// package-private members (a package-private field accessed across two
+/// files in the same package was being falsely flagged "Cannot resolve").
+/// Erring toward *including* a member only ever makes completion more generous
+/// and the unresolved-member diagnostic more conservative — both safe
+/// directions. `private` stays hidden (never accessible from another file).
+fn externally_visible(node: Node, source: &str, _enclosing_kind: TypeKind) -> bool {
+    if matches!(node.kind(), "formal_parameter" | "enum_constant") {
+        return true; // record component / enum constant: no modifier slot
     }
     // A field's modifiers live on the enclosing `field_declaration`, not on
     // its own `variable_declarator` node — same parent lookup
@@ -185,15 +235,7 @@ fn externally_visible(node: Node, source: &str, enclosing_kind: TypeKind) -> boo
         "variable_declarator" => node.parent().unwrap_or(node),
         _ => node,
     };
-    if has_modifier(modifiers_owner, source, "public")
-        || has_modifier(modifiers_owner, source, "protected")
-    {
-        return true;
-    }
-    if has_modifier(modifiers_owner, source, "private") {
-        return false;
-    }
-    matches!(enclosing_kind, TypeKind::Interface | TypeKind::Annotation)
+    !has_modifier(modifiers_owner, source, "private")
 }
 
 /// The FQN a declared-type node's *base* name resolves to, through the
@@ -349,8 +391,43 @@ mod tests {
         assert!(class_from_source("not even java {{{", "Person", &pick_first).is_none());
     }
 
+    /// An enum's constants, its implicit `java.lang.Enum` super, and the
+    /// synthesized static `values()`/`valueOf(String)` all surface — so
+    /// `E.CONSTANT`, `e.name()`, and `E.values()` resolve on a cross-file enum.
     #[test]
-    fn package_private_and_private_members_are_excluded() {
+    fn enum_exposes_constants_enum_super_and_synthetic_statics() {
+        let src = "package p;\npublic enum E { SAMPLE, PATIENT;\n\
+                   @Override public String toString() { return name(); } }\n";
+        let class = class_from_source(src, "E", &pick_first).unwrap();
+        assert!(
+            class.supers.iter().any(|s| s == "java.lang.Enum"),
+            "implicit Enum super: {:?}",
+            class.supers
+        );
+        let statics: Vec<&str> = class
+            .members
+            .iter()
+            .filter(|m| m.is_static)
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(statics.contains(&"SAMPLE"), "constant: {statics:?}");
+        assert!(statics.contains(&"PATIENT"), "constant: {statics:?}");
+        assert!(
+            statics.contains(&"values"),
+            "synthetic values(): {statics:?}"
+        );
+        assert!(
+            statics.contains(&"valueOf"),
+            "synthetic valueOf(): {statics:?}"
+        );
+    }
+
+    #[test]
+    fn only_private_members_are_excluded_from_project_source() {
+        // A project's own source exposes package-private members too
+        // (same-package code legitimately uses them) — only explicitly
+        // `private` members stay hidden. Looser than the bytecode gate on
+        // purpose; see `externally_visible`.
         let src = "package demo;\n\
                    public class Widget {\n\
                    public int pub_f;\n\
@@ -360,22 +437,39 @@ mod tests {
                    private void priv_m() {}\n\
                    void pkg_m() {}\n\
                    private Widget() {}\n\
-                   public Widget(int n) {}\n\
+                   Widget(int n) {}\n\
                    }\n";
         let class = class_from_source(src, "Widget", &pick_first).unwrap();
         let names: Vec<&str> = class.members.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"pub_f"), "{names:?}");
         assert!(names.contains(&"prot_f"), "{names:?}");
-        assert!(!names.contains(&"priv_f"), "{names:?}");
-        assert!(!names.contains(&"pkg_f"), "{names:?}");
-        assert!(!names.contains(&"priv_m"), "{names:?}");
-        assert!(!names.contains(&"pkg_m"), "{names:?}");
+        assert!(
+            names.contains(&"pkg_f"),
+            "package-private field included: {names:?}"
+        );
+        assert!(
+            names.contains(&"pkg_m"),
+            "package-private method included: {names:?}"
+        );
+        assert!(
+            !names.contains(&"priv_f"),
+            "private field hidden: {names:?}"
+        );
+        assert!(
+            !names.contains(&"priv_m"),
+            "private method hidden: {names:?}"
+        );
         let ctors: Vec<_> = class
             .members
             .iter()
             .filter(|m| m.kind == ExternalMemberKind::Constructor)
             .collect();
-        assert_eq!(ctors.len(), 1, "only the public ctor: {:?}", class.members);
+        assert_eq!(
+            ctors.len(),
+            1,
+            "the package-private ctor is included, the private one is not: {:?}",
+            class.members
+        );
     }
 
     #[test]

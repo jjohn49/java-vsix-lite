@@ -26,11 +26,11 @@ pub struct ExternalMember {
     /// arguments. `None` when the member uses no type variables.
     pub template: Option<String>,
     pub is_static: bool,
-    /// M7: dotted FQN of the erased method return / field declared type —
+    /// Dotted FQN of the erased method return / field declared type —
     /// what a `recv.member().` chain resolves through. `None` for
     /// primitives, `void`, arrays, and constructors.
     pub ret_fqn: Option<String>,
-    /// M7: the generic return/field type alone in `{i}` template form
+    /// The generic return/field type alone in `{i}` template form
     /// (`Stream<{0}>`, `{0}`), so chains substitute use-site type arguments
     /// before re-resolving. `None` without generic info.
     pub ret_display: Option<String>,
@@ -50,7 +50,7 @@ pub enum ExternalMemberKind {
     Constructor,
 }
 
-/// A classpath type offerable by name (M7): completion label plus the names
+/// A classpath type offerable by name: completion label plus the names
 /// needed to resolve and to import it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeCandidate {
@@ -68,7 +68,7 @@ pub struct TypeCandidate {
 pub trait SymbolSource {
     fn class(&self, fqn: &str) -> Option<ExternalClass>;
 
-    /// M7: classpath types whose simple name starts with `prefix`
+    /// Classpath types whose simple name starts with `prefix`
     /// (case-insensitive), best-first, at most `limit`; the bool reports
     /// whether the cap cut candidates off. Defaults to none (mocks, and a
     /// server with no classpath).
@@ -76,7 +76,7 @@ pub trait SymbolSource {
         (Vec::new(), false)
     }
 
-    /// M7: immediate children of a dotted package (`""` = roots):
+    /// Immediate children of a dotted package (`""` = roots):
     /// `(subpackage segments, types)` — the shape import-path completion
     /// walks. Defaults to none.
     fn package_children(&self, _package: &str) -> (Vec<String>, Vec<TypeCandidate>) {

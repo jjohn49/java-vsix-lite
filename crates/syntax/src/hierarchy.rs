@@ -1,6 +1,6 @@
-//! M8e: call- and type-hierarchy primitives. The server composes these with
-//! its existing bounded scans: incoming calls = the M4.3 reference scan with
-//! each hit grouped under [`enclosing_callable`]; subtypes = the M4.6
+//! Call- and type-hierarchy primitives. The server composes these with
+//! its existing bounded scans: incoming calls = the reference scan with
+//! each hit grouped under [`enclosing_callable`]; subtypes = the
 //! implementation scan with each hit wrapped by [`type_decl_at_byte`];
 //! outgoing calls = [`outgoing_call_sites`] resolved through the
 //! go-to-definition ladder. All byte ranges are relative to the document

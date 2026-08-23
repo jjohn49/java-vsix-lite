@@ -5,43 +5,60 @@
 //! binary over stdio and stays thin; all analysis lives here and in the
 //! `jvl-*` crates.
 //!
-//! The default tier parses open Java files incrementally with tree-sitter and
-//! provides syntax diagnostics, document symbols, folding/selection ranges,
-//! semantic tokens, and — over in-file/open-file types — hover and completion.
-//! Documents are tracked open-files-only; there is no workspace or JAR/JDK
-//! indexing (that arrives with the bytecode sub-project).
+//! Open Java files are parsed incrementally with tree-sitter and get syntax
+//! diagnostics, document symbols, folding/selection ranges, and semantic
+//! tokens. Hover, completion, navigation, and diagnostics also draw on
+//! closed project source files (via the lazy workspace index and
+//! `project_symbols`) and on JDK/dependency types (via the `jvl-classpath`
+//! crate) — not just what's currently open in the editor. An optional
+//! `javac`-backed check adds real compiler diagnostics, running
+//! automatically on project load and after every save in trusted
+//! workspaces (see `javac`'s module doc comment), plus on demand via a
+//! manual command.
 //!
 //! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
 //! to stderr via `tracing`.
 
 #![forbid(unsafe_code)]
 
+mod backend;
+mod diagnostics;
+mod fs_scan;
+mod hierarchy;
 mod javac;
+mod navigation;
 mod project_symbols;
 mod references;
 mod workspace_index;
 
+use backend::{byte_range_to_lsp, Backend, Document};
+#[cfg(test)]
+use backend::{
+    insert_bounded_project_file, CachedProjectFile, RebuildCoalescer, MAX_PROJECT_FILE_BYTES,
+};
+use diagnostics::JavacRunningGuard;
+use hierarchy::{callable_item, type_item};
+use navigation::truncation_notice;
 use project_symbols::{CombinedSymbols, ProjectSymbols};
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range as StdRange;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::SystemTime;
 
-use jvl_syntax::tree_sitter::{Parser, Tree};
-use jvl_syntax::{Definition, LineIndex, PositionEncoding};
+use jvl_syntax::tree_sitter::Tree;
+use jvl_syntax::{LineIndex, PositionEncoding};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::request::{
     GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
     GotoTypeDefinitionResponse,
 };
 use tower_lsp_server::ls_types::*;
-use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{LanguageServer, LspService, Server};
 
-/// M6.2: the server-internal `executeCommand` id the extension's trust-gated
+/// The server-internal `executeCommand` id the extension's trust-gated
 /// `java-vsix-lite.downloadDependencies` command forwards to, to trigger an
 /// immediate (non-debounced) classpath rebuild after installing consented-to
 /// dependencies. Deliberately namespaced `jvl.*` and NOT the same id as any
@@ -50,887 +67,6 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 /// `server_commands_do_not_collide_with_extension_commands` lifecycle test
 /// guards this for every server command, this one included.
 const REBUILD_CLASSPATH_COMMAND: &str = "jvl.classpath.rebuild";
-
-/// Bound on the step-(d) external stub/source cache: cleared wholesale past
-/// this many entries rather than tracking LRU — the path is rare enough
-/// (cold, one-off lookups) that eviction pressure is low and a simple bound
-/// is not worth extra bookkeeping.
-const EXTERNAL_CACHE_CAP: usize = 32;
-
-/// Bound on the parse-on-demand project-file cache, shared by goto-definition
-/// ladder step (c) (one file per request) and M4.3 find-references' Tier-2
-/// confirm (up to `references::MAX_FILES_SCANNED` = 500 hit files in a single
-/// request). Same clear-wholesale-on-overflow policy as
-/// [`EXTERNAL_CACHE_CAP`], but sized so a typical references request's hit
-/// set survives within one request *and* is still warm for a follow-up
-/// request on the same symbol (500 hit files is the pathological cap;
-/// real hit sets are far smaller). ~256 parsed small-to-medium `.java` files
-/// is a few tens of MB at worst — bounded, and cleared rather than grown when
-/// exceeded.
-const PROJECT_FILE_CACHE_CAP: usize = 256;
-
-/// A single project source file parsed on demand for ladder step (c),
-/// invalidated by `mtime` so an on-disk edit is picked up without an explicit
-/// notification (the server never watches files).
-struct CachedProjectFile {
-    mtime: SystemTime,
-    text: Arc<String>,
-    tree: Tree,
-}
-
-/// A single open document: its current text and the parse tree kept in sync
-/// with it, plus its LSP version (M4.4: `rename`'s `WorkspaceEdit` prefers
-/// versioned `TextDocumentEdit`s for open documents over the client's
-/// `documentChanges` capability — see `Backend::rename`).
-struct Document {
-    text: String,
-    tree: Tree,
-    version: i32,
-}
-
-/// M5.2's debounce/coalescing decision state for classpath rebuilds
-/// triggered by watched build-file changes — pure and synchronous, so it's
-/// unit-tested directly with no real timers involved (see the `tests`
-/// module below). The actual timing (the debounce wait, `spawn_blocking`
-/// for the rebuild itself) lives in `Backend::drive_classpath_rebuild`,
-/// which just calls these methods at the right points. `on_event`'s `bool`
-/// return elects exactly one caller as "the driver" for however many
-/// debounce-then-rebuild cycles it takes to settle, so at most one rebuild
-/// ever runs at a time and no unbounded queue of pending rebuilds can build
-/// up — a fresh event always folds into whichever cycle is already running.
-#[derive(Default)]
-struct RebuildCoalescer {
-    /// Some caller already owns driving a debounce-wait-then-maybe-rebuild
-    /// cycle; a later event just needs to mark `dirty` and return.
-    driving: bool,
-    /// A matching change happened since the driver last started waiting (or
-    /// last started a rebuild) that it hasn't accounted for yet.
-    dirty: bool,
-    /// A rebuild is actually running right now, as opposed to still waiting
-    /// out the debounce window — tracked only for clarity/assertions.
-    in_flight: bool,
-}
-
-impl RebuildCoalescer {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// A matching build-file change arrived. Returns `true` exactly once per
-    /// debounce-then-rebuild cycle: the caller that gets `true` must drive
-    /// it (wait the debounce window, call `on_debounce_elapsed`, and so on
-    /// until settled); every other concurrent/later caller gets `false` —
-    /// its event has already been folded into the driver's next decision.
-    fn on_event(&mut self) -> bool {
-        if self.driving {
-            // Already being handled by the current debounce-wait-then-maybe-
-            // rebuild cycle; this event just needs to be accounted for.
-            self.dirty = true;
-            false
-        } else {
-            self.driving = true;
-            true
-        }
-    }
-
-    /// The driver's debounce wait elapsed. `true` means proceed straight to
-    /// a rebuild (nothing arrived during the wait); `false` means a fresh
-    /// event reset the window and the driver must wait a full debounce
-    /// window again before re-checking.
-    fn on_debounce_elapsed(&mut self) -> bool {
-        if self.dirty {
-            self.dirty = false;
-            false
-        } else {
-            self.in_flight = true;
-            true
-        }
-    }
-
-    /// The in-flight rebuild finished. `true` means at least one event
-    /// arrived during the rebuild and exactly one follow-up debounce/rebuild
-    /// cycle must run (the driver keeps going); `false` means it's fully
-    /// settled and the driver may stop.
-    fn on_rebuild_finished(&mut self) -> bool {
-        self.in_flight = false;
-        if self.dirty {
-            self.dirty = false;
-            true
-        } else {
-            self.driving = false;
-            false
-        }
-    }
-}
-
-/// RAII guard releasing `Backend::javac_running` on drop — see
-/// `Backend::execute_command`.
-struct JavacRunningGuard<'a>(&'a std::sync::atomic::AtomicBool);
-
-impl Drop for JavacRunningGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-struct Backend {
-    client: Client,
-    /// Reused across parses; held only for synchronous parse calls, never across
-    /// an `.await`.
-    parser: StdMutex<Parser>,
-    /// Open documents, keyed by URI string. Open-files-only by design — the
-    /// default tier never indexes the whole workspace.
-    documents: Mutex<HashMap<String, Document>>,
-    /// LSP position encoding negotiated during `initialize` (defaults to UTF-16).
-    encoding: OnceLock<PositionEncoding>,
-    /// Whether the client supports snippet completion (`$1` tab stops). Defaults
-    /// to `false` until negotiated during `initialize`.
-    snippet_support: OnceLock<bool>,
-    /// Bytecode-backed symbols for imported (JDK/dependency) types. Built lazily
-    /// on first use so the JDK's jmods aren't scanned until completion/hover needs
-    /// them. M5.2: now swappable — a watched build-file change triggers a
-    /// debounced rebuild (see `RebuildCoalescer`/`drive_classpath_rebuild`)
-    /// that atomically swaps in a freshly resolved `Classpath`. Every read
-    /// path takes its own `Arc` snapshot via `classpath()` at the start of a
-    /// request and never holds this lock across an `.await`.
-    classpath: StdRwLock<Option<Arc<jvl_classpath::Classpath>>>,
-    /// Whether the client supports dynamic registration of
-    /// `workspace/didChangeWatchedFiles` (negotiated during `initialize`) —
-    /// gates whether `initialized()` bothers registering the build-file
-    /// watch at all; the LSP spec has no static alternative for this
-    /// capability, so a client without it simply never gets watched.
-    classpath_watch_dynamic: OnceLock<bool>,
-    /// M8e: whether the client supports dynamic registration for type
-    /// hierarchy. `ls-types` 0.0.6's `ServerCapabilities` has no
-    /// `typeHierarchyProvider` field to advertise statically, so the
-    /// feature is registered dynamically in `initialized` instead — VS Code
-    /// supports exactly that.
-    type_hierarchy_dynamic: OnceLock<bool>,
-    /// Debounce window for a classpath rebuild after a watched build-file
-    /// change (`classpath_debounce_ms_opt`) — 2s by default, overridable via
-    /// `initializationOptions.classpathDebounceMs` so tests aren't forced to
-    /// sleep multiple seconds.
-    classpath_debounce_ms: OnceLock<u64>,
-    /// M5.2's debounce/coalescing decision state (see [`RebuildCoalescer`]),
-    /// guarded by a plain `Mutex` — decisions are synchronous and quick,
-    /// never held across an `.await`.
-    classpath_rebuild: StdMutex<RebuildCoalescer>,
-    /// Workspace root (from `initialize`), used to discover project dependencies.
-    workspace_root: OnceLock<Option<PathBuf>>,
-    /// Fallback project root derived from the first opened document (so deps
-    /// resolve even when a lone file is opened with no workspace folder).
-    project_root_hint: OnceLock<Option<PathBuf>>,
-    /// Whether to emit unresolved-member diagnostics (default on; opt-out).
-    unresolved_member_diagnostics: OnceLock<bool>,
-    /// Ladder step (c): a single unopened project source file, parsed on
-    /// demand and cached by path (see [`CachedProjectFile`]). Never held
-    /// across an `.await`.
-    project_file_cache: StdMutex<HashMap<PathBuf, CachedProjectFile>>,
-    /// Ladder step (d): a JDK/dependency type's source (or, absent that, a
-    /// signature-only stub rendered from `ClassInfo`) — the text served
-    /// through the `jvl-src:` virtual document scheme. Keyed by FQN. Never
-    /// held across an `.await`.
-    external_stub_cache: StdMutex<HashMap<String, Arc<String>>>,
-    /// M4.5: the lazy, bounded workspace symbol index (built on the first
-    /// `workspace/symbol` request, not at startup).
-    workspace_index: workspace_index::WorkspaceIndex,
-    /// Whether [`workspace_index`]'s cap-truncation has already been logged
-    /// to the client — logged once, not on every subsequent query.
-    workspace_index_truncation_logged: std::sync::atomic::AtomicBool,
-    /// M4.4: whether the client's `workspace.workspaceEdit.resourceOperations`
-    /// includes `"rename"` — gates whether `rename`'s `WorkspaceEdit` may
-    /// include a `RenameFile` resource op (text edits are emitted either way).
-    supports_rename_file: OnceLock<bool>,
-    /// M5.4: an explicit override for the JDK home to find `javac` under
-    /// (`java-vsix-lite.jdk.home` initialization option), tried before
-    /// `$JAVA_HOME` — see `javac::locate_javac`.
-    jdk_home_override: OnceLock<Option<PathBuf>>,
-    /// M5.4: the `javac` check's timeout, already clamped to
-    /// `[10, 600]` seconds (`javacTimeoutSecs` initialization option,
-    /// default 120) — see `javac::clamp_timeout_secs`.
-    javac_timeout_secs: OnceLock<u64>,
-    /// M5.4: one `checkProject` run at a time — `true` while a run is in
-    /// flight; a concurrent `executeCommand` sees `true` and returns
-    /// "already running" instead of starting a second `javac`.
-    javac_running: std::sync::atomic::AtomicBool,
-    /// M5.4: the currently-running `javac` child (if any), shared with
-    /// `javac::run`'s polling loop so `shutdown` can kill+reap it — see
-    /// `javac::kill_running_child`.
-    javac_child: javac::SharedChild,
-    /// M5.4: bounded accounting of the reader threads abandoned by
-    /// timed-out/cancelled runs, so a misbehaving `jdk.home` binary can't
-    /// leak blocked threads without bound — `javac::run` refuses to start
-    /// once the cap is hit. See `javac::LeakedReaders` for the security
-    /// rationale.
-    javac_leaked_readers: javac::LeakedReaders,
-    /// M5.4: diagnostics from the last `checkProject` run, keyed by URI
-    /// string, merged into `compute_diagnostics`'s result for that file.
-    /// Cleared for a file on its next `didChange` (stale after edit) and
-    /// wholesale-replaced (with a publish to clear anything that dropped
-    /// out) on every new `checkProject` run — see
-    /// `Backend::publish_javac_diagnostics`.
-    javac_diagnostics: StdMutex<HashMap<String, Vec<Diagnostic>>>,
-}
-
-impl Backend {
-    fn new(client: Client) -> Self {
-        Self {
-            client,
-            parser: StdMutex::new(jvl_syntax::new_parser()),
-            documents: Mutex::new(HashMap::new()),
-            encoding: OnceLock::new(),
-            snippet_support: OnceLock::new(),
-            classpath: StdRwLock::new(None),
-            classpath_watch_dynamic: OnceLock::new(),
-            type_hierarchy_dynamic: OnceLock::new(),
-            classpath_debounce_ms: OnceLock::new(),
-            classpath_rebuild: StdMutex::new(RebuildCoalescer::new()),
-            workspace_root: OnceLock::new(),
-            project_root_hint: OnceLock::new(),
-            unresolved_member_diagnostics: OnceLock::new(),
-            project_file_cache: StdMutex::new(HashMap::new()),
-            external_stub_cache: StdMutex::new(HashMap::new()),
-            workspace_index: workspace_index::WorkspaceIndex::new(),
-            workspace_index_truncation_logged: std::sync::atomic::AtomicBool::new(false),
-            supports_rename_file: OnceLock::new(),
-            jdk_home_override: OnceLock::new(),
-            javac_timeout_secs: OnceLock::new(),
-            javac_running: std::sync::atomic::AtomicBool::new(false),
-            javac_child: Arc::new(StdMutex::new(None)),
-            javac_leaked_readers: javac::LeakedReaders::new(),
-            javac_diagnostics: StdMutex::new(HashMap::new()),
-        }
-    }
-
-    fn encoding(&self) -> PositionEncoding {
-        self.encoding
-            .get()
-            .copied()
-            .unwrap_or(PositionEncoding::Utf16)
-    }
-
-    fn snippet_support(&self) -> bool {
-        self.snippet_support.get().copied().unwrap_or(false)
-    }
-
-    /// M4.4: whether the client advertised `resourceOperations` including
-    /// `"rename"` — see [`supports_rename_file_op`], negotiated in
-    /// `initialize`.
-    fn supports_rename_file(&self) -> bool {
-        self.supports_rename_file.get().copied().unwrap_or(false)
-    }
-
-    /// The imported-type symbol source, built on first use from the user's JDK
-    /// plus the project's declared dependencies. The project root is the
-    /// workspace folder, or (if none) one derived from the first opened file.
-    ///
-    /// Returns a snapshot `Arc`: the caller holds its own reference-counted
-    /// handle to whichever `Classpath` was current the moment it asked, so a
-    /// concurrent M5.2 rebuild swap never invalidates work already in
-    /// flight, and this method never holds `self.classpath`'s lock across an
-    /// `.await`.
-    fn classpath(&self) -> Arc<jvl_classpath::Classpath> {
-        if let Some(existing) = self
-            .classpath
-            .read()
-            .expect("classpath lock poisoned")
-            .clone()
-        {
-            return existing;
-        }
-        // Double-checked: the first caller (of possibly several racing here)
-        // builds it; everyone else just reads back what got stored.
-        let mut guard = self.classpath.write().expect("classpath lock poisoned");
-        if let Some(existing) = guard.clone() {
-            return existing;
-        }
-        let built = Arc::new(jvl_classpath::Classpath::from_jdk_and_project(
-            self.project_root().as_deref(),
-        ));
-        *guard = Some(Arc::clone(&built));
-        built
-    }
-
-    /// The debounce window for M5.2 classpath rebuilds (see
-    /// `classpath_debounce_ms_opt`); 2s unless overridden.
-    fn classpath_debounce(&self) -> Duration {
-        Duration::from_millis(self.classpath_debounce_ms.get().copied().unwrap_or(2000))
-    }
-
-    /// Re-resolve the classpath from scratch on the blocking pool — the same
-    /// static, offline resolution the initial lazy build uses (no build tool
-    /// is ever invoked) — and swap it in atomically. Never holds
-    /// `self.classpath`'s lock across the `.await`.
-    async fn rebuild_classpath(&self) {
-        let root = self.project_root();
-        let built = tokio::task::spawn_blocking(move || {
-            jvl_classpath::Classpath::from_jdk_and_project(root.as_deref())
-        })
-        .await
-        .unwrap_or_else(|_| jvl_classpath::Classpath::empty());
-        *self.classpath.write().expect("classpath lock poisoned") = Some(Arc::new(built));
-    }
-
-    /// Recompute and republish diagnostics for every currently open
-    /// document — used after a classpath swap (M5.2), since
-    /// unresolved-member diagnostics depend on it and may change once new
-    /// dependency types become resolvable.
-    async fn republish_all_diagnostics(&self) {
-        let uris: Vec<String> = self.documents.lock().await.keys().cloned().collect();
-        for uri_str in uris {
-            let diagnostics = {
-                let docs = self.documents.lock().await;
-                self.compute_diagnostics(&docs, &uri_str)
-            };
-            if let Ok(uri) = uri_str.parse::<Uri>() {
-                self.client
-                    .publish_diagnostics(uri, diagnostics, None)
-                    .await;
-            }
-        }
-    }
-
-    /// M5.2: drive one or more debounce-then-rebuild cycles until settled.
-    /// Only the single caller that won `RebuildCoalescer::on_event`'s race
-    /// calls this (see `did_change_watched_files`) — every other concurrent
-    /// or later matching event just folds into the cycle already running
-    /// here, so at most one rebuild is ever in flight and exactly one more
-    /// runs if anything changed while it was.
-    async fn drive_classpath_rebuild(&self) {
-        loop {
-            tokio::time::sleep(self.classpath_debounce()).await;
-            let proceed = {
-                let mut c = self
-                    .classpath_rebuild
-                    .lock()
-                    .expect("classpath rebuild coalescer poisoned");
-                c.on_debounce_elapsed()
-            };
-            if !proceed {
-                continue; // a fresh event arrived during the wait; wait a full window again
-            }
-
-            self.client
-                .log_message(MessageType::INFO, "classpath rebuild: started")
-                .await;
-            let start = Instant::now();
-            self.rebuild_classpath().await;
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("classpath rebuild: finished in {:?}", start.elapsed()),
-                )
-                .await;
-            self.republish_all_diagnostics().await;
-
-            let again = {
-                let mut c = self
-                    .classpath_rebuild
-                    .lock()
-                    .expect("classpath rebuild coalescer poisoned");
-                c.on_rebuild_finished()
-            };
-            if !again {
-                break;
-            }
-        }
-    }
-
-    /// The workspace folder, or (if none) the root derived from the first
-    /// opened file — used both for classpath discovery and (here) as the base
-    /// for ladder step (c)'s conventional source-root candidates.
-    fn project_root(&self) -> Option<PathBuf> {
-        self.workspace_root
-            .get()
-            .and_then(|r| r.clone())
-            .or_else(|| self.project_root_hint.get().and_then(|r| r.clone()))
-    }
-
-    /// Candidate source roots for ladder step (c): the conventional
-    /// `src/main/java` and `src/test/java` under the project root, plus one
-    /// inferred from each open document's own path and `package` declaration
-    /// (`file = root/a/b/C.java` + `package a.b;` ⇒ `root`). No directory
-    /// walking — every root here is either a fixed convention or derived from
-    /// data already in memory (open documents' parsed trees).
-    fn source_roots(&self, docs: &HashMap<String, Document>, project_root: &Path) -> Vec<PathBuf> {
-        let mut roots = vec![
-            project_root.join("src/main/java"),
-            project_root.join("src/test/java"),
-        ];
-        for (uri, doc) in docs {
-            if let Some(root) = infer_source_root(uri, &doc.tree, &doc.text) {
-                if !roots.contains(&root) {
-                    roots.push(root);
-                }
-            }
-        }
-        roots
-    }
-
-    /// Candidate file paths for an FQN under every discovered source root
-    /// (ladder step (c)). `None` (rather than an empty list) when no project
-    /// root is known at all, or when `fqn` isn't safe to turn into a path
-    /// (guards against a crafted `package`/`import` escaping the root).
-    fn candidate_paths(&self, docs: &HashMap<String, Document>, fqn: &str) -> Vec<PathBuf> {
-        if !is_safe_fqn(fqn) {
-            return Vec::new();
-        }
-        let Some(root) = self.project_root() else {
-            return Vec::new();
-        };
-        let rel = format!("{}.java", fqn.replace('.', "/"));
-        self.source_roots(docs, &root)
-            .into_iter()
-            .map(|source_root| source_root.join(&rel))
-            .collect()
-    }
-
-    /// M6.1 rule (c): the package a document's own path implies it should
-    /// declare — `None` when no project root is known at all (a lone file
-    /// with no workspace, per the task brief) or the URI isn't a `file:`
-    /// path; otherwise the dotted directory segments between the *most
-    /// specific* containing source root and the file (possibly `""` — the
-    /// unnamed/default package — when the file sits directly under the
-    /// root). Only a root that is an actual prefix of the file's directory
-    /// counts as "confidently containing" it, matching rule (c)'s
-    /// conservative gate in the task brief.
-    ///
-    /// Deliberately does NOT reuse [`Self::source_roots`]: that ladder
-    /// includes roots *inferred from other open documents'* package/path
-    /// coincidences (`infer_source_root`), which is fine for best-effort
-    /// navigation but unacceptable for a diagnostic — what error a file gets
-    /// must never depend on which unrelated sibling files happen to be open.
-    /// Only the fixed conventional roots (`src/main/java`, `src/test/java`
-    /// under the workspace root) qualify. The bare workspace root itself is
-    /// also deliberately excluded: a file at `root/tools/Foo.java` is far
-    /// more likely an ad-hoc/unconventional layout than a genuine claim
-    /// that `Foo` belongs to package `tools`, so flagging it would be a
-    /// false positive by construction. Unconventional layouts simply stay
-    /// silent (per the brief: "lone files / unknown roots stay silent").
-    fn expected_package(&self, uri: &str) -> Option<String> {
-        let path = open_doc_path(uri)?;
-        let dir = path.parent()?;
-        let project_root = self.project_root()?;
-        [
-            project_root.join("src/main/java"),
-            project_root.join("src/test/java"),
-        ]
-        .into_iter()
-        .find(|root| dir.starts_with(root))
-        .map(|root| {
-            dir.strip_prefix(&root)
-                .into_iter()
-                .flat_map(|rel| rel.components())
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect::<Vec<_>>()
-                .join(".")
-        })
-    }
-
-    /// The lazy, bounded workspace symbol index (see `workspace_index`),
-    /// exposed so another feature in this crate (e.g. a future add-import)
-    /// can do "simple name -> paths" lookups without re-walking the
-    /// workspace itself. Building/rebuilding only happens via `ensure_built`
-    /// (called from the `symbol` handler); this accessor never triggers it.
-    pub(crate) fn workspace_index(&self) -> &workspace_index::WorkspaceIndex {
-        &self.workspace_index
-    }
-
-    /// M7: refresh the workspace type-name index (see `workspace_index`)
-    /// before consulting `ProjectSymbols` — the same lock-roots-then-
-    /// release-then-walk choreography the `symbol` handler already used
-    /// (M4.5), factored out so every interactive handler that now consults
-    /// closed project files can call it too. Cheap on the common case (a
-    /// handful of `stat`s, no walk) once nothing under a source root has
-    /// changed. Must be called *before* taking `self.documents`'s own lock
-    /// — it briefly takes that lock itself to compute source roots, and
-    /// `tokio::sync::Mutex` isn't reentrant.
-    async fn ensure_workspace_index(&self) {
-        let project_root = self.project_root();
-        let roots = {
-            let docs = self.documents.lock().await;
-            project_root
-                .as_deref()
-                .map(|root| self.source_roots(&docs, root))
-                .unwrap_or_default()
-        };
-        self.workspace_index()
-            .ensure_built(&roots, project_root.as_deref())
-            .await;
-    }
-
-    /// Parse (or reuse a cached parse of) a single project source file,
-    /// invalidated by `mtime` so an on-disk edit is picked up without an
-    /// explicit notification (the server never watches files). Shared by
-    /// ladder step (c) (`locate_in_project_file`, below) and M4.3
-    /// find-references' Tier 2 per-hit-file confirm (`references()`/
-    /// `references.rs`) — both are one-off, cold, parse-on-demand lookups
-    /// of a file that isn't open in the editor.
-    fn parsed_project_file(&self, path: &Path) -> Option<(Arc<String>, Tree)> {
-        let metadata = std::fs::metadata(path).ok()?;
-        let mtime = metadata.modified().ok()?;
-
-        let mut cache = self
-            .project_file_cache
-            .lock()
-            .expect("project file cache poisoned");
-        let fresh = cache.get(path).is_some_and(|c| c.mtime == mtime);
-        if !fresh {
-            let text = std::fs::read_to_string(path).ok()?;
-            let tree = self.parse(&text, None);
-            insert_bounded_project_file(
-                &mut cache,
-                PROJECT_FILE_CACHE_CAP,
-                path.to_path_buf(),
-                CachedProjectFile {
-                    mtime,
-                    text: Arc::new(text),
-                    tree,
-                },
-            );
-        }
-        let cached = cache.get(path)?;
-        Some((Arc::clone(&cached.text), cached.tree.clone()))
-    }
-
-    /// Parse (or reuse a cached parse of) a single project source file for
-    /// ladder step (c). At most one file is read per candidate tried, and the
-    /// caller (`resolve_location`) stops at the first hit — no directory
-    /// walking or indexing.
-    fn locate_in_project_file(
-        &self,
-        path: &Path,
-        simple_name: &str,
-    ) -> Option<(StdRange<usize>, Arc<String>)> {
-        let (text, tree) = self.parsed_project_file(path)?;
-        let range = jvl_syntax::locate_type_in_source(&tree, &text, simple_name)?;
-        Some((range, text))
-    }
-
-    /// The source text to serve for an external (JDK/dependency) FQN: real
-    /// source when the classpath's sibling source archive has it, else a
-    /// signature-only stub synthesized from `ClassInfo`. Stub text is cached
-    /// per FQN (real source is already cached inside `Classpath` itself).
-    fn external_source_text(&self, fqn: &str) -> Option<Arc<String>> {
-        if let Some(src) = self.classpath().source(fqn) {
-            return Some(src);
-        }
-        self.stub_text(fqn)
-    }
-
-    fn stub_text(&self, fqn: &str) -> Option<Arc<String>> {
-        if let Some(hit) = self
-            .external_stub_cache
-            .lock()
-            .expect("external stub cache poisoned")
-            .get(fqn)
-        {
-            return Some(Arc::clone(hit));
-        }
-        let info = self.classpath().class(fqn)?;
-        let text = Arc::new(render_stub(&info));
-        let mut cache = self
-            .external_stub_cache
-            .lock()
-            .expect("external stub cache poisoned");
-        if cache.len() >= EXTERNAL_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(fqn.to_string(), Arc::clone(&text));
-        Some(text)
-    }
-
-    /// Resolve a `jvl_syntax::Definition` into an LSP `Location`, dispatching
-    /// on which ladder step produced it. `docs`/`uris` are the same
-    /// documents-lock-held snapshot the `jvl_syntax::definition`/
-    /// `type_definition` call was made against.
-    fn resolve_location(
-        &self,
-        def: Definition,
-        docs: &HashMap<String, Document>,
-        uris: &[&str],
-    ) -> Option<Location> {
-        match def {
-            Definition::InOpenDoc {
-                doc, name_range, ..
-            } => {
-                let uri_str = *uris.get(doc)?;
-                let target = docs.get(uri_str)?;
-                let index = LineIndex::new(&target.text, self.encoding());
-                Some(Location {
-                    uri: uri_str.parse().ok()?,
-                    range: byte_range_to_lsp(&index, name_range),
-                })
-            }
-            Definition::ProjectType { simple_name, fqn } => {
-                let fqn = fqn?;
-                for path in self.candidate_paths(docs, &fqn) {
-                    if let Some((range, text)) = self.locate_in_project_file(&path, &simple_name) {
-                        let index = LineIndex::new(&text, self.encoding());
-                        return Some(Location {
-                            uri: Uri::from_file_path(&path)?,
-                            range: byte_range_to_lsp(&index, range),
-                        });
-                    }
-                }
-                None
-            }
-            Definition::External { fqn, member } => {
-                let text = self.external_source_text(&fqn)?;
-                let simple = simple_name(&fqn);
-                let byte_range = jvl_syntax::locate_in_source(&text, simple, member.as_deref());
-                let index = LineIndex::new(&text, self.encoding());
-                let range = match byte_range {
-                    Some(r) => byte_range_to_lsp(&index, r),
-                    // The member/type couldn't be located inside the source or
-                    // stub (e.g. an overload set quirk) — still point *somewhere*
-                    // inside the virtual document rather than failing outright.
-                    None => Range::default(),
-                };
-                Some(Location {
-                    uri: jvl_src_uri(&fqn)?,
-                    range,
-                })
-            }
-        }
-    }
-
-    /// M8e: the text + tree behind a hierarchy item's file — the open
-    /// document if there is one, else the on-disk file through
-    /// `parsed_project_file`'s cache (hierarchy items can point at files the
-    /// user never opened, e.g. a supertype found through the workspace
-    /// index).
-    async fn hierarchy_doc(&self, uri: &str) -> Option<(Arc<String>, Tree)> {
-        {
-            let docs = self.documents.lock().await;
-            if let Some(d) = docs.get(uri) {
-                return Some((Arc::new(d.text.clone()), d.tree.clone()));
-            }
-        }
-        let path = open_doc_path(uri)?;
-        self.parsed_project_file(&path)
-    }
-
-    /// Parse `text`, reusing `old` for an incremental reparse when the caller has
-    /// already applied the corresponding `InputEdit`s to it.
-    fn parse(&self, text: &str, old: Option<&Tree>) -> Tree {
-        let mut parser = self.parser.lock().expect("parser mutex poisoned");
-        jvl_syntax::parse(&mut parser, text, old).expect("parser yields a tree for in-memory text")
-    }
-
-    /// Syntax diagnostics for a document already stored under `uri`, plus
-    /// unresolved-member diagnostics unless that setting has been turned
-    /// off, plus (M5.4) any `javac` diagnostics still on file for `uri` —
-    /// merged in, never clobbering either set. Unlike the first two, the
-    /// `javac` diagnostics don't require `uri` to be an open document: a
-    /// checked file the editor never opened still gets its diagnostics
-    /// published (see `Backend::publish_javac_diagnostics`).
-    fn compute_diagnostics(&self, docs: &HashMap<String, Document>, uri: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = match docs.get(uri) {
-            Some(doc) => {
-                let index = LineIndex::new(&doc.text, self.encoding());
-                let mut d = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
-                if self.unresolved_member_diagnostics.get().copied() == Some(true) {
-                    let open = open_docs(docs, uri, doc);
-                    // M7: classpath-only, not `CombinedSymbols` — this is a
-                    // synchronous fn on the didOpen/didChange hot path, and
-                    // `ProjectSymbols` needs an async `ensure_workspace_index`
-                    // pass first. The unresolved-member check already stays
-                    // silent whenever a receiver's type doesn't resolve at
-                    // all (see `member_names`'s `complete` flag), so a
-                    // closed-file project type is a missed diagnosis, never a
-                    // false positive — an accepted gap, not a regression.
-                    let symbols = ClasspathSymbols(self.classpath());
-                    d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
-                }
-                let filename = filename_from_uri(uri);
-                let expected_package = self.expected_package(uri);
-                d.extend(jvl_syntax::structural_diagnostics(
-                    &doc.tree,
-                    &doc.text,
-                    &index,
-                    filename.as_deref(),
-                    expected_package.as_deref(),
-                ));
-                d
-            }
-            None => Vec::new(),
-        };
-        if let Some(javac_diags) = self
-            .javac_diagnostics
-            .lock()
-            .expect("javac diagnostics poisoned")
-            .get(uri)
-        {
-            diagnostics.extend(javac_diags.clone());
-        }
-        diagnostics
-    }
-
-    /// Parse a freshly opened (or fully replaced) document from scratch, store
-    /// it, and publish its diagnostics.
-    async fn open_document(&self, uri: Uri, version: i32, text: String) {
-        let tree = self.parse(&text, None);
-        let diagnostics = {
-            let mut docs = self.documents.lock().await;
-            docs.insert(
-                uri.as_str().to_string(),
-                Document {
-                    text,
-                    tree,
-                    version,
-                },
-            );
-            self.compute_diagnostics(&docs, uri.as_str())
-        };
-        self.client
-            .publish_diagnostics(uri, diagnostics, None)
-            .await;
-    }
-
-    /// The `javacTimeoutSecs` initialization option, already clamped.
-    fn javac_timeout(&self) -> Duration {
-        Duration::from_secs(self.javac_timeout_secs.get().copied().unwrap_or(120))
-    }
-
-    /// M5.4: the check-project run (`jvl.checkProject.run`, forwarded by the
-    /// extension's trust-gated `java-vsix-lite.checkProject`) — see the module
-    /// doc comment on `javac` for the security invariants this must never
-    /// violate.
-    /// Concurrency (one run at a time) is enforced by the caller
-    /// (`execute_command`), which claims `javac_running` before calling this
-    /// and releases it afterward; this method assumes that's already done.
-    async fn run_check_project(&self) -> serde_json::Value {
-        let Some(project_root) = self.project_root() else {
-            return serde_json::json!({
-                "status": "error",
-                "message": "no project root (open a workspace folder or a file under a Maven/Gradle project)",
-            });
-        };
-
-        let javac_path = match javac::locate_javac(
-            self.jdk_home_override.get().and_then(|o| o.as_deref()),
-        ) {
-            Some(path) => path,
-            None => {
-                return serde_json::json!({
-                    "status": "javac-not-found",
-                    "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
-                });
-            }
-        };
-
-        let classpath = self.classpath();
-        let roots = {
-            let docs = self.documents.lock().await;
-            let mut roots = self.source_roots(&docs, &project_root);
-            roots.extend(classpath.source_roots().iter().cloned());
-            roots
-        };
-        let source_files = javac::collect_source_files(&roots);
-        if source_files.is_empty() {
-            return serde_json::json!({
-                "status": "error",
-                "message": "no .java source files found under the discovered source roots",
-            });
-        }
-
-        let config = javac::RunConfig {
-            javac_path,
-            source_files,
-            classpath_entries: classpath.entries().to_vec(),
-            timeout: self.javac_timeout(),
-        };
-        let slot = Arc::clone(&self.javac_child);
-        let leaked = self.javac_leaked_readers.clone();
-        let outcome = tokio::task::spawn_blocking(move || javac::run(config, &slot, &leaked))
-            .await
-            .unwrap_or_else(|err| {
-                javac::RunOutcome::SpawnError(format!("javac task panicked: {err}"))
-            });
-
-        match outcome {
-            javac::RunOutcome::TimedOut => serde_json::json!({
-                "status": "timeout",
-                "message": format!("javac timed out after {}s and was killed", self.javac_timeout().as_secs()),
-            }),
-            javac::RunOutcome::Cancelled => serde_json::json!({
-                "status": "cancelled",
-                "message": "javac was killed by server shutdown",
-            }),
-            javac::RunOutcome::SpawnError(message) => serde_json::json!({
-                "status": "spawn-error",
-                "message": message,
-            }),
-            javac::RunOutcome::Completed { stderr } => {
-                let raw = javac::parse_stderr(&stderr);
-                let (error_count, warning_count) = javac::count_severities(&raw);
-                let grouped = javac::group_diagnostics(raw);
-                self.publish_javac_diagnostics(grouped).await;
-                serde_json::json!({
-                    "status": "ok",
-                    "errorCount": error_count,
-                    "warningCount": warning_count,
-                })
-            }
-        }
-    }
-
-    /// M5.4: replace the javac-diagnostics set wholesale with `new_diags`
-    /// (keyed by filesystem path, as `javac` echoed it) and (re)publish
-    /// every affected URI — both newly (or still) diagnosed files and any
-    /// file that had javac diagnostics before this run but doesn't anymore
-    /// (which must be published empty-of-javac to actually clear in the
-    /// client's Problems panel; LSP has no "leave unchanged" — an omitted
-    /// publish just means "nothing changed", not "clear"). Merges with each
-    /// file's other diagnostics via `compute_diagnostics`, never clobbering.
-    async fn publish_javac_diagnostics(&self, new_diags: HashMap<String, Vec<Diagnostic>>) {
-        let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
-            .into_iter()
-            .filter_map(|(path, diags)| {
-                Uri::from_file_path(Path::new(&path)).map(|uri| (uri.as_str().to_string(), diags))
-            })
-            .collect();
-
-        let affected: Vec<String> = {
-            let mut map = self
-                .javac_diagnostics
-                .lock()
-                .expect("javac diagnostics poisoned");
-            let mut affected: HashSet<String> = map.keys().cloned().collect();
-            affected.extend(new_map.keys().cloned());
-            *map = new_map;
-            affected.into_iter().collect()
-        };
-
-        for uri_str in affected {
-            let diagnostics = {
-                let docs = self.documents.lock().await;
-                self.compute_diagnostics(&docs, &uri_str)
-            };
-            if let Ok(uri) = uri_str.parse::<Uri>() {
-                self.client
-                    .publish_diagnostics(uri, diagnostics, None)
-                    .await;
-            }
-        }
-    }
-
-    /// M6.2: `REBUILD_CLASSPATH_COMMAND` — an immediate, synchronous classpath
-    /// rebuild (unlike `drive_classpath_rebuild`'s debounced version driven by
-    /// watched build-file changes), used by the fixed-point loop that follows
-    /// a consent-gated dependency install: the extension awaits this
-    /// `executeCommand` response before re-querying `jvl/missingDependencies`,
-    /// so it must reflect the just-installed jar(s) by the time it returns.
-    /// Reuses the exact same static/offline resolution as every other
-    /// rebuild path — this command itself never touches the network; it only
-    /// re-reads whatever the extension already placed under `~/.m2`.
-    async fn run_rebuild_classpath_command(&self) -> serde_json::Value {
-        self.rebuild_classpath().await;
-        self.republish_all_diagnostics().await;
-        serde_json::json!({ "status": "ok" })
-    }
-}
 
 /// The workspace root as a filesystem path, from the first workspace folder
 /// (falling back to the deprecated `rootUri`). Uses the URI type's own
@@ -1016,37 +152,15 @@ fn open_doc_path(uri: &str) -> Option<PathBuf> {
     Some(uri.to_file_path()?.into_owned())
 }
 
-/// M6.1 rule (a)/(b): the document's own file name (e.g.
+/// The document's own file name (e.g.
 /// `"MavenDemo2.java"`), or `None` for a non-`file:` URI (untitled/in-memory
 /// document) or one whose path doesn't end in `.java`. Derived purely from
 /// the URI — no filesystem access, no workspace/project root needed, so a
-/// lone file with no workspace still gets this check (per the task brief).
+/// lone file with no workspace still gets this check.
 fn filename_from_uri(uri: &str) -> Option<String> {
     let path = open_doc_path(uri)?;
     let name = path.file_name()?.to_str()?.to_string();
     name.ends_with(".java").then_some(name)
-}
-
-/// Whether every dotted segment of a fully-qualified name is a safe, single
-/// path component — guards ladder step (c)'s file lookup against a crafted
-/// `package`/`import` declaration escaping the inferred source root (e.g. a
-/// `..` segment) when building a candidate path.
-fn is_safe_fqn(fqn: &str) -> bool {
-    !fqn.is_empty()
-        && fqn
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['/', '\\']))
-}
-
-/// `java.util.Map$Entry` -> `Entry`: the simple name the virtual-document
-/// tree-sitter lookup (`jvl_syntax::locate_in_source`) searches for.
-fn simple_name(fqn: &str) -> &str {
-    fqn.rsplit(['.', '$']).next().unwrap_or(fqn)
-}
-
-/// The `jvl-src:` virtual-document URI for an external (JDK/dependency) FQN.
-fn jvl_src_uri(fqn: &str) -> Option<Uri> {
-    format!("jvl-src:/{fqn}.java").parse().ok()
 }
 
 /// The FQN encoded in a `jvl-src:` virtual-document URI (the inverse of
@@ -1057,107 +171,8 @@ fn fqn_from_jvl_src_uri(uri: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Render a signature-only stub `.java`-shaped text from bytecode-derived
-/// `ClassInfo` — used when no `-sources.jar`/`src.zip` entry exists for an
-/// external type. Reuses the member signatures `jvl-classpath` already
-/// rendered (via its own signature/generics helpers) rather than re-deriving
-/// them; declarations have no bodies, which is ordinary Java syntax
-/// (abstract methods, interface methods) and parses fine.
-fn render_stub(info: &jvl_classpath::ClassInfo) -> String {
-    let mut out = format!(
-        "// Signature-only stub for {} (no sources available)\nclass {} {{\n",
-        info.fqn,
-        simple_name(&info.fqn)
-    );
-    for member in &info.members {
-        out.push_str("    ");
-        out.push_str(&member.signature);
-        out.push_str(";\n");
-    }
-    out.push_str("}\n");
-    out
-}
-
-/// Insert into the bounded project-file cache, clearing it wholesale when
-/// the cap is reached (the same simple bound-not-LRU policy as the external
-/// stub cache — see [`PROJECT_FILE_CACHE_CAP`]'s doc comment for sizing).
-/// A free function (not a `Backend` method) so the overflow behavior is
-/// directly unit-testable without constructing a `Client`.
-fn insert_bounded_project_file(
-    cache: &mut HashMap<PathBuf, CachedProjectFile>,
-    cap: usize,
-    path: PathBuf,
-    file: CachedProjectFile,
-) {
-    if cache.len() >= cap {
-        cache.clear();
-    }
-    cache.insert(path, file);
-}
-
-/// Convert a byte range (from `jvl-syntax`) into an LSP `Range` via `index`.
-/// M8e: wrap a located callable into a `CallHierarchyItem`.
-fn callable_item(
-    info: &jvl_syntax::CallableInfo,
-    uri: Uri,
-    index: &LineIndex,
-) -> CallHierarchyItem {
-    CallHierarchyItem {
-        name: info.name.clone(),
-        kind: match info.kind {
-            jvl_syntax::CallableKind::Method => SymbolKind::METHOD,
-            jvl_syntax::CallableKind::Constructor => SymbolKind::CONSTRUCTOR,
-            jvl_syntax::CallableKind::Type => SymbolKind::CLASS,
-        },
-        tags: None,
-        detail: info.detail.clone(),
-        uri,
-        range: byte_range_to_lsp(index, info.decl_range.clone()),
-        selection_range: byte_range_to_lsp(index, info.name_range.clone()),
-        data: None,
-    }
-}
-
-/// M8e: wrap a located type into a `TypeHierarchyItem`.
-fn type_item(info: &jvl_syntax::TypeInfo, uri: Uri, index: &LineIndex) -> TypeHierarchyItem {
-    TypeHierarchyItem {
-        name: info.name.clone(),
-        kind: match info.kind {
-            jvl_syntax::TypeInfoKind::Class => SymbolKind::CLASS,
-            jvl_syntax::TypeInfoKind::Interface => SymbolKind::INTERFACE,
-            jvl_syntax::TypeInfoKind::Enum => SymbolKind::ENUM,
-            jvl_syntax::TypeInfoKind::Record => SymbolKind::STRUCT,
-            jvl_syntax::TypeInfoKind::Annotation => SymbolKind::INTERFACE,
-        },
-        tags: None,
-        detail: None,
-        uri,
-        range: byte_range_to_lsp(index, info.decl_range.clone()),
-        selection_range: byte_range_to_lsp(index, info.name_range.clone()),
-        data: None,
-    }
-}
-
-fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Range {
-    Range {
-        start: index.position(range.start),
-        end: index.position(range.end),
-    }
-}
-
-/// The bounded-prefilter cap-truncation notice text — shared verbatim by
-/// `references()` (M4.3) and `goto_implementation()` (M4.6), which both run
-/// the same `references::prefilter` and must tell the user the same thing
-/// when it hits its file cap.
-fn truncation_notice() -> String {
-    format!(
-        "References search truncated at {} files; results may be incomplete.",
-        references::MAX_FILES_SCANNED
-    )
-}
-
 /// The `unresolvedMemberDiagnostics` flag from `initializationOptions`.
-/// Default-on (M5.6): the diagnostic itself (`member_diagnostics`) is
+/// Default-on: the diagnostic itself (`member_diagnostics`) is
 /// conservative and stays silent whenever resolution is incomplete, so this
 /// flag exists only for a user who wants to opt back out, not to gate an
 /// otherwise-risky feature.
@@ -1171,7 +186,7 @@ fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
 }
 
 /// The `classpathDebounceMs` field from `initializationOptions` — the wait
-/// after the last matching build-file change before M5.2's classpath
+/// after the last matching build-file change before the classpath
 /// rebuild runs. Defaults to 2000ms; tests override it to a few
 /// milliseconds so the watched-build-file E2E round trip doesn't have to
 /// sleep multiple seconds.
@@ -1199,7 +214,7 @@ fn jdk_home_opt(params: &InitializeParams) -> Option<PathBuf> {
 }
 
 /// The `javacTimeoutSecs` field from `initializationOptions` — how long
-/// M5.4's `checkProject` run waits before killing `javac`. Clamped to
+/// a `checkProject` run waits before killing `javac`. Clamped to
 /// `[10, 600]` seconds (default 120) via `javac::clamp_timeout_secs`.
 fn javac_timeout_secs_opt(params: &InitializeParams) -> u64 {
     let raw = params
@@ -1211,10 +226,10 @@ fn javac_timeout_secs_opt(params: &InitializeParams) -> u64 {
 }
 
 /// Whether the client declared dynamic-registration support for
-/// `workspace/didChangeWatchedFiles` — if not, M5.2's build-file watch is
+/// `workspace/didChangeWatchedFiles` — if not, the build-file watch is
 /// simply never registered (graceful fallback; the LSP spec gives servers
 /// no static-capability alternative for this one).
-/// M8e: whether the client can dynamically register type hierarchy — the
+/// Whether the client can dynamically register type hierarchy — the
 /// only way to enable it, since `ls-types` 0.0.6 has no static
 /// `typeHierarchyProvider` capability field (see `type_hierarchy_dynamic`).
 fn supports_type_hierarchy_registration(params: &InitializeParams) -> bool {
@@ -1237,7 +252,7 @@ fn supports_watched_files_registration(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `uri` names one of M5.2's watched build files: `pom.xml`,
+/// Whether `uri` names one of the watched build files: `pom.xml`,
 /// `build.gradle`, `build.gradle.kts`, or `gradle/libs.versions.toml`
 /// (matched by filename, and — for the last, since the filename alone isn't
 /// distinctive — its parent directory too). Checked server-side on receipt
@@ -1275,10 +290,9 @@ fn supports_snippets(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
-/// M4.4: whether the client's `workspace.workspaceEdit.resourceOperations`
-/// includes `"rename"` — gates `rename`'s `RenameFile` resource op (per the
-/// task brief: skip the file op, but still emit the text edits, when
-/// unsupported).
+/// Whether the client's `workspace.workspaceEdit.resourceOperations`
+/// includes `"rename"` — gates `rename`'s `RenameFile` resource op: skip the
+/// file op, but still emit the text edits, when unsupported.
 fn supports_rename_file_op(params: &InitializeParams) -> bool {
     params
         .capabilities
@@ -1302,434 +316,6 @@ fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
         PositionEncoding::Utf8
     } else {
         PositionEncoding::Utf16
-    }
-}
-
-/// Everything a two-tier reference/rename scan needs, snapshotted from the
-/// documents lock before the (possibly slow, Tier-2-only) workspace scan —
-/// mirrors `workspace_index::ensure_built`'s own pattern of never holding the
-/// lock across a directory walk. Shared by `references()` (M4.3) and
-/// `rename()`/`prepare_rename()` (M4.4), which all resolve the cursor to the
-/// same `jvl_syntax::ReferenceTarget` first.
-struct TargetSnapshot {
-    target: jvl_syntax::ReferenceTarget,
-    target_uri: String,
-    target_text: String,
-    target_tree: Tree,
-    /// The declaring document's own LSP version, for `rename`'s versioned
-    /// `TextDocumentEdit` (this document is always open — resolution only
-    /// ever targets an open document).
-    target_version: i32,
-    roots: Vec<PathBuf>,
-    project_root: Option<PathBuf>,
-    /// Currently-open documents' live text/tree/version, keyed by
-    /// canonicalized path (falling back to the raw path when
-    /// canonicalization fails) — a Tier-2 hit file that is itself open is
-    /// read from here instead of disk, so unsaved edits are reflected.
-    open_snapshot: HashMap<PathBuf, (i32, String, Tree)>,
-}
-
-/// M4 (4.6): everything `goto_implementation`'s bounded scan needs,
-/// snapshotted from the documents lock before the (possibly slow)
-/// workspace prefilter — the `textDocument/implementation` analogue of
-/// [`TargetSnapshot`] (references/rename). No `target_version` (unlike
-/// `TargetSnapshot`): go-to-implementation only ever produces `Location`s,
-/// never a versioned edit.
-struct ImplTargetSnapshot {
-    target: jvl_syntax::ImplementationTarget,
-    target_uri: String,
-    target_text: String,
-    target_tree: Tree,
-    roots: Vec<PathBuf>,
-    project_root: Option<PathBuf>,
-    open_snapshot: HashMap<PathBuf, (i32, String, Tree)>,
-}
-
-/// One scanned file's confirmed implementor/override ranges — the
-/// `textDocument/implementation` analogue of [`ScanHit`], minus the open-doc
-/// `version` (never needed for a read-only `Location` result).
-struct ImplScanHit {
-    uri: Uri,
-    text: Arc<String>,
-    ranges: Vec<StdRange<usize>>,
-}
-
-/// Aggregate result of the bounded `textDocument/implementation` scan.
-struct ImplScanOutcome {
-    hits: Vec<ImplScanHit>,
-    /// Whether the workspace prefilter hit its file/byte cap (M4.3's same
-    /// `references::MAX_FILES_SCANNED`/`MAX_BYTES_SCANNED` caps — this
-    /// feature reuses that prefilter outright, not a new one).
-    truncated: bool,
-}
-
-/// One scanned file's confirmed occurrences of the target — the shared unit
-/// `references()` turns into `Location`s and `rename()` turns into a
-/// `TextDocumentEdit`.
-struct ScanHit {
-    uri: Uri,
-    text: Arc<String>,
-    /// `Some` when this file is a currently-open document (its LSP version,
-    /// for a versioned rename edit); `None` for an on-disk/unopened file.
-    version: Option<i32>,
-    ranges: Vec<StdRange<usize>>,
-}
-
-/// Aggregate result of the two-tier reference scan shared by
-/// `textDocument/references` (M4.3) and `textDocument/rename` (M4.4).
-struct ScanOutcome {
-    hits: Vec<ScanHit>,
-    /// Textual matches that could not be confirmed by resolution (aggregate
-    /// across every scanned file) — `references` reports these as a
-    /// best-effort notice; `rename` must refuse outright (any one of them
-    /// could be a real, unconfirmed occurrence).
-    possible: usize,
-    /// Whether the Tier-2 workspace prefilter hit its file/byte cap.
-    truncated: bool,
-    /// Tier::Workspace only: how many prefiltered candidate files could not
-    /// be read/parsed at all. `references` silently skips these (best
-    /// effort); `rename` must refuse whenever this is nonzero, since an
-    /// occurrence could be hiding in one of them.
-    unparsed_hit_files: usize,
-}
-
-impl Backend {
-    /// Resolve the cursor (in the currently open `uri`) to a
-    /// `jvl_syntax::ReferenceTarget` and snapshot everything the two-tier
-    /// scan needs — `None` for the same reasons
-    /// `jvl_syntax::reference_target` itself returns `None` (an external/JDK
-    /// symbol, `this`/`super`, a non-identifier, or a document that isn't
-    /// currently open).
-    async fn target_snapshot(&self, uri: &str, position: Position) -> Option<TargetSnapshot> {
-        self.ensure_workspace_index().await;
-        let docs = self.documents.lock().await;
-        let (open, uris) = open_docs_and_uris(&docs, uri)?;
-        let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
-        let target = jvl_syntax::reference_target(&open, 0, &index, position, &symbols)?;
-
-        let target_uri = uris[target.doc].to_string();
-        let target_doc = docs.get(&target_uri)?;
-        let target_text = target_doc.text.clone();
-        let target_tree = target_doc.tree.clone();
-        let target_version = target_doc.version;
-
-        let project_root = self.project_root();
-        let roots = project_root
-            .as_deref()
-            .map(|root| self.source_roots(&docs, root))
-            .unwrap_or_default();
-
-        let mut open_snapshot = HashMap::new();
-        for (doc_uri, doc) in docs.iter() {
-            if let Some(path) = open_doc_path(doc_uri) {
-                let key = std::fs::canonicalize(&path).unwrap_or(path);
-                open_snapshot.insert(key, (doc.version, doc.text.clone(), doc.tree.clone()));
-            }
-        }
-
-        Some(TargetSnapshot {
-            target,
-            target_uri,
-            target_text,
-            target_tree,
-            target_version,
-            roots,
-            project_root,
-            open_snapshot,
-        })
-    }
-
-    /// Run the bounded, two-tier reference scan for `target` (see
-    /// `references()`'s doc comment for the tier semantics) — the shared
-    /// orchestration `references()`/`rename()` both build on. Never holds
-    /// the documents lock (everything it reads is already snapshotted).
-    #[allow(clippy::too_many_arguments)]
-    async fn scan_references(
-        &self,
-        target: &jvl_syntax::ReferenceTarget,
-        target_uri: &str,
-        target_text: &str,
-        target_tree: &Tree,
-        target_version: i32,
-        roots: &[PathBuf],
-        project_root: Option<&Path>,
-        open_snapshot: &HashMap<PathBuf, (i32, String, Tree)>,
-        include_declaration: bool,
-    ) -> ScanOutcome {
-        self.ensure_workspace_index().await;
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
-        let empty = || ScanOutcome {
-            hits: Vec::new(),
-            possible: 0,
-            truncated: false,
-            unparsed_hit_files: 0,
-        };
-        let Some(target_uri_parsed) = target_uri.parse::<Uri>().ok() else {
-            return empty();
-        };
-
-        let mut hits = Vec::new();
-
-        // The declaring file's own occurrences are always in scope — Tier 1
-        // stops here entirely; Tier 2 also always checks it directly
-        // (self-references), whether or not it happens to lie under a
-        // discovered source root.
-        let self_target = jvl_syntax::ReferenceTarget {
-            doc: 0,
-            ..target.clone()
-        };
-        let target_open = jvl_syntax::OpenDoc {
-            source: target_text,
-            tree: target_tree,
-        };
-        let own_hits = jvl_syntax::references_in_doc(
-            std::slice::from_ref(&target_open),
-            0,
-            &self_target,
-            include_declaration,
-            &symbols,
-        );
-        // Textual hits that could not be confirmed by resolution (receiver
-        // type unresolved — e.g. an unknown supertype) are conservatively
-        // OMITTED from the results; aggregate their count across every
-        // scanned file so the caller can be told the list may be incomplete
-        // (`references`) or must refuse outright (`rename`).
-        let mut possible = own_hits.possible;
-        let mut truncated = false;
-        let mut unparsed_hit_files = 0usize;
-        if !own_hits.ranges.is_empty() {
-            hits.push(ScanHit {
-                uri: target_uri_parsed.clone(),
-                text: Arc::new(target_text.to_string()),
-                version: Some(target_version),
-                ranges: own_hits.ranges,
-            });
-        }
-
-        if target.tier == jvl_syntax::Tier::Workspace {
-            let scan = references::prefilter(roots, project_root, &target.name).await;
-
-            let target_path = open_doc_path(target_uri);
-            let target_canon = target_path
-                .as_ref()
-                .and_then(|p| std::fs::canonicalize(p).ok());
-
-            for hit_path in scan.files {
-                let hit_canon = std::fs::canonicalize(&hit_path).ok();
-                let is_target_file = target_path.as_ref() == Some(&hit_path)
-                    || (hit_canon.is_some() && hit_canon == target_canon);
-                if is_target_file {
-                    continue; // already handled above
-                }
-
-                let cached_open = hit_canon.as_ref().and_then(|c| open_snapshot.get(c));
-                let cached = cached_open
-                    .map(|(_, text, tree)| (Arc::new(text.clone()), tree.clone()))
-                    .or_else(|| self.parsed_project_file(&hit_path));
-                let Some((hit_text, hit_tree)) = cached else {
-                    unparsed_hit_files += 1;
-                    tokio::task::yield_now().await;
-                    continue;
-                };
-                let version = cached_open.map(|(v, _, _)| *v);
-
-                let docs_for_scan = [
-                    jvl_syntax::OpenDoc {
-                        source: &hit_text,
-                        tree: &hit_tree,
-                    },
-                    jvl_syntax::OpenDoc {
-                        source: target_text,
-                        tree: target_tree,
-                    },
-                ];
-                let remapped = jvl_syntax::ReferenceTarget {
-                    doc: 1,
-                    ..target.clone()
-                };
-                let scan_hits = jvl_syntax::references_in_doc(
-                    &docs_for_scan,
-                    0,
-                    &remapped,
-                    include_declaration,
-                    &symbols,
-                );
-                possible += scan_hits.possible;
-                if !scan_hits.ranges.is_empty() {
-                    if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
-                        hits.push(ScanHit {
-                            uri: hit_uri,
-                            text: hit_text,
-                            version,
-                            ranges: scan_hits.ranges,
-                        });
-                    }
-                }
-
-                tokio::task::yield_now().await;
-            }
-
-            truncated = scan.truncated;
-        }
-
-        ScanOutcome {
-            hits,
-            possible,
-            truncated,
-            unparsed_hit_files,
-        }
-    }
-
-    /// M4 (4.6): resolve the cursor to a `jvl_syntax::ImplementationTarget`
-    /// and snapshot everything the bounded scan needs — mirrors
-    /// `target_snapshot`, over `jvl_syntax::implementation_target` instead
-    /// of `reference_target`. `None` for the same reasons that returns
-    /// `None`: an external/JDK symbol, a local/param/field, `this`/`super`,
-    /// a non-identifier, or a document that isn't currently open.
-    async fn implementation_target_snapshot(
-        &self,
-        uri: &str,
-        position: Position,
-    ) -> Option<ImplTargetSnapshot> {
-        self.ensure_workspace_index().await;
-        let docs = self.documents.lock().await;
-        let (open, uris) = open_docs_and_uris(&docs, uri)?;
-        let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
-        let target = jvl_syntax::implementation_target(&open, 0, &index, position, &symbols)?;
-
-        let target_uri = uris[target.type_doc].to_string();
-        let target_doc = docs.get(&target_uri)?;
-        let target_text = target_doc.text.clone();
-        let target_tree = target_doc.tree.clone();
-
-        let project_root = self.project_root();
-        let roots = project_root
-            .as_deref()
-            .map(|root| self.source_roots(&docs, root))
-            .unwrap_or_default();
-
-        let mut open_snapshot = HashMap::new();
-        for (doc_uri, doc) in docs.iter() {
-            if let Some(path) = open_doc_path(doc_uri) {
-                let key = std::fs::canonicalize(&path).unwrap_or(path);
-                open_snapshot.insert(key, (doc.version, doc.text.clone(), doc.tree.clone()));
-            }
-        }
-
-        Some(ImplTargetSnapshot {
-            target,
-            target_uri,
-            target_text,
-            target_tree,
-            roots,
-            project_root,
-            open_snapshot,
-        })
-    }
-
-    /// M4 (4.6): the bounded, single-tier scan behind
-    /// `textDocument/implementation` — reuses the M4.3 references prefilter
-    /// (`references::prefilter`) with the target type's simple name as
-    /// needle (same caps, cancellation, source-root confinement as
-    /// `scan_references`'s Tier 2), then confirms each candidate file with
-    /// `jvl_syntax::implementations_in_doc`. Unlike `scan_references`, there
-    /// is no visibility tier (an interface/class name is always workspace-
-    /// reaching) and no "possible"/unparsed-hit-file refusal bookkeeping —
-    /// this is a read-only, best-effort query, not `rename`'s all-or-nothing
-    /// one.
-    #[allow(clippy::too_many_arguments)]
-    async fn scan_implementations(
-        &self,
-        target: &jvl_syntax::ImplementationTarget,
-        target_uri: &str,
-        target_text: &str,
-        target_tree: &Tree,
-        roots: &[PathBuf],
-        project_root: Option<&Path>,
-        open_snapshot: &HashMap<PathBuf, (i32, String, Tree)>,
-    ) -> ImplScanOutcome {
-        let mut hits = Vec::new();
-
-        // The target's own declaring file may itself contain an implementor
-        // (or, for a method-level query, the overriding declaration) — always
-        // checked directly, same as `scan_references`'s `own_hits`.
-        let target_open = jvl_syntax::OpenDoc {
-            source: target_text,
-            tree: target_tree,
-        };
-        let self_target = jvl_syntax::ImplementationTarget {
-            type_doc: 0,
-            ..target.clone()
-        };
-        let own_hits =
-            jvl_syntax::implementations_in_doc(std::slice::from_ref(&target_open), 0, &self_target);
-        if !own_hits.is_empty() {
-            if let Ok(target_uri_parsed) = target_uri.parse::<Uri>() {
-                hits.push(ImplScanHit {
-                    uri: target_uri_parsed,
-                    text: Arc::new(target_text.to_string()),
-                    ranges: own_hits.into_iter().map(|h| h.name_range).collect(),
-                });
-            }
-        }
-
-        let scan = references::prefilter(roots, project_root, &target.type_name).await;
-        let target_path = open_doc_path(target_uri);
-        let target_canon = target_path
-            .as_ref()
-            .and_then(|p| std::fs::canonicalize(p).ok());
-
-        for hit_path in scan.files {
-            let hit_canon = std::fs::canonicalize(&hit_path).ok();
-            let is_target_file = target_path.as_ref() == Some(&hit_path)
-                || (hit_canon.is_some() && hit_canon == target_canon);
-            if is_target_file {
-                continue; // already handled above
-            }
-
-            let cached_open = hit_canon.as_ref().and_then(|c| open_snapshot.get(c));
-            let cached = cached_open
-                .map(|(_, text, tree)| (Arc::new(text.clone()), tree.clone()))
-                .or_else(|| self.parsed_project_file(&hit_path));
-            let Some((hit_text, hit_tree)) = cached else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-
-            let docs_for_scan = [
-                jvl_syntax::OpenDoc {
-                    source: &hit_text,
-                    tree: &hit_tree,
-                },
-                jvl_syntax::OpenDoc {
-                    source: target_text,
-                    tree: target_tree,
-                },
-            ];
-            let remapped = jvl_syntax::ImplementationTarget {
-                type_doc: 1,
-                ..target.clone()
-            };
-            let scan_hits = jvl_syntax::implementations_in_doc(&docs_for_scan, 0, &remapped);
-            if !scan_hits.is_empty() {
-                if let Some(hit_uri) = Uri::from_file_path(&hit_path) {
-                    hits.push(ImplScanHit {
-                        uri: hit_uri,
-                        text: hit_text,
-                        ranges: scan_hits.into_iter().map(|h| h.name_range).collect(),
-                    });
-                }
-            }
-
-            tokio::task::yield_now().await;
-        }
-
-        ImplScanOutcome {
-            hits,
-            truncated: scan.truncated,
-        }
     }
 }
 
@@ -1781,19 +367,19 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
-                // M4 (4.6): go-to-implementation.
+                // Go-to-implementation.
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
-                // M4.4: `prepareRename` support advertised so the client
+                // `prepareRename` support advertised so the client
                 // validates/positions the rename before sending
                 // `textDocument/rename`.
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
-                // M8a: add-import quick fixes + "Organize Imports" (VS Code's
+                // Add-import quick fixes + "Organize Imports" (VS Code's
                 // shift+alt+O and `source.organizeImports` on save both work
-                // through this). M8d: extract variable/constant and
+                // through this), plus extract variable/constant and
                 // source-generate actions (accessors, constructor,
                 // equals/hashCode, toString).
                 code_action_provider: Some(CodeActionProviderCapability::Options(
@@ -1813,7 +399,7 @@ impl LanguageServer for Backend {
                     // completion is requested explicitly (Ctrl-Space) or by the
                     // editor as the user types.
                     trigger_characters: Some(vec![".".to_string()]),
-                    // M6.3: Javadoc is fetched lazily, only when the client
+                    // Javadoc is fetched lazily, only when the client
                     // asks via `completionItem/resolve` — never during
                     // `textDocument/completion` itself. See
                     // `Backend::completion_resolve`.
@@ -1840,12 +426,12 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
-                // M8e: call hierarchy (incoming/outgoing calls). Its type-
+                // Call hierarchy (incoming/outgoing calls). Its type-
                 // hierarchy sibling is registered dynamically in
                 // `initialized` — see `type_hierarchy_dynamic`.
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
-                // M5.4/M6.2: the one-shot, trust-gated `javac` check command
-                // and the M6.2 classpath-rebuild command. The extension only
+                // The one-shot, trust-gated `javac` check command
+                // and the classpath-rebuild command. The extension only
                 // sends either after confirming Workspace Trust; see
                 // `javac`'s module doc comment (and `REBUILD_CLASSPATH_COMMAND`'s)
                 // for the rest of the security invariants.
@@ -1867,7 +453,7 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "java-vsix-lite server initialized")
             .await;
 
-        // M8e: type hierarchy is registered dynamically, client permitting —
+        // Type hierarchy is registered dynamically, client permitting —
         // `ls-types` 0.0.6's `ServerCapabilities` cannot advertise it
         // statically (no `typeHierarchyProvider` field).
         if self.type_hierarchy_dynamic.get().copied().unwrap_or(false) {
@@ -1887,7 +473,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        // M5.2: watch build files for classpath invalidation, client
+        // Watch build files for classpath invalidation, client
         // permitting. VS Code supports dynamic registration; a client that
         // doesn't just never gets watched — the LSP spec has no static
         // alternative for this capability.
@@ -1922,7 +508,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        // M5.4: a `checkProject` run in flight must never survive the
+        // A `checkProject` run in flight must never survive the
         // server as a zombie or an orphaned process — kill and reap it.
         javac::kill_running_child(&self.javac_child);
         Ok(())
@@ -1949,7 +535,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // M5.4: an edit invalidates any javac diagnostics for this file —
+        // An edit invalidates any javac diagnostics for this file —
         // they're stale the instant the source they were computed from
         // changes. Cleared here (rather than left to the next checkProject
         // run) so they disappear from Problems immediately on edit.
@@ -1957,6 +543,13 @@ impl LanguageServer for Backend {
             .lock()
             .expect("javac diagnostics poisoned")
             .remove(uri.as_str());
+
+        // Warm the classpath before taking the documents lock — see
+        // `open_document`'s identical call for why: `compute_diagnostics`
+        // below needs it for the unresolved-member pass, and a cold
+        // first-ever build (JDK/project dependency scan) should not run
+        // while other requests are blocked on the documents lock.
+        self.classpath();
 
         // Apply edits to the cached text + tree under the lock (all synchronous),
         // reparse, then drop the lock before the async publish.
@@ -2010,7 +603,7 @@ impl LanguageServer for Backend {
         self.client.publish_diagnostics(uri, vec![], None).await;
     }
 
-    /// M5.2: a watched build file changed. Events that don't actually name
+    /// A watched build file changed. Events that don't actually name
     /// one of the watched build files (`is_classpath_build_file`) are
     /// ignored outright — no log message, no coalescer state touched — so
     /// an unrelated file's change never triggers a rebuild (verified
@@ -2041,14 +634,14 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// M5.4/M6.2: `workspace/executeCommand` — `javac::CHECK_PROJECT_COMMAND`
+    /// `workspace/executeCommand` — `javac::CHECK_PROJECT_COMMAND`
     /// or `REBUILD_CLASSPATH_COMMAND`. One-shot per invocation; the extension
     /// only sends either after confirming Workspace Trust (the server itself
     /// has no notion of that and just does what it's told — see `javac`'s
-    /// module doc comment). M8b: the extension additionally sends the javac
-    /// check after Java file saves (debounced, still trust-gated, opt-out via
-    /// `javac.checkOnSave`) — the single-flight guard below is what makes
-    /// that safe against overlapping saves.
+    /// module doc comment). The extension additionally sends the javac
+    /// check on project load and after Java file saves (debounced, still
+    /// trust-gated, opt-out via `javac.checkOnSave`) — the single-flight
+    /// guard below is what makes that safe against overlapping runs.
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -2087,7 +680,7 @@ impl LanguageServer for Backend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
-    /// M4.5: `workspace/symbol` over the lazy, bounded workspace index (see
+    /// `workspace/symbol` over the lazy, bounded workspace index (see
     /// `workspace_index`), built here on the first request. Query matching
     /// is case-insensitive substring or camel-hump prefix (see
     /// `workspace_index::matches_query`). Open documents are looked up live
@@ -2288,7 +881,7 @@ impl LanguageServer for Backend {
         for item in &mut result.items {
             stamp_completion_data_uri(item, &uris);
         }
-        // M7: a `CompletionList` (not a bare array) so `isIncomplete` reaches
+        // A `CompletionList` (not a bare array) so `isIncomplete` reaches
         // the client — it re-queries as the user types past a capped set.
         Ok(
             (!result.items.is_empty() || result.is_incomplete).then_some(CompletionResponse::List(
@@ -2300,7 +893,7 @@ impl LanguageServer for Backend {
         )
     }
 
-    /// M8a: code actions — add-import quick fixes for the identifier under
+    /// Code actions — add-import quick fixes for the identifier under
     /// the cursor plus "Organize Imports". `jvl_syntax::code_actions` returns
     /// URI-less sketches; the request's own document URI is stamped on here.
     /// The client's `context.only` filter is honored hierarchically (a
@@ -2343,13 +936,13 @@ impl LanguageServer for Backend {
         Ok((!actions.is_empty()).then_some(actions))
     }
 
-    /// M6.3: the strictly-lazy counterpart to `completion` — Javadoc is
+    /// The strictly-lazy counterpart to `completion` — Javadoc is
     /// fetched only here, on demand, from whatever key `completion` attached
     /// to the item's `data` field (see `jvl_syntax::resolve_documentation`).
     /// A `data`-less item (locals, params, keywords, type names — none of
     /// which ever carried eager docs) is returned unchanged.
     ///
-    /// M6.3 fix round 1: an in-project key is re-resolved against the
+    /// An in-project key is re-resolved against the
     /// **originating document only** (the `data.uri` stamped at completion
     /// time), never by scanning all open documents — with two open files
     /// declaring same-named types and members, a simple-name scan could
@@ -2384,7 +977,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // M7: deliberately ClasspathSymbols-only, NOT CombinedSymbols.
+        // Deliberately ClasspathSymbols-only, NOT CombinedSymbols.
         // jvl_syntax::definition's ladder step (c) — landing precisely
         // inside an unopened project file via locate_in_project_file —
         // is *triggered* by the SymbolSource failing to recognize a bare
@@ -2410,7 +1003,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoTypeDefinitionParams,
     ) -> Result<Option<GotoTypeDefinitionResponse>> {
-        // M7: deliberately ClasspathSymbols-only, NOT CombinedSymbols.
+        // Deliberately ClasspathSymbols-only, NOT CombinedSymbols.
         // jvl_syntax::definition's ladder step (c) — landing precisely
         // inside an unopened project file via locate_in_project_file —
         // is *triggered* by the SymbolSource failing to recognize a bare
@@ -2432,11 +1025,11 @@ impl LanguageServer for Backend {
         Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
-    /// M4 (4.6): `textDocument/implementation` — bounded, single-tier scan
+    /// `textDocument/implementation` — bounded, single-tier scan
     /// (see `scan_implementations`'s doc comment): resolve the cursor to an
     /// in-project type or method (`jvl_syntax::implementation_target`),
     /// prefilter the workspace for candidate files by the type's simple
-    /// name (reusing the M4.3 `references::prefilter`), and confirm each
+    /// name (reusing the `references::prefilter`), and confirm each
     /// with `jvl_syntax::implementations_in_doc` (supertype simple-name
     /// match + import/package-aware resolution — the same confirm-by-
     /// resolution convention `references.rs`'s `bare_type_site` uses).
@@ -2491,7 +1084,7 @@ impl LanguageServer for Backend {
         Ok((!locations.is_empty()).then_some(GotoImplementationResponse::Array(locations)))
     }
 
-    /// M4 (4.3): `textDocument/references` — two-tier, bounded, confirm-by-
+    /// `textDocument/references` — two-tier, bounded, confirm-by-
     /// resolution (see the `jvl_syntax::references` module doc for the full
     /// design). The target's visibility tier (`jvl_syntax::Tier`, read off
     /// its declaration's modifiers) decides the scan's reach:
@@ -2512,8 +1105,8 @@ impl LanguageServer for Backend {
     /// `jvl_syntax::reference_target` answers `None` for anything else
     /// (an external/JDK symbol, an unopened project file, `this`/`super`, a
     /// non-identifier), and this handler answers `Ok(None)` in that case.
-    /// M8e: `textDocument/prepareCallHierarchy` — the cursor must resolve
-    /// (via the M4.3 reference machinery) to a method/constructor
+    /// `textDocument/prepareCallHierarchy` — the cursor must resolve
+    /// (via the reference machinery) to a method/constructor
     /// **declared in an open document**; anything else answers `None`, the
     /// same open-files-first refusal shape as references/rename.
     async fn prepare_call_hierarchy(
@@ -2540,7 +1133,7 @@ impl LanguageServer for Backend {
         Ok(Some(vec![callable_item(&info, item_uri, &index)]))
     }
 
-    /// M8e: `callHierarchy/incomingCalls` — the M4.3 bounded reference scan,
+    /// `callHierarchy/incomingCalls` — the bounded reference scan,
     /// with every confirmed call site grouped under its enclosing
     /// method/constructor (or type, for field-initializer references).
     async fn incoming_calls(
@@ -2596,7 +1189,7 @@ impl LanguageServer for Backend {
         Ok(Some(calls))
     }
 
-    /// M8e: `callHierarchy/outgoingCalls` — every call site inside the
+    /// `callHierarchy/outgoingCalls` — every call site inside the
     /// item's body, each resolved through the same ladder as
     /// go-to-definition (open docs, closed project files, JDK/dependency
     /// stubs as `jvl-src` virtual documents). Unresolvable callees are
@@ -2650,7 +1243,7 @@ impl LanguageServer for Backend {
         Ok(Some(calls))
     }
 
-    /// M8e: `textDocument/prepareTypeHierarchy` — the cursor must name a
+    /// `textDocument/prepareTypeHierarchy` — the cursor must name a
     /// type declared in an open document (its declaration or any reference
     /// the open-document table resolves).
     async fn prepare_type_hierarchy(
@@ -2674,7 +1267,7 @@ impl LanguageServer for Backend {
         Ok(Some(vec![type_item(&info, item_uri, &decl_index)]))
     }
 
-    /// M8e: `typeHierarchy/supertypes` — the item's `extends`/`implements`
+    /// `typeHierarchy/supertypes` — the item's `extends`/`implements`
     /// simple names, located open-files-first, then in closed workspace
     /// files through the declaring file's import candidates + the workspace
     /// index. JDK/dependency supertypes are omitted (no real file to point
@@ -2737,7 +1330,7 @@ impl LanguageServer for Backend {
         Ok(Some(out))
     }
 
-    /// M8e: `typeHierarchy/subtypes` — the M4.6 bounded implementation scan
+    /// `typeHierarchy/subtypes` — the bounded implementation scan
     /// (same prefilter, same confirm-by-resolution), each hit wrapped back
     /// into its enclosing type declaration.
     async fn subtypes(
@@ -2864,7 +1457,7 @@ impl LanguageServer for Backend {
         Ok((!locations.is_empty()).then_some(locations))
     }
 
-    /// M4 (4.4): `textDocument/prepareRename` — `Some` only when the cursor
+    /// `textDocument/prepareRename` — `Some` only when the cursor
     /// resolves to an in-project declaration (see
     /// `jvl_syntax::prepare_rename`'s doc comment for the full refusal
     /// list: external/JDK symbols, keywords, literals, `this`/`super`, and
@@ -2893,11 +1486,11 @@ impl LanguageServer for Backend {
         }))
     }
 
-    /// M4 (4.4): `textDocument/rename` — conservative: refuse rather than
-    /// corrupt. Reuses the M4.3 find-references orchestration
+    /// `textDocument/rename` — conservative: refuse rather than
+    /// corrupt. Reuses the find-references orchestration
     /// (`target_snapshot`/`scan_references`) to collect every occurrence
     /// (declaration included — rename always renames it too), then applies
-    /// every refusal guard from the task brief, in order:
+    /// every refusal guard, in order:
     ///
     /// 1. `new_name` must be a syntactically valid Java identifier and not
     ///    a reserved word/literal (`jvl_syntax::is_valid_new_name`).
@@ -3068,7 +1661,7 @@ impl Backend {
     }
 }
 
-/// M6.2: one fetchable coordinate the current classpath's resolution
+/// One fetchable coordinate the current classpath's resolution
 /// couldn't find in the local cache — a candidate for the extension's
 /// consent-gated Maven Central download.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -3078,7 +1671,7 @@ struct MissingDependencyCoord {
     version: String,
 }
 
-/// M6.2: a degraded coordinate the server deliberately will not offer to
+/// A degraded coordinate the server deliberately will not offer to
 /// download (a dynamic/unresolved version, an unsupported classifier, a
 /// resolver bound) — surfaced so the extension's UI can explain the gap
 /// rather than silently drop it.
@@ -3101,7 +1694,7 @@ struct MissingDependenciesResult {
 }
 
 impl Backend {
-    /// M6.2: `jvl/missingDependencies` — reports the current classpath's
+    /// `jvl/missingDependencies` — reports the current classpath's
     /// degraded coordinates, split into `missing` (a real `g:a:v` absent
     /// from the local cache — fetchable) and `skipped` (resolution
     /// deliberately declined to pursue further — not fetchable, with a
@@ -3134,7 +1727,7 @@ impl Backend {
 /// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
 /// bytecode model into the analysis crate's external-symbol types. Holds an
 /// owned snapshot `Arc` (from `Backend::classpath()`) rather than a borrow,
-/// so it's unaffected by a concurrent M5.2 rebuild swap mid-request.
+/// so it's unaffected by a concurrent rebuild swap mid-request.
 struct ClasspathSymbols(Arc<jvl_classpath::Classpath>);
 
 impl jvl_syntax::SymbolSource for ClasspathSymbols {
@@ -3165,7 +1758,7 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
         })
     }
 
-    /// M7: name-index delegation — classpath type-name completion.
+    /// Name-index delegation — classpath type-name completion.
     fn types_with_prefix(
         &self,
         prefix: &str,
@@ -3175,7 +1768,7 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
         (entries.into_iter().map(candidate).collect(), truncated)
     }
 
-    /// M7: name-index delegation — import-path completion.
+    /// Name-index delegation — import-path completion.
     fn package_children(&self, package: &str) -> (Vec<String>, Vec<jvl_syntax::TypeCandidate>) {
         let (subpackages, types) = self.0.package_children(package);
         (subpackages, types.into_iter().map(candidate).collect())
@@ -3286,7 +1879,7 @@ fn open_docs_and_uris<'a>(
     Some((open, uris))
 }
 
-/// M6.3 fix round 1: translate an in-project completion item's lazy-resolve
+/// Translate an in-project completion item's lazy-resolve
 /// `data.doc` (the declaring document's index in the `&[OpenDoc]` slice this
 /// request ran against — `jvl-syntax` is URI-free, so an index is all it can
 /// name) into that document's URI, which stays meaningful across requests.
@@ -3363,7 +1956,7 @@ async fn main() {
 mod tests {
     use super::*;
 
-    /// M5.6: with no `initializationOptions` at all, unresolved-member
+    /// With no `initializationOptions` at all, unresolved-member
     /// diagnostics must default to **on** (the conservative gating inside
     /// `member_diagnostics` is what keeps this safe, not this flag).
     #[test]
@@ -3396,7 +1989,7 @@ mod tests {
         assert!(unresolved_member_diagnostics_opt(&params));
     }
 
-    /// M4.3 fix round 1: the project-file cache never exceeds its cap — at
+    /// The project-file cache never exceeds its cap — at
     /// the cap it clears wholesale and keeps accepting inserts (a Tier-2
     /// references request can push up to 500 files through it in one go).
     #[test]
@@ -3426,7 +2019,145 @@ mod tests {
         assert!(cache.contains_key(Path::new(&format!("/proj/F{}.java", cap * 3 - 1))));
     }
 
-    /// M5.2: absent `initializationOptions`, the debounce defaults to 2s.
+    /// A fresh, empty temp directory for a filesystem-backed test — mirrors
+    /// `references.rs`'s own `temp_dir` helper (small enough, and specific
+    /// enough to each module's needs, not worth sharing across files).
+    fn temp_project_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jvl-main-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A bare `Backend` for a direct (non-LSP-transport) unit test —
+    /// `LspService::new` is the only public way to get a `Client` to build
+    /// one; the returned service's `.inner()` hands back the `Backend`
+    /// itself. The paired `ClientSocket` is dropped: these tests never send
+    /// client notifications.
+    fn test_backend() -> LspService<Backend> {
+        let (service, _socket) = LspService::new(Backend::new);
+        service
+    }
+
+    /// The oversize guard added to `parsed_project_file`: a file over
+    /// `MAX_PROJECT_FILE_BYTES` must be reported exactly like an unreadable
+    /// one — `None`, never read into memory, never inserted into the parse
+    /// cache — rather than being parsed wholesale.
+    #[test]
+    fn parsed_project_file_skips_oversized_files_without_reading_or_caching_them() {
+        let service = test_backend();
+        let backend = service.inner();
+
+        let dir = temp_project_dir("oversize-project-file");
+        let path = dir.join("Big.java");
+        let oversized_contents = "x".repeat(MAX_PROJECT_FILE_BYTES as usize + 1);
+        std::fs::write(&path, &oversized_contents).expect("write oversized file");
+
+        assert!(
+            backend.parsed_project_file(&path).is_none(),
+            "a file over MAX_PROJECT_FILE_BYTES must be reported unavailable, not parsed"
+        );
+        assert!(
+            backend
+                .project_file_cache
+                .lock()
+                .expect("cache lock")
+                .is_empty(),
+            "an oversized file must never be inserted into the parse-on-demand cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The conservative-completeness contract this whole audit item exists
+    /// for: `scan_references`'s Tier-2 workspace scan must treat BOTH an
+    /// oversized candidate (caught by `references::prefilter`'s own
+    /// per-file guard, before it's ever read) AND an unreadable one (caught
+    /// by `parsed_project_file`, after prefiltering) as incomplete —
+    /// flipping the exact signals `rename()` already refuses on
+    /// (`ScanOutcome::truncated` and `ScanOutcome::unparsed_hit_files`),
+    /// rather than silently pretending either file simply had no
+    /// occurrences.
+    #[tokio::test]
+    async fn scan_references_treats_oversized_and_unreadable_candidates_as_incomplete() {
+        let service = test_backend();
+        let backend = service.inner();
+
+        let root = temp_project_dir("scan-references-incomplete");
+
+        // The declaring ("target") file: always scanned directly by
+        // `scan_references`'s own-file step, never through the candidate
+        // loop this test is exercising.
+        let target_path = root.join("Target.java");
+        let target_text = "class Target {\n    void widget() {}\n}\n".to_string();
+        std::fs::write(&target_path, &target_text).expect("write target file");
+        let target_uri = Uri::from_file_path(&target_path)
+            .expect("file uri")
+            .to_string();
+        let mut parser = jvl_syntax::new_parser();
+        let target_tree =
+            jvl_syntax::parse(&mut parser, &target_text, None).expect("parse target file");
+        let name_offset = target_text.find("widget").expect("target text has widget");
+        let target = jvl_syntax::ReferenceTarget {
+            doc: 0,
+            name_range: name_offset..name_offset + "widget".len(),
+            name: "widget".to_string(),
+            tier: jvl_syntax::Tier::Workspace,
+        };
+
+        // A candidate containing the needle but too large to read safely —
+        // `references::prefilter`'s per-file guard must skip it via a
+        // `metadata()` stat alone, and never hand it to this loop at all.
+        let big_path = root.join("Big.java");
+        let mut big_contents = "widget".to_string();
+        big_contents.push_str(&"x".repeat(references::MAX_SINGLE_FILE_BYTES as usize));
+        std::fs::write(&big_path, &big_contents).expect("write oversized candidate");
+
+        // A candidate that passes the prefilter (small, and a plain
+        // substring search never requires valid UTF-8) but is not valid
+        // UTF-8 text, so `parsed_project_file`'s `read_to_string` fails and
+        // it can't be parsed for the semantic confirm step.
+        let bad_path = root.join("Bad.java");
+        let mut bad_bytes = b"class Bad { void widget() {} }\n".to_vec();
+        bad_bytes.push(0xFF); // not valid UTF-8 on its own
+        std::fs::write(&bad_path, &bad_bytes).expect("write unreadable candidate");
+
+        let open_snapshot: HashMap<PathBuf, (i32, String, Tree)> = HashMap::new();
+        let outcome = backend
+            .scan_references(
+                &target,
+                &target_uri,
+                &target_text,
+                &target_tree,
+                1,
+                std::slice::from_ref(&root),
+                Some(root.as_path()),
+                &open_snapshot,
+                true,
+            )
+            .await;
+
+        assert!(
+            outcome.truncated,
+            "an oversized candidate must mark the scan truncated — the same signal \
+             `rename` already refuses on"
+        );
+        assert!(
+            outcome.unparsed_hit_files > 0,
+            "an unreadable candidate must be counted as unparsed — the same signal \
+             `rename` already refuses on"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Absent `initializationOptions`, the debounce defaults to 2s.
     #[test]
     fn classpath_debounce_defaults_to_2000ms() {
         let params = InitializeParams::default();
@@ -3469,7 +2200,7 @@ mod tests {
         assert!(supports_watched_files_registration(&params));
     }
 
-    /// M5.2: only the four documented build-file names/locations match —
+    /// Only the four documented build-file names/locations match —
     /// everything else (including an unrelated `.java` file) must not.
     #[test]
     fn classpath_build_file_matching() {
@@ -3485,7 +2216,7 @@ mod tests {
         assert!(!matches("file:///proj/pom.xml.bak"));
     }
 
-    /// M5.2's debounce/coalescing state machine — pure, no real timers.
+    /// The debounce/coalescing state machine — pure, no real timers.
     mod rebuild_coalescer {
         use super::*;
 

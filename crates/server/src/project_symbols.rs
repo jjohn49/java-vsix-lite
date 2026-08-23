@@ -1,4 +1,4 @@
-//! M7: workspace `.java` files the user hasn't opened, as a [`SymbolSource`]
+//! Workspace `.java` files the user hasn't opened, as a [`SymbolSource`]
 //! layer — the fix for "I imported `Person`, it's not open, and I get no
 //! completion for it." Resolves an FQN to a file via [`WorkspaceIndex`],
 //! reads it through `Backend::parsed_project_file`'s existing mtime cache
@@ -143,7 +143,7 @@ impl<P: SymbolSource, C: SymbolSource> SymbolSource for CombinedSymbols<P, C> {
         }
     }
 
-    /// M7.5: member docs inherit across the project/classpath boundary — a
+    /// Member docs inherit across the project/classpath boundary — a
     /// project class overriding a JDK/dependency method (or vice versa)
     /// shows the supertype's Javadoc when its own layer has none. Each
     /// layer's own `doc` may walk supers *within* its world
@@ -231,7 +231,7 @@ mod tests {
         }
     }
 
-    /// M7.5: a project class overriding a classpath method inherits the
+    /// A project class overriding a classpath method inherits the
     /// classpath supertype's member doc — the walk crosses layer worlds.
     #[test]
     fn combined_doc_walks_supers_across_layers() {

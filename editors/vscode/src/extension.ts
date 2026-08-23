@@ -6,7 +6,7 @@
 // commands. All parsing/lint/IntelliSense (and, later, supervision of the
 // optional javac tier) lives inside the Rust server.
 
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -50,7 +50,13 @@ const SERVER_CHECK_PROJECT_COMMAND = "jvl.checkProject.run";
 // executeCommand id it drives (`SERVER_REBUILD_CLASSPATH_COMMAND`) must never
 // be the same string.
 const DOWNLOAD_DEPENDENCIES_COMMAND = "java-vsix-lite.downloadDependencies";
+const INSTALL_DEPENDENCIES_COMMAND = "java-vsix-lite.installDependencies";
 const SERVER_REBUILD_CLASSPATH_COMMAND = "jvl.classpath.rebuild";
+
+// Hard ceiling on a build-tool run before it's killed (dependency resolution
+// can legitimately take minutes on a cold cache; a hung/interactive process
+// must not block forever).
+const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 
 // Fixed-point loop bounds (see the task brief): a runaway or maliciously deep
 // transitive graph must never turn one consented download into an unbounded
@@ -127,6 +133,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand(DOWNLOAD_DEPENDENCIES_COMMAND, async () => {
       await downloadDependencies();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(INSTALL_DEPENDENCIES_COMMAND, async () => {
+      await installDependencies();
     }),
   );
 
@@ -473,6 +485,260 @@ async function runSaveCheck(): Promise<void> {
 // simply told one is already running.
 let downloadInFlight = false;
 
+// ---------------------------------------------------------------------------
+// Install dependencies by running the project's build tool (Maven/Gradle).
+//
+// SECURITY: unlike `Download Missing Dependencies` (direct HTTPS + checksum,
+// no tool execution), this runs `mvn`/`gradle`, which EXECUTES the project's
+// build scripts — Maven plugins run through the lifecycle; a `build.gradle` is
+// a Groovy/Kotlin program. That is arbitrary code from the workspace, so it is
+// gated exactly like the `javac` tier (trusted workspaces only) AND requires
+// an explicit per-invocation confirmation. It is never run automatically. Its
+// purpose is to populate the local cache (`~/.m2`, `~/.gradle`) with the
+// BOM/parent-managed transitive versions the offline resolver can't determine
+// on its own (the case where `Download Missing Dependencies` finds nothing to
+// fetch because every needed coordinate has an unresolved version).
+// ---------------------------------------------------------------------------
+
+let installInFlight = false;
+
+interface BuildTool {
+  kind: "maven" | "gradle";
+  /** Absolute path (wrapper) or bare command name to execute. */
+  command: string;
+  args: string[];
+  cwd: string;
+  /** True when `command` is the project-shipped wrapper (an extra note in the
+   *  confirmation, since running it executes project-controlled code too). */
+  isWrapper: boolean;
+}
+
+async function installDependencies(): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: Install Dependencies is disabled in an untrusted workspace — it runs your project's build tool, which executes the project's build scripts. Trust this workspace to enable it.",
+    );
+    return;
+  }
+  if (installInFlight) {
+    void vscode.window.showInformationMessage(
+      "java-vsix-lite: a dependency install is already running.",
+    );
+    return;
+  }
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder || folder.uri.scheme !== "file") {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: open a Maven or Gradle project folder first.",
+    );
+    return;
+  }
+  const tool = detectBuildTool(folder.uri.fsPath);
+  if (!tool) {
+    void vscode.window.showErrorMessage(
+      "java-vsix-lite: no `pom.xml` or Gradle build file found at the workspace root.",
+    );
+    return;
+  }
+
+  const confirm = await vscode.window.showWarningMessage(
+    `Run ${tool.kind === "maven" ? "Maven" : "Gradle"} to install dependencies?`,
+    {
+      modal: true,
+      detail:
+        `Runs \`${path.basename(tool.command)} ${tool.args.join(" ")}\` in ${tool.cwd}.\n\n` +
+        `⚠ This EXECUTES this project's build scripts` +
+        (tool.isWrapper
+          ? ` (including the project-shipped ${tool.kind === "maven" ? "Maven" : "Gradle"} wrapper)`
+          : "") +
+        `, which can run arbitrary code. Only continue for a project you trust.`,
+    },
+    "Run",
+  );
+  if (confirm !== "Run") {
+    return;
+  }
+
+  installInFlight = true;
+  try {
+    await runInstall(tool);
+  } finally {
+    installInFlight = false;
+  }
+}
+
+/**
+ * Locate the build tool for `root`: Maven when a `pom.xml` is present, else
+ * Gradle when a Gradle build/settings file is. Prefers the project wrapper
+ * (`mvnw`/`gradlew`), then a machine-configured path, then the tool on `PATH`.
+ * `undefined` when neither project type applies.
+ */
+function detectBuildTool(root: string): BuildTool | undefined {
+  const win = process.platform === "win32";
+  const has = (name: string) => fs.existsSync(path.join(root, name));
+  if (has("pom.xml")) {
+    const wrapper = path.join(root, win ? "mvnw.cmd" : "mvnw");
+    const { command, isWrapper } = resolveTool("maven", wrapper, win);
+    return { kind: "maven", command, args: ["-B", "dependency:go-offline"], cwd: root, isWrapper };
+  }
+  if (
+    has("build.gradle") ||
+    has("build.gradle.kts") ||
+    has("settings.gradle") ||
+    has("settings.gradle.kts")
+  ) {
+    const wrapper = path.join(root, win ? "gradlew.bat" : "gradlew");
+    const { command, isWrapper } = resolveTool("gradle", wrapper, win);
+    return { kind: "gradle", command, args: ["--console=plain", "dependencies"], cwd: root, isWrapper };
+  }
+  return undefined;
+}
+
+/**
+ * Pick the executable to run: the project wrapper if present, else a
+ * machine-configured absolute path, else the tool discovered on `PATH` or in
+ * common install locations, else the bare name (so a clean ENOENT still tells
+ * the user what's missing). The common-location probe matters because a
+ * GUI-launched editor often has a minimal `PATH` that omits Homebrew/SDKMAN —
+ * the same reason `$JAVA_HOME` is empty there.
+ */
+function resolveTool(
+  kind: "maven" | "gradle",
+  wrapper: string,
+  win: boolean,
+): { command: string; isWrapper: boolean } {
+  if (fs.existsSync(wrapper)) {
+    return { command: wrapper, isWrapper: true };
+  }
+  const configured = configuredToolPath(kind);
+  if (configured) {
+    return { command: configured, isWrapper: false };
+  }
+  const bare = kind === "maven" ? (win ? "mvn.cmd" : "mvn") : win ? "gradle.bat" : "gradle";
+  return { command: locateExecutable(bare, kind) ?? bare, isWrapper: false };
+}
+
+/** Search `$PATH` then common install dirs for `exe`; absolute path or `undefined`. */
+function locateExecutable(exe: string, kind: "maven" | "gradle"): string | undefined {
+  const pathDirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const home = os.homedir();
+  const common = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    path.join(home, ".sdkman", "candidates", kind === "maven" ? "maven" : "gradle", "current", "bin"),
+    `/opt/${kind === "maven" ? "maven" : "gradle"}/bin`,
+  ];
+  for (const dir of [...pathDirs, ...common]) {
+    const candidate = path.join(dir, exe);
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // unreadable dir — skip
+    }
+  }
+  return undefined;
+}
+
+/** A machine-scoped override for the Maven/Gradle executable, or `undefined`. */
+function configuredToolPath(kind: "maven" | "gradle"): string | undefined {
+  const raw = vscode.workspace
+    .getConfiguration("java-vsix-lite")
+    .get<string>(`${kind}.path`, "")
+    .trim();
+  return raw.length > 0 ? raw : undefined;
+}
+
+async function runInstall(tool: BuildTool): Promise<void> {
+  const channel = client?.outputChannel;
+  if (channel) {
+    channel.show(true);
+    channel.appendLine(`\n$ ${tool.command} ${tool.args.join(" ")}   (cwd: ${tool.cwd})`);
+  }
+
+  const outcome = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `java-vsix-lite: installing ${tool.kind === "maven" ? "Maven" : "Gradle"} dependencies…`,
+      cancellable: true,
+    },
+    (_progress, token) => runBuildTool(tool, channel, token),
+  );
+
+  if (outcome === "cancelled") {
+    void vscode.window.showInformationMessage("java-vsix-lite: dependency install cancelled.");
+  } else if (outcome === "spawn-error") {
+    void vscode.window.showErrorMessage(
+      `java-vsix-lite: could not run ${path.basename(tool.command)} — is it installed and on your PATH? ` +
+        `Set java-vsix-lite.${tool.kind}.path, or add a wrapper (${tool.kind === "maven" ? "mvnw" : "gradlew"}) to the project.`,
+    );
+  } else if (outcome !== 0) {
+    void vscode.window.showWarningMessage(
+      `java-vsix-lite: ${path.basename(tool.command)} exited with code ${outcome}. ` +
+        `Some dependencies may still have installed — see the java-vsix-lite output.`,
+    );
+  } else {
+    void vscode.window.showInformationMessage(
+      "java-vsix-lite: dependencies installed. Refreshing IntelliSense…",
+    );
+  }
+
+  // Whatever resolved is now cached even on a nonzero/partial exit — rebuild
+  // the classpath so IntelliSense picks it up, then re-run the javac check.
+  if (client && outcome !== "cancelled" && outcome !== "spawn-error") {
+    await client
+      .sendRequest(ExecuteCommandRequest.type, {
+        command: SERVER_REBUILD_CLASSPATH_COMMAND,
+        arguments: [],
+      })
+      .catch(() => undefined);
+    if (javacBackgroundCheckEnabled()) {
+      scheduleSaveCheck();
+    }
+  }
+}
+
+/**
+ * Run `tool`, streaming stdout/stderr to `channel`, killed on cancellation or
+ * the hard timeout. Resolves to the exit code, or `"cancelled"` /
+ * `"spawn-error"`. Uses `spawn` (no shell — args are a fixed array, never
+ * concatenated) so a crafted path can't inject extra commands.
+ */
+function runBuildTool(
+  tool: BuildTool,
+  channel: vscode.OutputChannel | undefined,
+  token: vscode.CancellationToken,
+): Promise<number | "cancelled" | "spawn-error"> {
+  return new Promise((resolve) => {
+    const child = spawn(tool.command, tool.args, {
+      cwd: tool.cwd,
+      shell: false,
+      timeout: INSTALL_TIMEOUT_MS,
+    });
+    let settled = false;
+    const finish = (result: number | "cancelled" | "spawn-error") => {
+      if (!settled) {
+        settled = true;
+        resolve(result);
+      }
+    };
+    child.stdout?.on("data", (d: Buffer) => channel?.append(d.toString()));
+    child.stderr?.on("data", (d: Buffer) => channel?.append(d.toString()));
+    child.on("error", (err) => {
+      channel?.appendLine(`\n[spawn error] ${String(err)}`);
+      finish("spawn-error");
+    });
+    child.on("close", (code) => finish(code ?? 1));
+    token.onCancellationRequested(() => {
+      channel?.appendLine("\n[cancelled by user]");
+      child.kill("SIGTERM");
+      finish("cancelled");
+    });
+  });
+}
+
 // M6.2: the consent-gated dependency download command. Trust-gated like
 // `checkProject` (this one performs network I/O and writes into `~/.m2`,
 // both squarely "acts on behalf of this project" territory), then:
@@ -524,10 +790,20 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
 
   if (initial.missing.length === 0) {
     if (initial.skipped.length > 0) {
-      void vscode.window.showInformationMessage(
-        `java-vsix-lite: no missing dependencies can be downloaded automatically. ` +
-          `${initial.skipped.length} dependency(ies) skipped: ${summarizeSkipped(initial.skipped)}.`,
+      // These couldn't be resolved to a downloadable `g:a:v` — most commonly
+      // a version managed by a parent POM / BOM that isn't in the local cache
+      // (so the offline resolver can't tell which version to fetch). Direct
+      // download can't help here; running the build tool once can.
+      const choice = await vscode.window.showInformationMessage(
+        `java-vsix-lite: nothing can be downloaded directly — ` +
+          `${initial.skipped.length} dependency(ies) have an unresolved version ` +
+          `(usually a parent POM/BOM missing from your local cache): ${summarizeSkipped(initial.skipped)}. ` +
+          `Run the build tool once to populate the cache.`,
+        "Install Dependencies",
       );
+      if (choice === "Install Dependencies") {
+        await installDependencies();
+      }
     } else {
       void vscode.window.showInformationMessage("java-vsix-lite: no missing dependencies detected.");
     }

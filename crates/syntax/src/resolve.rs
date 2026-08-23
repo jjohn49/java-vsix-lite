@@ -81,7 +81,7 @@ pub(crate) enum BindingKind {
 
 /// A receiver type: declared in an open document, an external (JDK/dependency)
 /// type named by its FQN with any use-site type arguments (e.g. `["String"]`
-/// for `ArrayList<String>`), or an array (M7 — whose members are the synthetic
+/// for `ArrayList<String>`), or an array (whose members are the synthetic
 /// `length`/`clone()` plus `java.lang.Object`'s, never the element's).
 pub(crate) enum ResolvedType<'t> {
     InProject(TypeDecl<'t>),
@@ -120,7 +120,7 @@ pub(crate) fn node_at<'t>(tree: &'t Tree, byte: usize) -> Node<'t> {
 }
 
 /// Whether a tree-sitter node kind is one of Java's five type-declaration
-/// shapes. `pub(crate)` (M4.4) so `rename.rs` can walk past a nested type's
+/// shapes. `pub(crate)` so `rename.rs` can walk past a nested type's
 /// immediate declaration to find its *outer* enclosing type, the same way
 /// [`enclosing_type_node`] finds the innermost one.
 pub(crate) fn is_type_decl(kind: &str) -> bool {
@@ -225,7 +225,7 @@ fn resolve_receiver_depth<'t>(
             ctx,
             depth + 1,
         ),
-        // M7: a method call's receiver type is the called member's result
+        // A method call's receiver type is the called member's result
         // type — the arm that makes `xs.stream().`, `s.trim().`, and every
         // builder chain resolve. No object means an unqualified call on the
         // enclosing type.
@@ -247,12 +247,12 @@ fn resolve_receiver_depth<'t>(
             )?;
             member_result_type(&member, &recv_ty, ctx)
         }
-        // M7: `((Type) expr).` exposes the cast-to type's members.
+        // `((Type) expr).` exposes the cast-to type's members.
         "cast_expression" => {
             let ty = recv.child_by_field_name("type")?;
             resolve_type_node(ty, ctx.doc.source, ctx).map(instance)
         }
-        // M7: `arr[i].` exposes the array's element type.
+        // `arr[i].` exposes the array's element type.
         "array_access" => {
             let arr = recv.child_by_field_name("array")?;
             let a = resolve_receiver_depth(arr, ctx, depth + 1)?;
@@ -274,7 +274,7 @@ fn resolve_receiver_depth<'t>(
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
             let field = recv.child_by_field_name("field")?;
-            // M7: one shared segment step handles in-project fields, external
+            // One shared segment step handles in-project fields, external
             // fields (`System.out.` → `java.io.PrintStream`), and nested
             // types alike.
             if let Some(obj_ty) = resolve_receiver_depth(obj, ctx, depth + 1) {
@@ -325,7 +325,7 @@ fn resolve_name_depth<'t>(
                 return resolve_type_node(type_node, binding.source, ctx).map(instance);
             }
         }
-        // M7: a `var` (or typeless) binding infers its type from the
+        // A `var` (or typeless) binding infers its type from the
         // declarator's initializer, resolved like any receiver expression
         // (`var v = new ArrayList<String>()`, `var t = s.trim()`, …).
         // Depth-capped: ERROR-recovery trees can produce self-referential
@@ -333,6 +333,14 @@ fn resolve_name_depth<'t>(
         // whatever static-ness the initializer expression had does not
         // transfer to the value it produced.
         let value = binding.decl_node.child_by_field_name("value")?;
+        // A `var` in an enhanced-for binds the *element* type of the iterable,
+        // not the iterable's own type: `for (var s : List<String>)` → `s` is a
+        // `String`. Resolving `value` directly would give `List` and mis-flag
+        // every member access on the loop variable.
+        if binding.decl_node.kind() == "enhanced_for_statement" {
+            let iterable = resolve_receiver_depth(value, ctx, depth + 1)?;
+            return iterable_element_type(&iterable.ty, ctx).map(instance);
+        }
         return resolve_receiver_depth(value, ctx, depth + 1).map(|r| instance(r.ty));
     }
     if let Some(td) = ctx.table.get(name) {
@@ -349,6 +357,76 @@ fn resolve_name_depth<'t>(
         },
         static_only: true,
     })
+}
+
+/// Display name for a resolved type, as it would read in a signature
+/// (`ArrayList<String>`, an in-project `Widget`, `String[]`). External FQNs are
+/// shown by their simple name plus any use-site type arguments. Used to render
+/// an inferred `var` type on hover.
+pub(crate) fn type_display(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::InProject(td) => td.name.to_string(),
+        ResolvedType::External { fqn, args } => {
+            let simple = fqn.rsplit('.').next().unwrap_or(fqn);
+            if args.is_empty() {
+                simple.to_string()
+            } else {
+                format!("{simple}<{}>", args.join(", "))
+            }
+        }
+        ResolvedType::Array { display } => display.clone(),
+    }
+}
+
+/// If the binding named `name` visible at `byte` is a `var` local, the display
+/// string of its *inferred* type (from the declarator's initializer); `None`
+/// for an explicitly-typed binding — render its declaration normally — or when
+/// inference fails. Mirrors the `var` inference in [`resolve_name_depth`], but
+/// stays silent unless the declared type is literally `var` so it never
+/// overrides an explicit type. Used to render hover on a `var` local.
+pub(crate) fn inferred_var_type_display(name: &str, byte: usize, ctx: &Ctx) -> Option<String> {
+    let binding = lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        byte,
+        name,
+        ctx.table,
+        ctx.current,
+    )?;
+    let type_node = binding.type_node?;
+    if node_text(type_node, binding.source) != "var" {
+        return None;
+    }
+    let value = binding.decl_node.child_by_field_name("value")?;
+    let resolved = resolve_receiver_depth(value, ctx, 0)?;
+    Some(type_display(&resolved.ty))
+}
+
+/// If the binding named `name` visible at `byte` is a Java 21 pattern binding
+/// (`case Type name`, a record-deconstruction component, or `instanceof Type
+/// name`), the display string of its declared type; `None` for any other
+/// binding (rendered from its declaration node instead). A type that doesn't
+/// resolve to a class (a primitive like `int`) falls back to its written text.
+pub(crate) fn pattern_binding_type_display(name: &str, byte: usize, ctx: &Ctx) -> Option<String> {
+    let binding = lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        byte,
+        name,
+        ctx.table,
+        ctx.current,
+    )?;
+    if !matches!(
+        binding.decl_node.kind(),
+        "type_pattern" | "record_pattern_component" | "instanceof_expression"
+    ) {
+        return None;
+    }
+    let type_node = binding.type_node?;
+    let display = resolve_type_node(type_node, binding.source, ctx)
+        .map(|ty| type_display(&ty))
+        .unwrap_or_else(|| node_text(type_node, binding.source).to_string());
+    Some(display)
 }
 
 /// Resolve a `new Type(...)` expression's type reference to the receiver type
@@ -372,8 +450,8 @@ fn resolve_type_node<'t>(
     source: &'t str,
     ctx: &Ctx<'_, 't>,
 ) -> Option<ResolvedType<'t>> {
-    // M7: an array's members are `length`/`clone()`/Object's — never the
-    // element type's (the old behavior offered `String`'s members on a
+    // An array's members are `length`/`clone()`/Object's — never the
+    // element type's (an earlier behavior offered `String`'s members on a
     // `String[]` receiver).
     if type_node.kind() == "array_type" {
         return Some(ResolvedType::Array {
@@ -437,9 +515,9 @@ fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>
 }
 
 /// First import candidate FQN that the symbol source can actually resolve.
-/// M7: an import path (`java.util.Map.Entry`) to the binary FQN
+/// An import path (`java.util.Map.Entry`) to the binary FQN
 /// (`java.util.Map$Entry`) — replace trailing dots with `$` until the symbol
-/// source recognizes the name. Shared by import completion and (M7.5)
+/// source recognizes the name. Shared by import completion and
 /// hover-on-import.
 pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
     if path.is_empty() {
@@ -456,7 +534,7 @@ pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
     None
 }
 
-/// `pub(crate)` (M7.5): also used by hover's inherited-Javadoc walk, which
+/// `pub(crate)`: also used by hover's inherited-Javadoc walk, which
 /// resolves a supertype simple name to ask the symbol source for the
 /// super's member doc.
 pub(crate) fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
@@ -469,7 +547,7 @@ pub(crate) fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
 /// The full dotted name of a fully-qualified type node (`java.util.List`), or
 /// `None` for a simple (unqualified) type.
 ///
-/// `pub(crate)` (M4.6): also used by `implementation.rs`'s per-supertype
+/// `pub(crate)`: also used by `implementation.rs`'s per-supertype
 /// confirm, which must match a fully-qualified `extends`/`implements` entry
 /// against the target's real FQN rather than through the scanned file's
 /// imports (a qualified reference bypasses imports entirely).
@@ -501,7 +579,7 @@ fn field_type_node<'t>(declarator: Node<'t>) -> Option<Node<'t>> {
     declarator.parent()?.child_by_field_name("type")
 }
 
-/// Resolve a dotted path (`a.b.c`), M7-style: walk it segment by segment from
+/// Resolve a dotted path (`a.b.c`): walk it segment by segment from
 /// a resolvable head (binding → in-project type → imported/`java.lang`
 /// external type), stepping through fields, nested types, and enum constants
 /// in either world; failing that, try the longest prefix of the path as a
@@ -589,7 +667,7 @@ fn resolve_member_segment<'t>(
     member_result_type(&member, current, ctx)
 }
 
-/// M7: the type a member access *evaluates to* — a method call's return type
+/// The type a member access *evaluates to* — a method call's return type
 /// or a field/enum-constant's declared type — which becomes the next
 /// receiver in a chain. `None` for primitives/void/arrays-of-unknown and
 /// whatever else can't be re-resolved (the chain just stops, never errors).
@@ -616,7 +694,7 @@ fn member_result_type<'t>(
     }
 }
 
-/// M7: an external member's result type. Prefers the generic `ret_display`
+/// An external member's result type. Prefers the generic `ret_display`
 /// template substituted with the receiver's use-site type arguments (so
 /// `List<String>.get(int)` chains as `String`, `stream()` as
 /// `Stream<String>`); falls back to the erased `ret_fqn`.
@@ -638,12 +716,19 @@ fn external_result_type<'t>(
             _ => (Vec::new(), Vec::new()),
         };
         let substituted = substitute_template(display, &args, &type_params);
-        // An unfilled placeholder means the substitution had nothing to say
-        // (raw receiver, malformed template) — fall through to erasure.
-        if !substituted.contains('{') {
-            if let Some(resolved) = resolve_display_type(&substituted, m.ret_fqn.as_deref(), ctx) {
-                return Some(resolved);
-            }
+        // An unfilled placeholder means this member returns a *type variable*
+        // the receiver didn't pin down (a raw/erased receiver, or an argument
+        // we couldn't thread through a chain). The concrete type is genuinely
+        // unknown — returning the erased bound (`java.lang.Object`) here is
+        // what made generic chains like `list.stream().findFirst()
+        // .orElseThrow()` resolve to `Object` and then falsely flag every
+        // member access on the result. Stay unresolved instead, so callers
+        // (diagnostics especially) stay silent.
+        if substituted.contains('{') {
+            return None;
+        }
+        if let Some(resolved) = resolve_display_type(&substituted, m.ret_fqn.as_deref(), ctx) {
+            return Some(resolved);
         }
     }
     let fqn = m.ret_fqn.clone()?;
@@ -653,7 +738,7 @@ fn external_result_type<'t>(
     })
 }
 
-/// M7: resolve a rendered display type (`Stream<String>`, `String`,
+/// Resolve a rendered display type (`Stream<String>`, `String`,
 /// `MyType`) back to a receiver type: the in-project table first, then the
 /// erased FQN when its simple name agrees with the display's base (the
 /// common generic-class case), then the file's imports/`java.lang` (the
@@ -680,7 +765,7 @@ fn resolve_display_type<'t>(
     resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External { fqn, args })
 }
 
-/// M7: split a rendered type into its base name and top-level type
+/// Split a rendered type into its base name and top-level type
 /// arguments: `Map<String, List<Integer>>` → `("Map", ["String",
 /// "List<Integer>"])`. Arrays and malformed shapes yield `None` (chains
 /// don't continue through them).
@@ -712,7 +797,7 @@ fn parse_display_type(s: &str) -> Option<(&str, Vec<String>)> {
     Some((base, args))
 }
 
-/// M7: the two members every Java array has beyond `java.lang.Object`'s —
+/// The two members every Java array has beyond `java.lang.Object`'s —
 /// the `length` field and the covariant `clone()`.
 fn array_members(display: &str) -> [ExternalMember; 2] {
     [
@@ -737,7 +822,7 @@ fn array_members(display: &str) -> [ExternalMember; 2] {
     ]
 }
 
-/// M7: the element type of an array receiver (`arr[i].`), resolved from the
+/// The element type of an array receiver (`arr[i].`), resolved from the
 /// array's declared display text. Multi-dimensional arrays peel one level.
 fn array_element_type<'t>(display: &str, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
     let element = display.trim().strip_suffix("[]")?.trim_end();
@@ -757,6 +842,37 @@ fn array_element_type<'t>(display: &str, ctx: &Ctx<'_, 't>) -> Option<Resolved<'
             args: Vec::new(),
         })
     })
+}
+
+/// The element type produced by iterating `ty` — an array's element
+/// (`String[]` → `String`) or a generic collection's first type argument
+/// (`List<Foo>`/`Set<Foo>`/`Iterable<Foo>` → `Foo`). Returns `None` (never the
+/// iterable's own type) when it can't be determined — a raw collection, an
+/// unparameterized project type, an unresolvable argument — so an enhanced-for
+/// `var` with an unknown element resolves to nothing rather than to the
+/// collection itself (which would mis-resolve every access on the loop var).
+fn iterable_element_type<'t>(ty: &ResolvedType<'t>, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
+    match ty {
+        ResolvedType::Array { display } => array_element_type(display, ctx).map(|r| r.ty),
+        ResolvedType::External { args, .. } => {
+            let first = args.first()?;
+            let base = first.split('<').next().unwrap_or(first).trim();
+            let simple = base.rsplit('.').next().unwrap_or(base);
+            if simple.is_empty() || simple == "?" {
+                return None;
+            }
+            if let Some(td) = ctx.table.get(simple) {
+                return Some(ResolvedType::InProject(td.clone()));
+            }
+            resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External {
+                fqn,
+                args: Vec::new(),
+            })
+        }
+        // A project collection type's element isn't tracked (no generics from
+        // source); staying silent is correct — never fall back to the type.
+        ResolvedType::InProject(_) => None,
+    }
 }
 
 /// A member of a resolved type — declared in an open document or external.
@@ -849,7 +965,7 @@ impl MemberNamespace {
 /// type or any supertype. A kind-aware variant of [`find_member_hier`] — a
 /// deliberately separate function rather than a behavior change to that one,
 /// which hover/completion consume and whose name-only semantics must not
-/// shift underneath them (M4.3 fix round 1).
+/// shift underneath them.
 pub(crate) fn find_member_hier_of_kind<'t>(
     resolved: &Resolved<'t>,
     ctx: &Ctx<'_, 't>,
@@ -886,7 +1002,7 @@ fn walk_members<'t>(
                     acc.out.push(HierMember::InProject(m));
                 }
             }
-            // M8c: Lombok-generated accessors join the class's declared
+            // Lombok-generated accessors join the class's declared
             // members. Synthesized, not declared — no AST node to point at —
             // so they travel as External members; their result types resolve
             // through `ret_display`/`ret_fqn` like any bytecode member's.
@@ -923,8 +1039,23 @@ fn walk_members<'t>(
                     );
                 }
             }
+            // An in-project enum implicitly extends `java.lang.Enum` — the
+            // source of `name()`, `ordinal()`, `compareTo()`, etc. (its own
+            // `supers` list holds only explicit interfaces).
+            if td.kind == crate::model::TypeKind::Enum {
+                walk_members(
+                    &ResolvedType::External {
+                        fqn: "java.lang.Enum".to_string(),
+                        args: Vec::new(),
+                    },
+                    ctx,
+                    static_only,
+                    acc,
+                    depth + 1,
+                );
+            }
         }
-        // M7: arrays expose exactly `length`, `clone()`, and Object's members.
+        // Arrays expose exactly `length`, `clone()`, and Object's members.
         ResolvedType::Array { display } => {
             for m in array_members(display) {
                 if static_only {
@@ -1109,8 +1240,25 @@ fn diag_walk(
                     *complete = false; // unknown supertype — give up flagging
                 }
             }
+            // An in-project enum implicitly extends `java.lang.Enum`
+            // (`name()`, `ordinal()`, `compareTo()`, …) — see the matching
+            // walk in `walk_members`.
+            if td.kind == crate::model::TypeKind::Enum {
+                diag_walk(
+                    &ResolvedType::External {
+                        fqn: "java.lang.Enum".to_string(),
+                        args: Vec::new(),
+                    },
+                    ctx,
+                    names,
+                    complete,
+                    visited_node,
+                    visited_fqn,
+                    depth + 1,
+                );
+            }
         }
-        // M7: an array's complete member set is `length` + `clone` (plus
+        // An array's complete member set is `length` + `clone` (plus
         // Object's, appended globally by `member_names`).
         ResolvedType::Array { display } => {
             for m in array_members(display) {
@@ -1154,7 +1302,7 @@ fn diag_walk(
 
 /// The signature to show for an external member: its generic template
 /// substituted with the use-site type arguments when present, otherwise the
-/// erased signature. `pub(crate)` (M6.3): also used directly by hover and
+/// erased signature. `pub(crate)`: also used directly by hover and
 /// signature help's dedicated constructor lookups, which bypass
 /// [`collect_members`] (constructors are filtered out of the ordinary member
 /// walk — see [`walk_members`]) but still want the same use-site generic
@@ -1228,6 +1376,17 @@ pub(crate) fn collect_bindings<'t>(
                     });
                 }
             }
+            // Java 21 pattern bindings visible in a switch rule's guard and
+            // body (`case Type name`, record deconstruction components).
+            "switch_rule" => push_pattern_bindings(n, source, doc, &mut out),
+            // `x instanceof Type name` binds `name` in the enclosing condition
+            // and its guarded branch — scan the condition subtree from each
+            // condition-bearing statement/expression on the way up.
+            "if_statement" | "while_statement" | "do_statement" | "ternary_expression" => {
+                if let Some(cond) = n.child_by_field_name("condition") {
+                    push_instanceof_bindings(cond, source, doc, &mut out);
+                }
+            }
             "method_declaration"
             | "constructor_declaration"
             | "compact_constructor_declaration"
@@ -1265,6 +1424,82 @@ fn push_locals<'t>(decl: Node<'t>, source: &'t str, doc: usize, out: &mut Vec<Bi
                     doc,
                 });
             }
+        }
+    }
+}
+
+/// The (name, declared-type) parts of a `type_pattern` (`String s`) or a
+/// `record_pattern_component` (`int x`): the sole `identifier` child is the
+/// binding name; the first non-`identifier` named child is the type (a
+/// `type_identifier`/`generic_type`/…, or a primitive `integral_type`).
+/// `None` for a component that nests another pattern instead of binding.
+fn pattern_binding_parts<'t>(node: Node<'t>) -> Option<(Node<'t>, Option<Node<'t>>)> {
+    let name = named_children(node)
+        .into_iter()
+        .find(|c| c.kind() == "identifier")?;
+    let type_node = named_children(node)
+        .into_iter()
+        .find(|c| c.kind() != "identifier");
+    Some((name, type_node))
+}
+
+/// Collect the pattern bindings a `switch_rule` introduces — walking only its
+/// `switch_label` subtree (where the patterns are declared; they're in scope
+/// for the whole rule), so a nested switch in the body doesn't leak its own.
+fn push_pattern_bindings<'t>(
+    rule: Node<'t>,
+    source: &'t str,
+    doc: usize,
+    out: &mut Vec<Binding<'t>>,
+) {
+    let mut stack: Vec<Node<'t>> = named_children(rule)
+        .into_iter()
+        .filter(|c| c.kind() == "switch_label")
+        .collect();
+    while let Some(n) = stack.pop() {
+        if matches!(n.kind(), "type_pattern" | "record_pattern_component") {
+            if let Some((name, type_node)) = pattern_binding_parts(n) {
+                out.push(Binding {
+                    name: node_text(name, source),
+                    kind: BindingKind::Local,
+                    type_node,
+                    decl_node: n,
+                    source,
+                    doc,
+                });
+            }
+        }
+        for c in named_children(n) {
+            stack.push(c);
+        }
+    }
+}
+
+/// Collect every `instanceof Type name` binding within a condition subtree
+/// (`f instanceof String s && s.length() > 0` nests the pattern in a
+/// `binary_expression`, so the whole subtree is walked).
+fn push_instanceof_bindings<'t>(
+    cond: Node<'t>,
+    source: &'t str,
+    doc: usize,
+    out: &mut Vec<Binding<'t>>,
+) {
+    let mut stack = vec![cond];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "instanceof_expression" {
+            if let Some(name) = n.child_by_field_name("name") {
+                out.push(Binding {
+                    name: node_text(name, source),
+                    kind: BindingKind::Local,
+                    type_node: n.child_by_field_name("right"),
+                    decl_node: n,
+                    source,
+                    doc,
+                });
+            }
+        }
+        for c in named_children(n) {
+            stack.push(c);
         }
     }
 }
@@ -1379,7 +1614,7 @@ mod decl_site_tests {
         parse(&mut new_parser(), src, None).expect("parse")
     }
 
-    /// M4.0: a usage of a local variable resolves to a `DeclSite` in the same
+    /// A usage of a local variable resolves to a `DeclSite` in the same
     /// document, at the byte range of the declaring identifier.
     #[test]
     fn binding_decl_site_points_at_declaring_identifier() {
@@ -1398,7 +1633,7 @@ mod decl_site_tests {
         assert_eq!(site.name_range, expected..expected + "count".len());
     }
 
-    /// M4.0: a type used in doc B but declared in doc A resolves to a
+    /// A type used in doc B but declared in doc A resolves to a
     /// `DeclSite` naming A's index and the byte range of `Foo`'s name.
     #[test]
     fn cross_file_type_decl_site_points_at_declaring_document() {
@@ -1424,7 +1659,7 @@ mod decl_site_tests {
         assert_eq!(site.name_range, expected..expected + "Foo".len());
     }
 
-    /// M4.0: resolving a member inherited from a supertype declared in another
+    /// Resolving a member inherited from a supertype declared in another
     /// open document yields a `DeclSite` in that other document.
     #[test]
     fn inherited_member_decl_site_points_at_supertype_document() {
@@ -1463,8 +1698,8 @@ mod decl_site_tests {
         assert_eq!(site.name_range, expected..expected + "methodFromA".len());
     }
 
-    /// M4.0: a member resolved from an external `SymbolSource` (JDK/jar) has no
-    /// `DeclSite` in this task — no open document backs it.
+    /// A member resolved from an external `SymbolSource` (JDK/jar) has no
+    /// `DeclSite` — no open document backs it.
     #[test]
     fn external_member_decl_site_is_absent() {
         struct StubSymbols;
@@ -1513,7 +1748,7 @@ mod decl_site_tests {
     }
 }
 
-/// M5 (5.3b): mapping a parameterized supertype's type arguments through
+/// Mapping a parameterized supertype's type arguments through
 /// `SymbolSource::super_type_args` so an inherited external member's template
 /// substitutes with the *use-site* concrete types, not the raw class's own
 /// type variables.

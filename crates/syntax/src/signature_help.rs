@@ -161,9 +161,9 @@ fn member_signature(member: &HierMember) -> Option<SignatureInformation> {
 /// same way any other receiver-type reference does
 /// (`resolve::resolve_object_creation_type`), so a fully-qualified,
 /// generic (`new ArrayList<String>(...)`), or imported-external type-name
-/// all agree with hover and completion on what `new Foo` refers to. M6.3
-/// closes what used to be only an in-project feature: constructors are now
-/// members of the classpath model too (`ExternalMemberKind::Constructor`),
+/// all agree with hover and completion on what `new Foo` refers to.
+/// Constructors are members of the classpath model too
+/// (`ExternalMemberKind::Constructor`), not just an in-project feature,
 /// so `new ArrayList<>(|)` lists the JDK's real overloads.
 fn constructor_overloads<'t>(
     call: Node<'t>,
@@ -420,9 +420,8 @@ mod tests {
         );
     }
 
-    /// M6.3: `new Type(...)` on an *external* (JDK/dependency) type now lists
-    /// its constructor overloads — closing the Task-5 deferred gap the
-    /// module doc used to describe.
+    /// `new Type(...)` on an *external* (JDK/dependency) type lists
+    /// its constructor overloads.
     #[test]
     fn external_constructor_call_lists_overloads_with_documentation() {
         let src = "import test.Widget;\nclass C { void m() { Widget w = new Widget(1, 2); } }\n";
