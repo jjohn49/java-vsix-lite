@@ -15,6 +15,96 @@ use crate::resolve::{self, Locator, ResolvedProject};
 
 const MAX_BUILD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Best-effort scrape of the project's declared Java release from
+/// `build.gradle(.kts)`: a Java-toolchain `languageVersion`, a
+/// `JavaVersion.VERSION_*` constant, or a numeric `sourceCompatibility` /
+/// `targetCompatibility` / `release` assignment. Static-only (the build is
+/// never run), so computed/plugin-driven levels aren't seen — `None` then, and
+/// the caller falls back to the JDK's own level.
+pub(crate) fn compiler_release(root: &Path) -> Option<u32> {
+    for name in ["build.gradle", "build.gradle.kts"] {
+        let path = root.join(name);
+        if std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > MAX_BUILD_BYTES as u64
+        {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(n) = parse_gradle_release(&text) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn parse_gradle_release(text: &str) -> Option<u32> {
+    // 1) Java toolchain: `JavaLanguageVersion.of(N)`.
+    if let Some(pos) = text.find("JavaLanguageVersion.of(") {
+        if let Some(n) = leading_u32(text[pos + "JavaLanguageVersion.of(".len()..].trim_start()) {
+            return Some(n);
+        }
+    }
+    // 2) `JavaVersion.VERSION_<n>` / `VERSION_1_<n>`.
+    if let Some(pos) = text.find("VERSION_") {
+        let rest = &text[pos + "VERSION_".len()..];
+        if let Some(stripped) = rest.strip_prefix("1_") {
+            if let Some(n) = leading_u32(stripped) {
+                return Some(n);
+            }
+        } else if let Some(n) = leading_u32(rest) {
+            return Some(n);
+        }
+    }
+    // 3) numeric `sourceCompatibility` / `targetCompatibility` / `release`.
+    for key in ["sourceCompatibility", "targetCompatibility", "release"] {
+        if let Some(n) = version_after_key(text, key) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// The leading run of ASCII digits of `s`, parsed as a feature number.
+fn leading_u32(s: &str) -> Option<u32> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// The first `N` or `1.N` version token appearing after any occurrence of
+/// `key`, skipping assignment punctuation (`= ( ) ' " space`) but bailing at a
+/// newline or a letter — so a `= JavaVersion.VERSION_*` form is left to the
+/// dedicated `VERSION_` scanner rather than mis-read here.
+fn version_after_key(text: &str, key: &str) -> Option<u32> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(key) {
+        let after = from + rel + key.len();
+        if let Some(n) = version_token(&text[after..]) {
+            return Some(n);
+        }
+        from = after;
+    }
+    None
+}
+
+fn version_token(s: &str) -> Option<u32> {
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_digit() {
+            let rest = &s[i..];
+            return match rest.strip_prefix("1.") {
+                Some(minor) => leading_u32(minor),
+                None => leading_u32(rest),
+            };
+        }
+        if c == '\n' || c.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Resolve a Gradle project's dependencies (direct + transitive) from what
 /// can be statically scraped out of its build files, located first in
 /// `gradle_cache` (`~/.gradle/caches`) and, failing that, in `m2_repo`
@@ -214,6 +304,30 @@ mod tests {
         let mut out = Vec::new();
         scrape_coords(text, &mut out);
         out
+    }
+
+    #[test]
+    fn parse_gradle_release_recognizes_common_forms() {
+        assert_eq!(
+            parse_gradle_release(
+                "java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }"
+            ),
+            Some(21)
+        );
+        assert_eq!(
+            parse_gradle_release("sourceCompatibility = JavaVersion.VERSION_17"),
+            Some(17)
+        );
+        assert_eq!(
+            parse_gradle_release("sourceCompatibility = JavaVersion.VERSION_1_8"),
+            Some(8)
+        );
+        assert_eq!(parse_gradle_release("sourceCompatibility = '11'"), Some(11));
+        assert_eq!(parse_gradle_release("targetCompatibility = 17"), Some(17));
+        assert_eq!(
+            parse_gradle_release("dependencies { implementation 'a:b:1' }"),
+            None
+        );
     }
 
     #[test]

@@ -339,6 +339,29 @@ fn child_inherits_parent_pom_dependencies() {
 }
 
 #[test]
+fn parse_release_level_handles_common_forms() {
+    assert_eq!(parse_release_level("21"), Some(21));
+    assert_eq!(parse_release_level("17"), Some(17));
+    assert_eq!(parse_release_level("1.8"), Some(8));
+    assert_eq!(parse_release_level(" 11 "), Some(11));
+    assert_eq!(parse_release_level("${java.version}"), None);
+    assert_eq!(parse_release_level(""), None);
+}
+
+#[test]
+fn maven_compiler_release_reads_the_declared_java_level() {
+    let f = fixture("release");
+    std::fs::write(
+        f.root.join("pom.xml"),
+        "<project><groupId>g</groupId><artifactId>x</artifactId><version>1.0</version>\
+             <properties><java.version>21</java.version></properties></project>",
+    )
+    .unwrap();
+    let locator = crate::maven::MavenLocator { m2_repo: &f.m2 };
+    assert_eq!(maven_like_compiler_release(&f.root, &locator), Some(21));
+}
+
+#[test]
 fn parent_pom_properties_resolve_version() {
     let f = fixture("parent-props");
     put_pom_only(

@@ -138,13 +138,30 @@ fn count_severities_counts_errors_and_warnings_separately() {
 }
 
 #[test]
-fn source_level_args_enable_preview_at_detected_version() {
+fn source_level_args_for_each_level() {
+    // Unknown project level: compile at the JDK's own version with preview on.
     assert_eq!(
-        source_level_args(Some(21)),
+        source_level_args(SourceLevel::JdkDefault(21)),
         vec!["-source", "21", "-target", "21", "--enable-preview"]
     );
-    // Undetectable version keeps the previous bare-compile behavior.
-    assert!(source_level_args(None).is_empty());
+    // Known project level below the JDK: faithful --release, no preview.
+    assert_eq!(
+        source_level_args(SourceLevel::Release {
+            release: 17,
+            preview: false
+        }),
+        vec!["--release", "17"]
+    );
+    // Project level equal to the JDK: --release plus preview (legal only then).
+    assert_eq!(
+        source_level_args(SourceLevel::Release {
+            release: 21,
+            preview: true
+        }),
+        vec!["--release", "21", "--enable-preview"]
+    );
+    // No information at all keeps the bare-compile behavior.
+    assert!(source_level_args(SourceLevel::None).is_empty());
 }
 
 #[test]
@@ -236,7 +253,7 @@ fn run_kills_and_reaps_on_timeout() {
         source_files: vec![],
         classpath_entries: vec![],
         timeout: Duration::from_secs(1),
-        source_release: None,
+        source_level: SourceLevel::None,
     };
     let slot: SharedChild = Arc::new(StdMutex::new(None));
     let leaked = LeakedReaders::new();
@@ -280,7 +297,7 @@ fn kill_running_child_cancels_an_in_flight_run() {
         source_files: vec![],
         classpath_entries: vec![],
         timeout: Duration::from_secs(30), // long enough that only the kill ends it
-        source_release: None,
+        source_level: SourceLevel::None,
     };
     let slot: SharedChild = Arc::new(StdMutex::new(None));
     let run_slot = Arc::clone(&slot);
@@ -349,7 +366,7 @@ fn leaked_reader_cap_refuses_further_runs() {
             source_files: vec![],
             classpath_entries: vec![],
             timeout: Duration::from_millis(200),
-            source_release: None,
+            source_level: SourceLevel::None,
         },
         &slot,
         &leaked,
@@ -375,7 +392,7 @@ fn leaked_reader_cap_refuses_further_runs() {
             source_files: vec![],
             classpath_entries: vec![],
             timeout: Duration::from_millis(200),
-            source_release: None,
+            source_level: SourceLevel::None,
         },
         &slot,
         &leaked,
@@ -407,7 +424,7 @@ fn classpath_entry_with_separator_fails_loud() {
             PathBuf::from("/deps/evil:name.jar"),
         ],
         timeout: Duration::from_secs(10),
-        source_release: None,
+        source_level: SourceLevel::None,
     };
     let slot: SharedChild = Arc::new(StdMutex::new(None));
     let outcome = run(config, &slot, &LeakedReaders::new());

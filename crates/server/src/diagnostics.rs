@@ -152,19 +152,49 @@ impl Backend {
             });
         }
 
-        // The JDK home is `<home>/bin/javac`; read its feature version (no
-        // process spawn) so the check compiles at that level with preview
-        // features enabled — see `RunConfig::source_release`.
-        let source_release = javac_path
+        // JDK level: the JDK home is `<home>/bin/javac`; read its feature
+        // version (no process spawn). Project level: read statically from the
+        // build files. Together they pick the language level below.
+        let jdk_release = javac_path
             .parent()
             .and_then(|bin| bin.parent())
             .and_then(jvl_classpath::jdk_feature_version);
+        let project_release = jvl_classpath::project_java_release(&project_root);
+
+        // If the project targets a newer Java than the newest detected JDK,
+        // javac can't compile it and would emit a flood of "not supported in
+        // -source N" noise. Publish one clear diagnostic on the build file and
+        // skip the run entirely.
+        if let (Some(proj), Some(jdk)) = (project_release, jdk_release) {
+            if jdk < proj {
+                self.publish_jdk_too_old(&project_root, proj, jdk).await;
+                return serde_json::json!({
+                    "status": "jdk-too-old",
+                    "message": format!(
+                        "project targets Java {proj} but the newest detected JDK is {jdk}; javac check skipped"
+                    ),
+                });
+            }
+        }
+
+        // Language level: compile faithfully at the project's declared release
+        // when known (validated against that release's API), enabling preview
+        // only when it matches the JDK's own version; else fall back to the
+        // JDK's level with preview on; or a bare compile when neither is known.
+        let source_level = match (project_release, jdk_release) {
+            (Some(release), Some(jdk)) => javac::SourceLevel::Release {
+                release,
+                preview: release == jdk,
+            },
+            (None, Some(jdk)) => javac::SourceLevel::JdkDefault(jdk),
+            (_, None) => javac::SourceLevel::None,
+        };
         let config = javac::RunConfig {
             javac_path,
             source_files,
             classpath_entries: classpath.entries().to_vec(),
             timeout: self.javac_timeout(),
-            source_release,
+            source_level,
         };
         let slot = Arc::clone(&self.javac_child);
         let leaked = self.javac_leaked_readers.clone();
@@ -209,6 +239,45 @@ impl Backend {
     /// client's Problems panel; LSP has no "leave unchanged" — an omitted
     /// publish just means "nothing changed", not "clear"). Merges with each
     /// file's other diagnostics via `compute_diagnostics`, never clobbering.
+    /// Publish a single diagnostic on the project's build file explaining that
+    /// the detected JDK is too old for the project's declared Java level and
+    /// the javac check was skipped. Routed through
+    /// [`Self::publish_javac_diagnostics`] so it clears on the next run like
+    /// any other javac diagnostic.
+    async fn publish_jdk_too_old(&self, project_root: &Path, project: u32, jdk: u32) {
+        let Some(build_file) = ["pom.xml", "build.gradle", "build.gradle.kts"]
+            .iter()
+            .map(|n| project_root.join(n))
+            .find(|p| p.is_file())
+        else {
+            return;
+        };
+        let diag = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("java-vsix-lite".to_string()),
+            message: format!(
+                "This project targets Java {project}, but the newest detected JDK is {jdk}. \
+                 The javac check was skipped (it cannot compile Java {project} sources). \
+                 Install a JDK {project} or newer, or set `java-vsix-lite.jdk.home` to one. \
+                 Highlighting, completion, and navigation work regardless."
+            ),
+            ..Default::default()
+        };
+        let mut map: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+        map.insert(build_file.to_string_lossy().into_owned(), vec![diag]);
+        self.publish_javac_diagnostics(map).await;
+    }
+
     async fn publish_javac_diagnostics(&self, new_diags: HashMap<String, Vec<Diagnostic>>) {
         let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
             .into_iter()

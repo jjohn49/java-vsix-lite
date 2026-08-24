@@ -589,6 +589,48 @@ fn root_seeds(effective: &EffectivePom, seeds: &mut Vec<Seed>, degraded: &mut Ve
     }
 }
 
+/// The project's declared Java release from the root POM's effective
+/// properties: `maven.compiler.release`, else `maven.compiler.source`, else
+/// `java.version` (the spring-boot convention). Returns the feature number
+/// (e.g. `21`, or `8` for `1.8`). `None` when no such property is set or the
+/// pom can't be parsed — callers then fall back to the JDK's own level.
+pub(crate) fn maven_like_compiler_release(root: &Path, locator: &dyn Locator) -> Option<u32> {
+    let pom = root.join("pom.xml");
+    let raw = parse_effective_pom_raw(&pom, locator, 0, Some(root))?;
+    release_from_props(&raw.props)
+}
+
+fn release_from_props(props: &HashMap<String, String>) -> Option<u32> {
+    for key in [
+        "maven.compiler.release",
+        "maven.compiler.source",
+        "java.version",
+    ] {
+        if let Some(raw) = props.get(key) {
+            // Property values are stored unsubstituted (e.g. spring-boot's
+            // `maven.compiler.release` is literally `${java.version}`), so
+            // resolve against the full property set before parsing.
+            if let Some(n) = parse_release_level(&substitute(raw, props)) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a Java version token into its feature number: `"21"` -> 21,
+/// `"17"` -> 17, `"1.8"` -> 8. `None` if it isn't a recognizable version.
+pub(crate) fn parse_release_level(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || s.contains("${") {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("1.") {
+        return rest.parse().ok();
+    }
+    s.parse().ok()
+}
+
 /// Bare coordinate seeds (Gradle: statically scraped `g:a:v` literals, no
 /// pom to derive scope/exclusions from — treated as root-level compile
 /// deps).

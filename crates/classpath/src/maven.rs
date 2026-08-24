@@ -18,6 +18,13 @@ pub(crate) fn resolve_project(root: &Path, m2_repo: &Path) -> ResolvedProject {
     resolve::resolve_maven_like_project(root, &locator)
 }
 
+/// The project's declared Java release (`maven.compiler.release` /
+/// `maven.compiler.source` / `java.version`) from the effective root POM, or
+/// `None` when undeclared.
+pub(crate) fn compiler_release(root: &Path, m2_repo: &Path) -> Option<u32> {
+    resolve::maven_like_compiler_release(root, &MavenLocator { m2_repo })
+}
+
 /// Locates artifacts under a Maven local repository (`~/.m2/repository`).
 pub(crate) struct MavenLocator<'a> {
     pub m2_repo: &'a Path,

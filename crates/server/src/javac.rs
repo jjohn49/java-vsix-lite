@@ -390,6 +390,24 @@ pub(crate) enum RunOutcome {
     SpawnError(String),
 }
 
+/// How the throwaway `javac` check sets the Java language level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceLevel {
+    /// No level information (JDK version undetectable) — bare compile, exactly
+    /// the historical behavior.
+    None,
+    /// The project's target release is unknown; compile at the running JDK's
+    /// own feature version with `-source N -target N --enable-preview`, so
+    /// preview syntax valid for that JDK (pattern matching in `switch` on
+    /// 17–20, etc.) isn't flagged as an error.
+    JdkDefault(u32),
+    /// The project's declared release, compiled faithfully with `--release R`
+    /// (validated against release R's API surface, matching the real build).
+    /// `preview` is set only when R equals the running JDK's own version, since
+    /// `--enable-preview` is legal only for the compiler's current release.
+    Release { release: u32, preview: bool },
+}
+
 /// What one check run needs: where `javac` lives, which files to compile,
 /// the dependency jars for `-cp`, and how long to allow before killing it.
 pub(crate) struct RunConfig {
@@ -397,31 +415,30 @@ pub(crate) struct RunConfig {
     pub source_files: Vec<PathBuf>,
     pub classpath_entries: Vec<PathBuf>,
     pub timeout: Duration,
-    /// The running JDK's feature version (e.g. `21`), when known. When set, the
-    /// check compiles with `-source N -target N --enable-preview` so preview
-    /// language features (pattern matching in `switch` on JDK 17–20, etc.)
-    /// don't surface as false errors. `-source N -target N` matches the bare
-    /// default (source == platform, so no bootstrap-classpath warning); the
-    /// only added behavior is `--enable-preview`, which strictly *reduces*
-    /// false diagnostics for this throwaway (class files discarded) check.
-    /// `None` (version undetectable) keeps the previous bare-compile behavior.
-    pub source_release: Option<u32>,
+    /// The language level to compile at — see [`SourceLevel`]. Class files are
+    /// discarded, so these flags only steer which diagnostics `javac` emits.
+    pub source_level: SourceLevel,
 }
 
-/// The source-level arguments for a given detected feature version: an empty
-/// slice when unknown (bare compile, unchanged), else
-/// `-source N -target N --enable-preview`. Factored out so the flag policy is
-/// unit-testable without spawning `javac`.
-fn source_level_args(source_release: Option<u32>) -> Vec<String> {
-    match source_release {
-        Some(n) => vec![
+/// The `javac` source-level arguments for a [`SourceLevel`]. Factored out so
+/// the flag policy is unit-testable without spawning `javac`.
+fn source_level_args(level: SourceLevel) -> Vec<String> {
+    match level {
+        SourceLevel::None => Vec::new(),
+        SourceLevel::JdkDefault(n) => vec![
             "-source".to_string(),
             n.to_string(),
             "-target".to_string(),
             n.to_string(),
             "--enable-preview".to_string(),
         ],
-        None => Vec::new(),
+        SourceLevel::Release { release, preview } => {
+            let mut args = vec!["--release".to_string(), release.to_string()];
+            if preview {
+                args.push("--enable-preview".to_string());
+            }
+            args
+        }
     }
 }
 
@@ -577,7 +594,7 @@ fn run_in_scratch(
         .arg(scratch);
     // Compile at the running JDK's own source level with preview features
     // enabled, so modern-but-preview syntax isn't reported as an error.
-    cmd.args(source_level_args(config.source_release));
+    cmd.args(source_level_args(config.source_level));
     if !config.classpath_entries.is_empty() {
         match std::env::join_paths(&config.classpath_entries) {
             Ok(joined) => {

@@ -396,6 +396,25 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// The Java release the project declares it targets, as a feature number
+/// (`21`, `17`, `8` for `1.8`). Read statically from the build files — a
+/// Maven `pom.xml` (`maven.compiler.release` / `maven.compiler.source` /
+/// `java.version`, effective across the parent chain) or, best-effort, a
+/// Gradle `build.gradle(.kts)` (toolchain `languageVersion`,
+/// `JavaVersion.VERSION_*`, or a numeric `sourceCompatibility`). `None` when
+/// undeclared or unreadable — callers then fall back to the JDK's own level.
+/// The build is never executed.
+pub fn project_java_release(root: &Path) -> Option<u32> {
+    if root.join("pom.xml").is_file() {
+        let m2 = home_dir()?.join(".m2/repository");
+        return maven::compiler_release(root, &m2);
+    }
+    if root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file() {
+        return gradle::compiler_release(root);
+    }
+    None
+}
+
 /// The Gradle user home — `$GRADLE_USER_HOME` when set to a non-empty path
 /// (Gradle's own override, standard in CI and governed environments where the
 /// cache lives outside `$HOME`), else `~/.gradle`. `None` only when neither is
