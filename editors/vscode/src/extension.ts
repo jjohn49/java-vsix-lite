@@ -422,11 +422,36 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
         `java-vsix-lite: Check Project timed out. ${result.message ?? ""}`,
       );
       break;
+    case "jdk-too-old":
+      notifyJdkTooOld(result);
+      break;
     default:
       void vscode.window.showErrorMessage(
         `java-vsix-lite: Check Project failed: ${result.message ?? result.status}`,
       );
   }
+}
+
+// The detected JDK is older than the project's declared Java level, so the
+// javac check was skipped (the server already published a single diagnostic on
+// the build file). Surface it as a notification too, with a shortcut to the
+// machine-scoped JDK override.
+function notifyJdkTooOld(result: CheckProjectResult): void {
+  const detail =
+    result.message ?? "the detected JDK is too old for this project's Java level";
+  void vscode.window
+    .showWarningMessage(
+      `java-vsix-lite: ${detail}. Install a newer JDK, or set java-vsix-lite.jdk.home to one.`,
+      "Configure JDK path",
+    )
+    .then((choice) => {
+      if (choice === "Configure JDK path") {
+        void vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          "java-vsix-lite.jdk.home",
+        );
+      }
+    });
 }
 
 // M8b: check-on-save plumbing. Debounce coalesces a burst of saves ("save
@@ -438,6 +463,10 @@ let saveCheckTimer: ReturnType<typeof setTimeout> | undefined;
 let saveCheckRunning = false;
 let saveCheckQueued = false;
 const SAVE_CHECK_DEBOUNCE_MS = 1500;
+// The background check is silent, but the JDK-too-old *configuration* problem
+// is surfaced once (not on every save). Reset when a check no longer reports
+// it, so fixing then re-breaking the JDK notifies again.
+let jdkTooOldNotified = false;
 
 function scheduleSaveCheck(): void {
   if (saveCheckTimer !== undefined) {
@@ -461,10 +490,20 @@ async function runSaveCheck(): Promise<void> {
   }
   saveCheckRunning = true;
   try {
-    await client.sendRequest(ExecuteCommandRequest.type, {
+    const result = (await client.sendRequest(ExecuteCommandRequest.type, {
       command: SERVER_CHECK_PROJECT_COMMAND,
       arguments: [],
-    });
+    })) as CheckProjectResult;
+    // Otherwise silent, but the JDK-too-old state is a config problem worth a
+    // one-time toast (the diagnostic on the build file is easy to miss).
+    if (result.status === "jdk-too-old") {
+      if (!jdkTooOldNotified) {
+        jdkTooOldNotified = true;
+        notifyJdkTooOld(result);
+      }
+    } else {
+      jdkTooOldNotified = false;
+    }
   } catch {
     // Silent by design — a failed background check must never toast on save.
     // The manual `Java: Check Project (javac)` command reports errors.
