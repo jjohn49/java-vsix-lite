@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.3 — 2026-08-23
+
+### Changed
+- The `javac` check now compiles at the **project's declared Java
+  release** rather than always the newest installed JDK's level. The
+  target level is read statically from the build files (Maven
+  `maven.compiler.release`/`maven.compiler.source`/`java.version` across
+  the parent chain; best-effort Gradle toolchain/`sourceCompatibility`)
+  and compiled with `--release N` — validated against release N's API,
+  matching the real build — with `--enable-preview` only when N equals
+  the running JDK. When the level is undeclared it falls back to the
+  JDK's own level as before.
+
+### Added
+- When the newest detected JDK is **older** than the project's declared
+  Java level (e.g. a Java 21 project with only a JDK 17), the check is
+  skipped and a single clear message is shown — both as a diagnostic on
+  the build file and as a notification with a shortcut to the
+  `java-vsix-lite.jdk.home` setting — instead of a flood of
+  "not supported in -source" errors. The pure-Rust tier is unaffected.
+
 ## 0.1.2 — 2026-08-23
 
 ### Fixed
