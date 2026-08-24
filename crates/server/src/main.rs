@@ -110,7 +110,7 @@ fn derive_project_root(uri: &Uri) -> Option<PathBuf> {
 /// above them (`root/a/b/C.java` + `package a.b;` ⇒ `root`). `None` for a
 /// non-`file:` URI, a document with no package declaration, or one whose path
 /// doesn't actually match its package (nothing to infer).
-fn infer_source_root(uri: &str, tree: &Tree, source: &str) -> Option<PathBuf> {
+pub(crate) fn infer_source_root(uri: &str, tree: &Tree, source: &str) -> Option<PathBuf> {
     let uri: Uri = uri.parse().ok()?;
     let path = uri.to_file_path()?.into_owned();
     let package = extract_package(tree, source)?;
@@ -161,6 +161,53 @@ fn filename_from_uri(uri: &str) -> Option<String> {
     let path = open_doc_path(uri)?;
     let name = path.file_name()?.to_str()?.to_string();
     name.ends_with(".java").then_some(name)
+}
+
+/// Decode the `jvl.checkProject.run` scope from its `executeCommand`
+/// arguments (see [`javac::JavacCheckScope`]).
+///
+/// Backward compatible: no arguments, a `null`/empty first argument, or an
+/// object without a `scope` all mean the whole project (the historical
+/// behavior, and what the manual command sends explicitly as
+/// `{"scope":"project"}`). A `{"scope":"modules","documentUris":[...]}` request
+/// must carry a non-empty string array; a malformed or empty `modules` request
+/// is an `Err` — the caller rejects it rather than compiling the whole project.
+fn parse_check_scope(
+    arguments: &[serde_json::Value],
+) -> std::result::Result<javac::JavacCheckScope, String> {
+    let Some(first) = arguments.first() else {
+        return Ok(javac::JavacCheckScope::Project);
+    };
+    if first.is_null() {
+        return Ok(javac::JavacCheckScope::Project);
+    }
+    let obj = first
+        .as_object()
+        .ok_or_else(|| "checkProject argument must be a JSON object".to_string())?;
+    if obj.is_empty() {
+        return Ok(javac::JavacCheckScope::Project);
+    }
+    match obj.get("scope").and_then(|v| v.as_str()) {
+        None | Some("project") => Ok(javac::JavacCheckScope::Project),
+        Some("modules") => {
+            let array = obj
+                .get("documentUris")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "modules scope requires a documentUris array".to_string())?;
+            let mut document_uris = Vec::with_capacity(array.len());
+            for value in array {
+                let uri = value
+                    .as_str()
+                    .ok_or_else(|| "documentUris entries must be strings".to_string())?;
+                document_uris.push(uri.to_string());
+            }
+            if document_uris.is_empty() {
+                return Err("modules scope requires at least one document URI".to_string());
+            }
+            Ok(javac::JavacCheckScope::Modules { document_uris })
+        }
+        Some(other) => Err(format!("unknown checkProject scope: {other}")),
+    }
 }
 
 /// The FQN encoded in a `jvl-src:` virtual-document URI (the inverse of
@@ -652,6 +699,18 @@ impl LanguageServer for Backend {
         if params.command != javac::CHECK_PROJECT_COMMAND {
             return Err(Error::method_not_found());
         }
+        // Decode the check scope BEFORE claiming the single-flight flag: a
+        // malformed request is rejected outright (never widened to a project
+        // compile) without ever blocking a legitimate concurrent run.
+        let scope = match parse_check_scope(&params.arguments) {
+            Ok(scope) => scope,
+            Err(message) => {
+                return Ok(Some(serde_json::json!({
+                    "status": "error",
+                    "message": message,
+                })));
+            }
+        };
         if self
             .javac_running
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -662,7 +721,7 @@ impl LanguageServer for Backend {
         // unexpected panic unwinding through here), so a single bad run can
         // never wedge every future `checkProject` invocation.
         let _guard = JavacRunningGuard(&self.javac_running);
-        let result = self.run_check_project().await;
+        let result = self.run_check_project(scope).await;
         Ok(Some(result))
     }
 
@@ -1955,6 +2014,68 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backward compatibility: no arguments, a `null`/empty first argument,
+    /// an object without a `scope`, and an explicit `{"scope":"project"}` all
+    /// decode to a whole-project check.
+    #[test]
+    fn parse_check_scope_defaults_to_project() {
+        use javac::JavacCheckScope::Project;
+        assert_eq!(parse_check_scope(&[]), Ok(Project));
+        assert_eq!(parse_check_scope(&[serde_json::Value::Null]), Ok(Project));
+        assert_eq!(parse_check_scope(&[serde_json::json!({})]), Ok(Project));
+        assert_eq!(
+            parse_check_scope(&[serde_json::json!({ "scope": "project" })]),
+            Ok(Project)
+        );
+    }
+
+    /// A well-formed `modules` request decodes to its URI list.
+    #[test]
+    fn parse_check_scope_modules_decodes_uris() {
+        let scope = parse_check_scope(&[serde_json::json!({
+            "scope": "modules",
+            "documentUris": ["file:///ws/a/src/main/java/A.java", "file:///ws/b/src/main/java/B.java"],
+        })])
+        .expect("valid modules request");
+        assert_eq!(
+            scope,
+            javac::JavacCheckScope::Modules {
+                document_uris: vec![
+                    "file:///ws/a/src/main/java/A.java".to_string(),
+                    "file:///ws/b/src/main/java/B.java".to_string(),
+                ],
+            }
+        );
+    }
+
+    /// A malformed or empty `modules` request is an error — NEVER silently
+    /// widened into a project-wide compilation.
+    #[test]
+    fn parse_check_scope_rejects_malformed_or_empty_modules() {
+        // Empty URI list.
+        assert!(parse_check_scope(&[serde_json::json!({
+            "scope": "modules",
+            "documentUris": [],
+        })])
+        .is_err());
+        // Missing documentUris.
+        assert!(
+            parse_check_scope(&[serde_json::json!({ "scope": "modules" })]).is_err()
+        );
+        // Non-string entry.
+        assert!(parse_check_scope(&[serde_json::json!({
+            "scope": "modules",
+            "documentUris": [42],
+        })])
+        .is_err());
+        // Unknown scope.
+        assert!(
+            parse_check_scope(&[serde_json::json!({ "scope": "everything" })]).is_err()
+        );
+        // Non-object argument.
+        assert!(parse_check_scope(&[serde_json::json!("modules")]).is_err());
+    }
 
     /// With no `initializationOptions` at all, unresolved-member
     /// diagnostics must default to **on** (the conservative gating inside

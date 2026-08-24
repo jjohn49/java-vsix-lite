@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.4 — 2026-08-23
+
+### Changed
+- The automatic background `javac` check is now **module-scoped**. On save it
+  compiles only the Maven/Gradle module(s) owning the saved file(s) instead of
+  the whole workspace, so unrelated modules aren't recompiled on every save.
+  Sibling-module sources are still resolved (passed to `javac` via
+  `-sourcepath`) so cross-module references don't produce false "cannot find
+  symbol" errors. On activation/trust-grant the check now covers only the
+  modules of already-open Java documents rather than the entire project. If a
+  scoped compile flags a file outside the checked modules, the run transparently
+  falls back to a full-project check so no partial/misleading result is ever
+  published. The manual **Java: Check Project (javac)** command remains a
+  complete full-workspace check (and now covers every module in a multi-module
+  project, not just the root module and open files).
+
+### Added
+- **Rebuild Classpath (Refresh IntelliSense)** command — re-reads the build
+  files and local dependency caches and rebuilds the classpath without
+  restarting the language server (the light counterpart to **Restart Language
+  Server**). Offline and side-effect-free, so it works in untrusted workspaces.
+
 ## 0.1.3 — 2026-08-23
 
 ### Changed

@@ -53,6 +53,14 @@ const DOWNLOAD_DEPENDENCIES_COMMAND = "java-vsix-lite.downloadDependencies";
 const INSTALL_DEPENDENCIES_COMMAND = "java-vsix-lite.installDependencies";
 const SERVER_REBUILD_CLASSPATH_COMMAND = "jvl.classpath.rebuild";
 
+// User-facing "refresh" command: re-reads the build files and local caches
+// (`~/.m2`/`~/.gradle`) and republishes diagnostics WITHOUT restarting the
+// server process — the light counterpart to `restartServer`. Drives the same
+// server-internal `SERVER_REBUILD_CLASSPATH_COMMAND` the post-install loop
+// uses. Purely offline (no network, no build-script execution), so unlike the
+// download/install commands it is not trust-gated.
+const REBUILD_CLASSPATH_COMMAND = "java-vsix-lite.rebuildClasspath";
+
 // Hard ceiling on a build-tool run before it's killed (dependency resolution
 // can legitimately take minutes on a cold cache; a hung/interactive process
 // must not block forever).
@@ -131,6 +139,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand(REBUILD_CLASSPATH_COMMAND, async () => {
+      await rebuildClasspath();
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand(DOWNLOAD_DEPENDENCIES_COMMAND, async () => {
       await downloadDependencies();
     }),
@@ -158,7 +172,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         doc.uri.scheme === "file" &&
         javacBackgroundCheckEnabled()
       ) {
-        scheduleSaveCheck();
+        scheduleSaveCheck(doc.uri.toString());
       }
     }),
   );
@@ -168,7 +182,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
       if (javacBackgroundCheckEnabled()) {
-        scheduleSaveCheck();
+        scheduleOpenDocsCheck();
       }
     }),
   );
@@ -328,10 +342,11 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
 
   // M8b follow-up: one silent check when the project loads (and again after
   // a server restart), so pre-existing errors surface without waiting for
-  // the first save. Same gate, debounce, and single-flight as the on-save
-  // path — a save landing during startup simply coalesces with this run.
+  // the first save. Now scoped to the modules of whatever Java documents are
+  // already open — activation never eagerly compiles the whole workspace. Same
+  // gate, debounce, and single-flight as the on-save path.
   if (javacBackgroundCheckEnabled()) {
-    scheduleSaveCheck();
+    scheduleOpenDocsCheck();
   }
 }
 
@@ -352,6 +367,43 @@ async function restart(context: vscode.ExtensionContext): Promise<void> {
   await client?.stop();
   client = undefined;
   await start(context);
+}
+
+// The light "refresh": ask the running server to re-read the build files and
+// local dependency caches and rebuild the classpath, then republish
+// diagnostics — without tearing down the process (that's `restartServer`).
+// Use it after editing a `pom.xml`/`build.gradle` the watcher didn't catch, or
+// after dropping a jar into `~/.m2` by hand. Offline and side-effect-free
+// (no network, no build-script execution), so no trust gate.
+async function rebuildClasspath(): Promise<void> {
+  if (!client) {
+    void vscode.window.showErrorMessage("java-vsix-lite: the language server is not running.");
+    return;
+  }
+
+  const previousText = statusBar.text;
+  const previousTooltip = statusBar.tooltip;
+  statusBar.text = "$(loading~spin) Java Lite";
+  statusBar.tooltip = "java-vsix-lite: rebuilding classpath…";
+  try {
+    await client.sendRequest(ExecuteCommandRequest.type, {
+      command: SERVER_REBUILD_CLASSPATH_COMMAND,
+      arguments: [],
+    });
+    void vscode.window.showInformationMessage("java-vsix-lite: classpath rebuilt.");
+    // Re-run the silent javac check so Problems reflects the refreshed
+    // classpath too (same gate/debounce as save; no-op in untrusted workspaces).
+    if (javacBackgroundCheckEnabled()) {
+      scheduleOpenDocsCheck();
+    }
+  } catch (err) {
+    void vscode.window.showErrorMessage(
+      `java-vsix-lite: could not rebuild the classpath: ${String(err)}`,
+    );
+  } finally {
+    statusBar.text = previousText;
+    statusBar.tooltip = previousTooltip;
+  }
 }
 
 // M5.4: the one-shot, trust-gated javac check command. Spawning javac is
@@ -380,7 +432,8 @@ async function checkProject(): Promise<void> {
   try {
     const result = await client.sendRequest(ExecuteCommandRequest.type, {
       command: SERVER_CHECK_PROJECT_COMMAND,
-      arguments: [],
+      // The manual command is always a full-workspace check.
+      arguments: [{ scope: "project" }],
     });
     reportCheckProjectResult(result as CheckProjectResult);
   } catch (err) {
@@ -454,21 +507,25 @@ function notifyJdkTooOld(result: CheckProjectResult): void {
     });
 }
 
-// M8b: check-on-save plumbing. Debounce coalesces a burst of saves ("save
-// all") into one run; the running/queued pair coalesces saves that land
-// mid-run into exactly one follow-up run (the server would answer
-// `already-running` to a concurrent request, and the *last* save's state
-// must still get compiled).
+// M8b: check-on-save plumbing, now MODULE-SCOPED. Each background check
+// compiles only the Maven/Gradle modules owning the files saved in the debounce
+// window — not the whole workspace (the manual `Check Project (javac)` command
+// stays project-wide). `pendingSaveCheckUris` accumulates the file-backed Java
+// document URIs to check next; the debounce coalesces a burst of saves ("Save
+// All") into one run, and any save landing mid-run stays in the set for exactly
+// one follow-up run with the newest set (the server answers `already-running`
+// to a concurrent request, so at most one javac ever runs).
+const pendingSaveCheckUris = new Set<string>();
 let saveCheckTimer: ReturnType<typeof setTimeout> | undefined;
 let saveCheckRunning = false;
-let saveCheckQueued = false;
 const SAVE_CHECK_DEBOUNCE_MS = 1500;
 // The background check is silent, but the JDK-too-old *configuration* problem
 // is surfaced once (not on every save). Reset when a check no longer reports
 // it, so fixing then re-breaking the JDK notifies again.
 let jdkTooOldNotified = false;
 
-function scheduleSaveCheck(): void {
+/** (Re)arm the shared debounce timer without touching the pending set. */
+function armSaveCheckTimer(): void {
   if (saveCheckTimer !== undefined) {
     clearTimeout(saveCheckTimer);
   }
@@ -478,21 +535,56 @@ function scheduleSaveCheck(): void {
   }, SAVE_CHECK_DEBOUNCE_MS);
 }
 
+/** Queue one saved Java document for the next scoped background check. */
+function scheduleSaveCheck(uri: string): void {
+  pendingSaveCheckUris.add(uri);
+  armSaveCheckTimer();
+}
+
+/**
+ * Queue every currently-open, file-backed Java document for a scoped check —
+ * the activation / restart / trust-grant / post-install entry point (there is
+ * no single "saved file" to key off in those cases). Deliberately does NOT
+ * fall back to a whole-project compile: if no Java documents are open, there is
+ * nothing to check yet, so it schedules nothing.
+ */
+function scheduleOpenDocsCheck(): void {
+  let queuedAny = false;
+  for (const doc of vscode.workspace.textDocuments) {
+    if (doc.languageId === "java" && doc.uri.scheme === "file") {
+      pendingSaveCheckUris.add(doc.uri.toString());
+      queuedAny = true;
+    }
+  }
+  if (queuedAny) {
+    armSaveCheckTimer();
+  }
+}
+
 async function runSaveCheck(): Promise<void> {
   if (saveCheckRunning) {
-    saveCheckQueued = true;
+    // A check is in flight; the pending set is left intact so the follow-up
+    // scheduled in `finally` picks these saves up.
     return;
   }
   // Re-checked here (not just at schedule time): trust or the running client
   // can be gone by the time the debounce fires.
   if (!client || !vscode.workspace.isTrusted) {
+    pendingSaveCheckUris.clear();
     return;
   }
+  if (pendingSaveCheckUris.size === 0) {
+    return;
+  }
+  // Snapshot and clear: saves landing during the run re-populate the set for a
+  // follow-up, rather than being lost or folded into this run's fixed input.
+  const documentUris = [...pendingSaveCheckUris];
+  pendingSaveCheckUris.clear();
   saveCheckRunning = true;
   try {
     const result = (await client.sendRequest(ExecuteCommandRequest.type, {
       command: SERVER_CHECK_PROJECT_COMMAND,
-      arguments: [],
+      arguments: [{ scope: "modules", documentUris }],
     })) as CheckProjectResult;
     // Otherwise silent, but the JDK-too-old state is a config problem worth a
     // one-time toast (the diagnostic on the build file is easy to miss).
@@ -509,9 +601,10 @@ async function runSaveCheck(): Promise<void> {
     // The manual `Java: Check Project (javac)` command reports errors.
   } finally {
     saveCheckRunning = false;
-    if (saveCheckQueued) {
-      saveCheckQueued = false;
-      scheduleSaveCheck();
+    // A save landed during the run (or the timer fired mid-run): run once more
+    // with whatever accumulated.
+    if (pendingSaveCheckUris.size > 0) {
+      armSaveCheckTimer();
     }
   }
 }
@@ -734,7 +827,7 @@ async function runInstall(tool: BuildTool): Promise<void> {
       })
       .catch(() => undefined);
     if (javacBackgroundCheckEnabled()) {
-      scheduleSaveCheck();
+      scheduleOpenDocsCheck();
     }
   }
 }

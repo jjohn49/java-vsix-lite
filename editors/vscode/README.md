@@ -82,7 +82,8 @@ The automatic `javac` check is a separate, transient cost: compiling the reposit
 - **Missing dependency download** — a declared dependency not yet in `~/.m2` can be fetched from Maven Central — or from an internal Maven proxy via the machine-scoped `java-vsix-lite.dependencies.repository` setting (governed networks): run **Java: Download Missing Dependencies**, or accept the one-time prompt shown after opening a project with unresolved dependencies (see `java-vsix-lite.dependencies.autoDownload`). Workspace-trust-gated; HTTPS with checksum verification; nothing downloaded is ever executed
 - **Code actions** — add-import quick fixes for unresolved type names (lightbulb on the name) and **Organize Imports** (sorts, dedupes, drops unused — conservatively: a name referenced only in Javadoc keeps its import)
 - **Refactoring & code generation** — extract a selected expression to a local variable or a `private static final` constant; generate getters/setters, an all-fields constructor, `equals()`/`hashCode()`, and `toString()` from the Source Action menu
-- **Check Project (javac)** — a workspace-trust-gated `javac` check (annotation processing disabled) reporting real compiler errors in the Problems panel — no resident JVM. Runs on demand via the command, and automatically on project load and after saving a Java file (debounced and silent; disable with `java-vsix-lite.javac.checkOnSave`)
+- **Check Project (javac)** — a workspace-trust-gated `javac` check (annotation processing disabled) reporting real compiler errors in the Problems panel — no resident JVM. The manual command checks the **whole workspace**; the automatic on-save/on-load check is **module-scoped** — it compiles only the Maven/Gradle module(s) owning the saved file(s) (sibling modules still resolve via `-sourcepath`), so unrelated modules aren't recompiled on every save. Debounced and silent; disable with `java-vsix-lite.javac.checkOnSave`
+- **Rebuild Classpath (Refresh IntelliSense)** — re-reads build files and local dependency caches and rebuilds the classpath without restarting the server (the light counterpart to **Restart Language Server**). Offline and side-effect-free, so it works even in an untrusted workspace
 
 ## Configuration
 
@@ -102,7 +103,7 @@ Everything works out of the box: the JDK, Maven, Gradle, and the server binary a
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `java-vsix-lite.javac.checkOnSave` | `true` | Run the `javac` check automatically on project load and after saving a Java file (trusted workspaces only; debounced and silent). Set to `false` to make the check on-demand only |
+| `java-vsix-lite.javac.checkOnSave` | `true` | Run a **module-scoped** `javac` check automatically on project load and after saving a Java file — only the module(s) owning the saved file(s) are compiled (trusted workspaces only; debounced and silent). The manual **Check Project (javac)** command stays full-workspace. Set to `false` to make the check on-demand only |
 | `java-vsix-lite.diagnostics.unresolvedMembers` | `true` | Report an error for a member access when the receiver's full type hierarchy resolves but declares no such member. Conservative — stays silent whenever resolution is incomplete |
 | `java-vsix-lite.javac.timeoutSecs` | `120` | How long the `javac` check waits before timing out (clamped to 10–600) |
 | `java-vsix-lite.dependencies.autoDownload` | `prompt` | What to do when missing dependencies are detected in a trusted workspace: `prompt` (ask once per session), `always` (download silently), or `never` (disable the automatic check; the manual command still works) |

@@ -26,7 +26,8 @@ A thin TypeScript client (the VS Code extension host is JavaScript-only) hosts c
 **Compiler tier — optional `javac` diagnostics. Trusted workspaces only.**
 
 - Runs the detected JDK's `javac` (annotation processing disabled with `-proc:none`) on project load and after saves, publishing real compiler errors to the Problems panel. There is no resident JVM — each run is a bounded, timeout-guarded, killable subprocess, debounced and silent.
-- The JDK is auto-detected (ranked by real feature version) and overridable in settings; the check compiles at the JDK's own source level so preview syntax is not misreported.
+- Automatic checks are **module-scoped**: a save compiles only the Maven/Gradle module(s) owning the changed file(s), not the whole workspace, so unrelated modules aren't recompiled every time (sibling-module sources still resolve via `-sourcepath`). The manual **Check Project (javac)** command remains a complete full-workspace check.
+- The JDK is auto-detected (ranked by real feature version) and overridable in settings; the check compiles at the project's declared source level (falling back to the JDK's own) so preview syntax is not misreported.
 
 ## Build tooling
 

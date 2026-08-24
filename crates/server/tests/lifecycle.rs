@@ -3429,3 +3429,298 @@ fn check_project_locates_javac_without_java_home() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Scoped (module) checks reject malformed requests outright — a non-`.java`
+/// URI, a non-`file:` URI, an out-of-workspace file, and an empty module list
+/// must each come back `status:"error"` and NEVER be silently widened into a
+/// project-wide compile. No JDK needed: every rejection happens before javac
+/// is ever located.
+#[test]
+fn check_scoped_rejects_invalid_and_outside_uris() {
+    let root = temp_root("scoped-reject");
+    let src = root.join("mod-a/src/main/java/a");
+    std::fs::create_dir_all(&src).expect("create module dirs");
+    std::fs::write(root.join("mod-a/pom.xml"), "<project/>").expect("write pom");
+    std::fs::write(src.join("A.java"), "package a; class A {}").expect("write A");
+
+    // A real file OUTSIDE the workspace, to exercise the containment check.
+    let outside = temp_root("scoped-reject-outside");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let outside_file = outside.join("Outside.java");
+    std::fs::write(&outside_file, "class Outside {}").expect("write Outside");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // Each case: send a modules request, read the response, assert error.
+    let non_java = format!("file://{}", root.join("mod-a/pom.xml").display());
+    let outside_uri = format!("file://{}", outside_file.display());
+    let cases: [(u32, String); 4] = [
+        // Empty module list.
+        (2, r#"[{"scope":"modules","documentUris":[]}]"#.to_string()),
+        // A non-.java file inside the workspace.
+        (
+            3,
+            format!(r#"[{{"scope":"modules","documentUris":["{non_java}"]}}]"#),
+        ),
+        // A non-file: URI.
+        (
+            4,
+            r#"[{"scope":"modules","documentUris":["untitled:Foo.java"]}]"#.to_string(),
+        ),
+        // A real .java file outside the workspace.
+        (
+            5,
+            format!(r#"[{{"scope":"modules","documentUris":["{outside_uri}"]}}]"#),
+        ),
+    ];
+    for (id, args) in cases {
+        send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":{args}}}}}"#
+        ));
+        let raw = read_until(&mut reader, &format!("\"id\":{id}"), &mut seen);
+        let json: Value = serde_json::from_str(&raw).expect("parse response");
+        assert_eq!(
+            json["result"]["status"], "error",
+            "request {id} must be rejected as an error, got: {raw}"
+        );
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// The heart of the scoped-check design, end to end against real `javac` on a
+/// two-module Maven project (`mod-a` depends on `mod-b`):
+///
+/// 1. **`-sourcepath` resolves a sibling**: a scoped check of `mod-a` — whose
+///    class references `mod-b`'s — compiles cleanly (0 errors), proving the
+///    sibling source resolved without being an explicit input.
+/// 2. **External error → full-project fallback**: breaking `mod-b` and
+///    re-checking only `mod-a` (which references it) makes javac flag a file
+///    outside the checked module; the run must transparently fall back to a
+///    full project check (result has NO `"scope":"modules"` and reports the
+///    error) rather than publish a misleading clean scoped result.
+/// 3. **Module isolation + clean recheck clears**: with both modules broken
+///    *independently*, a full project check flags both; fixing `mod-a` and
+///    scoped-checking it clears `mod-a`'s diagnostic while leaving `mod-b`'s
+///    untouched (verified by reopening each file).
+///
+/// Skips gracefully if no JDK is discoverable.
+#[test]
+fn check_scoped_sourcepath_isolation_and_fallback() {
+    let Some(java_home) = discover_java_home() else {
+        eprintln!("skipping check_scoped_sourcepath_isolation_and_fallback: no JDK discoverable");
+        return;
+    };
+
+    let root = temp_root("scoped-multi");
+    let a_dir = root.join("mod-a/src/main/java/a");
+    let b_dir = root.join("mod-b/src/main/java/b");
+    std::fs::create_dir_all(&a_dir).expect("mod-a dirs");
+    std::fs::create_dir_all(&b_dir).expect("mod-b dirs");
+    std::fs::write(root.join("mod-a/pom.xml"), "<project/>").expect("mod-a pom");
+    std::fs::write(root.join("mod-b/pom.xml"), "<project/>").expect("mod-b pom");
+    let a_path = a_dir.join("A.java");
+    let b_path = b_dir.join("B.java");
+
+    // Phase 1 fixtures: A references B; both compile.
+    let a_uses_b = "package a;\nimport b.B;\npublic class A {\n    void m() {\n        new B().hello();\n    }\n}\n";
+    let b_good = "package b;\npublic class B {\n    public void hello() {}\n}\n";
+    std::fs::write(&a_path, a_uses_b).expect("write A");
+    std::fs::write(&b_path, b_good).expect("write B");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("JAVA_HOME", &java_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let a_uri = format!("file://{}", a_path.display());
+    let b_uri = format!("file://{}", b_path.display());
+
+    // Open both so the syntax tier + inferred roots are live (as in a real
+    // editor session).
+    for (uri, text) in [(&a_uri, a_uses_b), (&b_uri, b_good)] {
+        let escaped = json_escape(text);
+        send(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"java","version":1,"text":"{escaped}"}}}}}}"#
+        ));
+    }
+
+    // Phase 1: scoped check of mod-a. B resolves via -sourcepath → 0 errors.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{a_uri}"]}}]}}}}"#
+    ));
+    let raw = read_until(&mut reader, "\"id\":2", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-1 result");
+    assert_eq!(json["result"]["status"], "ok", "phase 1 status: {raw}");
+    assert_eq!(json["result"]["scope"], "modules", "phase 1 must be scoped: {raw}");
+    assert_eq!(
+        json["result"]["errorCount"], 0,
+        "sibling must resolve via -sourcepath (0 errors): {raw}"
+    );
+
+    // Phase 2: break B (a type error in its body), keep A referencing it, and
+    // re-check ONLY mod-a. javac loads B via -sourcepath, flags it → external
+    // scope → the run falls back to a full project check.
+    let b_broken = "package b;\npublic class B {\n    public void hello() {\n        int x = \"nope\";\n    }\n}\n";
+    std::fs::write(&b_path, b_broken).expect("rewrite B broken");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{a_uri}"]}}]}}}}"#
+    ));
+    let raw = read_until(&mut reader, "\"id\":3", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-2 result");
+    assert_eq!(json["result"]["status"], "ok", "phase 2 status: {raw}");
+    assert!(
+        json["result"].get("scope").is_none(),
+        "an external-scope error must fall back to a FULL project check (no scope field): {raw}"
+    );
+    assert!(
+        json["result"]["errorCount"].as_u64().unwrap_or(0) >= 1,
+        "the fallback full check must report B's error: {raw}"
+    );
+
+    // Phase 3: make A and B broken *independently* (A no longer references B),
+    // full-check to flag both, then fix A and scoped-check it.
+    let a_broken_independent =
+        "package a;\npublic class A {\n    void m() {\n        int y = \"bad\";\n    }\n}\n";
+    std::fs::write(&a_path, a_broken_independent).expect("rewrite A broken");
+    // Keep B broken (independent). Sync the open buffers to the new disk text so
+    // the syntax tier isn't stale (javac still reads disk regardless).
+    for (uri, text) in [(&a_uri, a_broken_independent), (&b_uri, b_broken)] {
+        let escaped = json_escape(text);
+        send(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":2}},"contentChanges":[{{"text":"{escaped}"}}]}}}}"#
+        ));
+    }
+
+    // Full project check → both modules flagged (manual check spans modules).
+    send(
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[{"scope":"project"}]}}"#,
+    );
+    let raw = read_until(&mut reader, "\"id\":4", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-3 full result");
+    assert_eq!(json["result"]["status"], "ok", "phase 3 full status: {raw}");
+    assert!(
+        json["result"]["errorCount"].as_u64().unwrap_or(0) >= 2,
+        "a full project check must flag BOTH modules: {raw}"
+    );
+
+    // Fix A on disk; scoped-check mod-a only. A is now clean and does not
+    // reference B, so there is no external error and no fallback: A's diagnostic
+    // clears while B's is preserved untouched.
+    let a_fixed = "package a;\npublic class A {\n    void m() {}\n}\n";
+    std::fs::write(&a_path, a_fixed).expect("fix A");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{a_uri}"]}}]}}}}"#
+    ));
+    let raw = read_until(&mut reader, "\"id\":5", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-3 scoped result");
+    assert_eq!(json["result"]["scope"], "modules", "phase 3 scoped result: {raw}");
+    assert_eq!(
+        json["result"]["errorCount"], 0,
+        "fixed module A must be clean: {raw}"
+    );
+
+    // Verify preservation/clearing deterministically: a classpath rebuild
+    // republishes every open document's diagnostics straight from the server's
+    // javac map WITHOUT recompiling — so B (untouched by the module-A scoped
+    // check) still carries its javac error, and A (cleared) does not.
+    let mark = seen.len();
+    send(
+        r#"{"jsonrpc":"2.0","id":6,"method":"workspace/executeCommand","params":{"command":"jvl.classpath.rebuild","arguments":[]}}"#,
+    );
+    // Collect frames until the response and both open-doc republishes are in
+    // hand (their wire order relative to the response is not guaranteed).
+    loop {
+        let slice = &seen[mark..];
+        let have_resp = slice.iter().any(|f| f.contains("\"id\":6"));
+        let have_a = slice
+            .iter()
+            .any(|f| f.contains(&a_uri) && f.contains("publishDiagnostics"));
+        let have_b = slice
+            .iter()
+            .any(|f| f.contains(&b_uri) && f.contains("publishDiagnostics"));
+        if have_resp && have_a && have_b {
+            break;
+        }
+        match read_frame(&mut reader) {
+            Some(f) => seen.push(f),
+            None => break,
+        }
+    }
+    let b_frame = seen[mark..]
+        .iter()
+        .find(|f| f.contains(&b_uri) && f.contains("publishDiagnostics"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        b_frame.contains("\"source\":\"javac\""),
+        "module B's diagnostic must be preserved by a module-A scoped check: {b_frame}"
+    );
+    let a_frame = seen[mark..]
+        .iter()
+        .find(|f| f.contains(&a_uri) && f.contains("publishDiagnostics"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !a_frame.contains("\"source\":\"javac\""),
+        "module A's diagnostic must have been cleared by its clean scoped recheck: {a_frame}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

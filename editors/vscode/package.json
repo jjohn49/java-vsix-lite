@@ -3,7 +3,7 @@
   "displayName": "java-vsix-lite",
   "description": "Minimal, low-compute Java language support for VS Code (pure-Rust default tier; optional opt-in javac tier).",
   "icon": "icon.png",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "java-vsix-lite",
   "license": "MIT",
   "repository": {
@@ -131,7 +131,7 @@
         "java-vsix-lite.javac.checkOnSave": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Run `Check Project (javac)` automatically when the project loads and after saving a Java file, publishing real compiler errors to Problems. Debounced, one run at a time, and silent (no pop-ups — results land in Problems only). Only active in a **trusted** workspace, because it spawns the JDK's `javac`; in an untrusted workspace saves never trigger it. Uses the same JDK resolution and timeout as the manual command."
+          "markdownDescription": "Run a background `javac` check automatically when the project loads and after saving a Java file, publishing real compiler errors to Problems. These automatic checks are **module-scoped**: only the Maven/Gradle module(s) owning the saved file(s) are compiled (sibling-module sources are still resolved, via `-sourcepath`), so unrelated modules aren't recompiled on every save. The manual **Java: Check Project (javac)** command remains a full-workspace check. Debounced, one run at a time, and silent (no pop-ups — results land in Problems only). Only active in a **trusted** workspace, because it spawns the JDK's `javac`; in an untrusted workspace saves never trigger it. Uses the same JDK resolution and timeout as the manual command."
         },
         "java-vsix-lite.dependencies.repository": {
           "type": "string",
@@ -172,6 +172,11 @@
       {
         "command": "java-vsix-lite.checkProject",
         "title": "Check Project (javac)",
+        "category": "java-vsix-lite"
+      },
+      {
+        "command": "java-vsix-lite.rebuildClasspath",
+        "title": "Rebuild Classpath (Refresh IntelliSense)",
         "category": "java-vsix-lite"
       },
       {

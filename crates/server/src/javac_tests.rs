@@ -252,6 +252,7 @@ fn run_kills_and_reaps_on_timeout() {
         javac_path: script,
         source_files: vec![],
         classpath_entries: vec![],
+        sourcepath_entries: vec![],
         timeout: Duration::from_secs(1),
         source_level: SourceLevel::None,
     };
@@ -296,6 +297,7 @@ fn kill_running_child_cancels_an_in_flight_run() {
         javac_path: script,
         source_files: vec![],
         classpath_entries: vec![],
+        sourcepath_entries: vec![],
         timeout: Duration::from_secs(30), // long enough that only the kill ends it
         source_level: SourceLevel::None,
     };
@@ -365,6 +367,7 @@ fn leaked_reader_cap_refuses_further_runs() {
             javac_path: PathBuf::from("/nonexistent/javac-never-spawned"),
             source_files: vec![],
             classpath_entries: vec![],
+            sourcepath_entries: vec![],
             timeout: Duration::from_millis(200),
             source_level: SourceLevel::None,
         },
@@ -391,6 +394,7 @@ fn leaked_reader_cap_refuses_further_runs() {
             javac_path: PathBuf::from("/nonexistent/javac-never-spawned"),
             source_files: vec![],
             classpath_entries: vec![],
+            sourcepath_entries: vec![],
             timeout: Duration::from_millis(200),
             source_level: SourceLevel::None,
         },
@@ -423,6 +427,7 @@ fn classpath_entry_with_separator_fails_loud() {
             PathBuf::from("/deps/fine.jar"),
             PathBuf::from("/deps/evil:name.jar"),
         ],
+        sourcepath_entries: vec![],
         timeout: Duration::from_secs(10),
         source_level: SourceLevel::None,
     };
@@ -438,4 +443,141 @@ fn classpath_entry_with_separator_fails_loud() {
         }
         _ => panic!("expected a loud SpawnError for the unjoinable classpath entry"),
     }
+}
+
+/// A unique temp directory for the module-resolution tests, canonicalized so
+/// comparisons against `nearest_module_root`'s canonicalized inputs hold on
+/// platforms where the temp dir is itself behind a symlink (macOS `/var`).
+fn module_test_root(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "jvl-module-{}-{}-{:?}",
+        label,
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::canonicalize(&dir).unwrap()
+}
+
+#[test]
+fn nearest_module_root_selects_deepest_nested_module() {
+    let ws = module_test_root("nearest");
+    // ws/ (pom.xml)  ->  ws/mod-a/ (pom.xml)  ->  a file deep inside mod-a
+    std::fs::write(ws.join("pom.xml"), "<project/>").unwrap();
+    let module = ws.join("mod-a");
+    let src = module.join("src/main/java/demo");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(module.join("pom.xml"), "<project/>").unwrap();
+    let file = src.join("Foo.java");
+    std::fs::write(&file, "package demo; class Foo {}").unwrap();
+
+    // The nearest module wins (mod-a), not the outer workspace pom.
+    assert_eq!(nearest_module_root(&file, &ws), Some(module.clone()));
+
+    // A file directly under the outer project (no nested module) resolves to ws.
+    let outer_src = ws.join("src/main/java");
+    std::fs::create_dir_all(&outer_src).unwrap();
+    let outer_file = outer_src.join("Bar.java");
+    std::fs::write(&outer_file, "class Bar {}").unwrap();
+    assert_eq!(nearest_module_root(&outer_file, &ws), Some(ws.clone()));
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn nearest_module_root_none_without_build_file() {
+    let ws = module_test_root("no-marker");
+    let src = ws.join("src/main/java");
+    std::fs::create_dir_all(&src).unwrap();
+    let file = src.join("Loose.java");
+    std::fs::write(&file, "class Loose {}").unwrap();
+    // No pom.xml / build.gradle anywhere up to the workspace root.
+    assert_eq!(nearest_module_root(&file, &ws), None);
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn nearest_module_root_never_walks_above_workspace() {
+    // A build file ABOVE the workspace root must not be selected — the walk
+    // stops at the workspace boundary.
+    let outer = module_test_root("boundary");
+    std::fs::write(outer.join("pom.xml"), "<project/>").unwrap();
+    let ws = outer.join("inner");
+    let src = ws.join("src/main/java");
+    std::fs::create_dir_all(&src).unwrap();
+    let file = src.join("Inner.java");
+    std::fs::write(&file, "class Inner {}").unwrap();
+    // ws has no build file; the outer pom is above the boundary → None.
+    assert_eq!(nearest_module_root(&file, &ws), None);
+    std::fs::remove_dir_all(&outer).ok();
+}
+
+#[test]
+fn canonical_within_workspace_accepts_inside_rejects_outside() {
+    let ws = module_test_root("within");
+    let inside = ws.join("Inside.java");
+    std::fs::write(&inside, "class Inside {}").unwrap();
+    assert_eq!(
+        canonical_within_workspace(&inside, &ws),
+        Some(std::fs::canonicalize(&inside).unwrap())
+    );
+
+    // A sibling directory outside the workspace is rejected.
+    let outside_root = module_test_root("within-outside");
+    let outside = outside_root.join("Outside.java");
+    std::fs::write(&outside, "class Outside {}").unwrap();
+    assert_eq!(canonical_within_workspace(&outside, &ws), None);
+
+    // A nonexistent path canonicalizes to None (never a path-string guess).
+    assert_eq!(canonical_within_workspace(&ws.join("Ghost.java"), &ws), None);
+
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside_root).ok();
+}
+
+/// A symlink whose real target escapes the workspace must be rejected — the
+/// scoped-check counterpart to the walker's "never follow symlinks" rule.
+#[cfg(unix)]
+#[test]
+fn canonical_within_workspace_rejects_symlink_escape() {
+    let ws = module_test_root("symlink-ws");
+    let secret_root = module_test_root("symlink-secret");
+    let secret = secret_root.join("Secret.java");
+    std::fs::write(&secret, "class Secret {}").unwrap();
+
+    // ws/escape.java -> ../symlink-secret/Secret.java (outside the workspace)
+    let link = ws.join("escape.java");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    // The literal path is under ws, but its real target is not → rejected.
+    assert_eq!(canonical_within_workspace(&link, &ws), None);
+
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&secret_root).ok();
+}
+
+#[test]
+fn discover_workspace_source_roots_finds_every_module() {
+    let ws = module_test_root("discover");
+    // Root module + two nested modules, each with main/test source roots.
+    std::fs::write(ws.join("pom.xml"), "<project/>").unwrap();
+    std::fs::create_dir_all(ws.join("src/main/java")).unwrap();
+    std::fs::create_dir_all(ws.join("src/test/java")).unwrap();
+    for m in ["mod-a", "mod-b"] {
+        let module = ws.join(m);
+        std::fs::create_dir_all(module.join("src/main/java")).unwrap();
+        std::fs::write(module.join("pom.xml"), "<project/>").unwrap();
+    }
+    // Build output must be skipped, not descended into.
+    std::fs::create_dir_all(ws.join("target/classes")).unwrap();
+
+    let roots = discover_workspace_source_roots(&ws);
+    assert!(roots.contains(&ws.join("src/main/java")), "root main: {roots:?}");
+    assert!(roots.contains(&ws.join("src/test/java")), "root test: {roots:?}");
+    assert!(roots.contains(&ws.join("mod-a/src/main/java")), "mod-a: {roots:?}");
+    assert!(roots.contains(&ws.join("mod-b/src/main/java")), "mod-b: {roots:?}");
+    // A module's absent test root is simply not listed (only existing dirs).
+    assert!(!roots.contains(&ws.join("mod-a/src/test/java")));
+
+    std::fs::remove_dir_all(&ws).ok();
 }

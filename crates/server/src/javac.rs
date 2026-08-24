@@ -50,6 +50,38 @@ use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, Position, Range
 /// `server_commands_do_not_collide_with_extension_commands` lifecycle test.
 pub(crate) const CHECK_PROJECT_COMMAND: &str = "jvl.checkProject.run";
 
+/// The scope of one check run, decoded from the `executeCommand` argument.
+///
+/// - `Project` — the manual `Java: Check Project (javac)` command: the entire
+///   workspace, exactly as it has always worked (also the backward-compatible
+///   default when no/empty arguments are sent).
+/// - `Modules` — the automatic on-save/on-load check: compile only the
+///   modules owning the given saved documents. `document_uris` must be
+///   non-empty and every entry a valid in-workspace `file:` `.java` URI;
+///   a malformed or empty `Modules` request is an error and is NEVER silently
+///   widened into a project-wide compilation (see `Backend::run_check_scoped`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JavacCheckScope {
+    Project,
+    Modules { document_uris: Vec<String> },
+}
+
+/// Build-file names that mark a directory as a Maven/Gradle module root — the
+/// anchors a scoped check walks upward to find (`settings.gradle*` is
+/// deliberately excluded: it marks the *root* of a multi-module Gradle build,
+/// not an individual compilable module).
+const MODULE_MARKERS: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
+
+/// Conventional source-root subdirectories under a module root.
+const CONVENTIONAL_SOURCE_SUBDIRS: [&str; 2] = ["src/main/java", "src/test/java"];
+
+/// Hard cap on directories visited while scanning the workspace for module
+/// source roots to feed `-sourcepath` (see [`discover_workspace_source_roots`]).
+/// This is a *directory-only* walk (never collecting `.java` files), so the
+/// cap is generous; it exists solely so a pathological tree can't turn the
+/// scan into unbounded work.
+const MAX_MODULE_SCAN_DIRS: usize = 50_000;
+
 /// Hard cap on how many source files a single check run will feed to
 /// `javac` — bounds both the argfile size and the compile time. A project
 /// this large is pathological for a one-shot IDE check; the run still
@@ -170,6 +202,105 @@ fn walk_for_java_files(root: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Canonicalize `file` and accept it only if it stays inside
+/// `workspace_root_canonical` (itself already canonicalized by the caller).
+///
+/// Canonicalization resolves every symlink in the path, so a symlink whose
+/// real target escapes the workspace is rejected here — the scoped-check
+/// counterpart to [`walk_for_java_files`]'s "never follow symlinks" rule.
+/// `None` for a nonexistent file, a canonicalization failure, or a real path
+/// outside the workspace.
+pub(crate) fn canonical_within_workspace(
+    file: &Path,
+    workspace_root_canonical: &Path,
+) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(file).ok()?;
+    canonical
+        .starts_with(workspace_root_canonical)
+        .then_some(canonical)
+}
+
+/// Walk upward from `file`'s directory to `workspace_root` (inclusive),
+/// returning the nearest ancestor directory that contains a [`MODULE_MARKERS`]
+/// build file — the Maven/Gradle module owning `file`. Both `file` and
+/// `workspace_root` are expected already-canonicalized (see
+/// [`canonical_within_workspace`]). `None` when no build file is found up to
+/// and including the workspace root (an unconventional layout — the caller
+/// decides whether the workspace-root source-layout fallback applies).
+pub(crate) fn nearest_module_root(file: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if MODULE_MARKERS.iter().any(|m| d.join(m).is_file()) {
+            return Some(d.to_path_buf());
+        }
+        if d == workspace_root {
+            break; // never walk above the workspace root
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The conventional source roots (`src/main/java`, `src/test/java`) under
+/// `module_root` that actually exist on disk. Used both to build a scoped
+/// run's explicit inputs and to test whether a file sits under a "discovered
+/// source root" for the no-build-file workspace-root fallback.
+pub(crate) fn conventional_source_roots(module_root: &Path) -> Vec<PathBuf> {
+    CONVENTIONAL_SOURCE_SUBDIRS
+        .iter()
+        .map(|sub| module_root.join(sub))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Scan the workspace for every module's conventional source roots, to feed
+/// `javac -sourcepath` so a scoped compile can load sibling-module sources on
+/// demand *without* compiling them eagerly. A bounded, **directory-only** walk
+/// (it never enumerates `.java` files): it descends the tree — skipping
+/// `target/`/`build/`/`.git`, hidden dirs, and symlinks, exactly like
+/// [`walk_for_java_files`] — and, at the workspace root and at every directory
+/// bearing a [`MODULE_MARKERS`] build file, adds the `src/main/java` /
+/// `src/test/java` roots that exist there. Deduplicated; capped at
+/// [`MAX_MODULE_SCAN_DIRS`] directories.
+pub(crate) fn discover_workspace_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![workspace_root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        if visited >= MAX_MODULE_SCAN_DIRS {
+            break;
+        }
+        visited += 1;
+        let is_module = dir == workspace_root || MODULE_MARKERS.iter().any(|m| dir.join(m).is_file());
+        if is_module {
+            for root in conventional_source_roots(&dir) {
+                if seen.insert(root.clone()) {
+                    roots.push(root);
+                }
+            }
+        }
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name_str.as_ref()) {
+                continue;
+            }
+            stack.push(entry.path());
+        }
+    }
+    roots
 }
 
 /// One diagnostic parsed out of `javac`'s stderr — see [`parse_stderr`].
@@ -414,6 +545,11 @@ pub(crate) struct RunConfig {
     pub javac_path: PathBuf,
     pub source_files: Vec<PathBuf>,
     pub classpath_entries: Vec<PathBuf>,
+    /// `-sourcepath` roots: sibling-module source directories a scoped compile
+    /// may load on demand *without* being compiled eagerly (empty for a
+    /// project-wide check, which lists every file as an explicit input). See
+    /// [`discover_workspace_source_roots`].
+    pub sourcepath_entries: Vec<PathBuf>,
     pub timeout: Duration,
     /// The language level to compile at — see [`SourceLevel`]. Class files are
     /// discarded, so these flags only steer which diagnostics `javac` emits.
@@ -618,6 +754,31 @@ fn run_in_scratch(
                         p.display()
                     ),
                     None => "classpath entries cannot be joined for javac -cp".to_string(),
+                });
+            }
+        }
+    }
+    // `-sourcepath` (scoped checks only): let javac resolve sibling-module
+    // sources on demand. Same fail-loud join handling as `-cp` — a dropped
+    // sourcepath would silently reintroduce the cross-module false positives
+    // this whole mechanism exists to avoid.
+    if !config.sourcepath_entries.is_empty() {
+        match std::env::join_paths(&config.sourcepath_entries) {
+            Ok(joined) => {
+                cmd.arg("-sourcepath").arg(joined);
+            }
+            Err(_) => {
+                let offender = config
+                    .sourcepath_entries
+                    .iter()
+                    .find(|p| std::env::join_paths(std::iter::once(*p)).is_err());
+                return RunOutcome::SpawnError(match offender {
+                    Some(p) => format!(
+                        "source-root entry contains the platform path-list separator and cannot \
+                         be passed to javac -sourcepath: {}",
+                        p.display()
+                    ),
+                    None => "source-root entries cannot be joined for javac -sourcepath".to_string(),
                 });
             }
         }

@@ -4,7 +4,7 @@
 //! check-project orchestration that merges compiler diagnostics in.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::*;
 
 use crate::backend::{Backend, Document};
 use crate::javac;
-use crate::{filename_from_uri, open_docs, ClasspathSymbols};
+use crate::{filename_from_uri, infer_source_root, open_docs, ClasspathSymbols};
 
 /// RAII guard releasing `Backend::javac_running` on drop — see
 /// `Backend::execute_command`.
@@ -23,6 +23,58 @@ impl Drop for JavacRunningGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// The result of the shared javac-invocation machinery ([`Backend::execute_javac_check`]),
+/// letting the project- and module-scoped callers decide how to publish.
+enum CheckExecution {
+    /// A terminal JSON result to return to the client verbatim (javac not
+    /// found, timed out, cancelled, spawn error, jdk-too-old, or "no sources").
+    Terminal(serde_json::Value),
+    /// `javac` completed; here are its parsed/grouped diagnostics (keyed by the
+    /// path `javac` echoed) and severity counts, for the caller to publish.
+    Completed {
+        grouped: HashMap<String, Vec<Diagnostic>>,
+        error_count: usize,
+        warning_count: usize,
+    },
+}
+
+/// Parse an LSP document URI into a `file:` filesystem path that ends in
+/// `.java`. Uses the URI type's own parser (never manual string surgery) so
+/// percent-encoding and platform path shapes are handled correctly. `None`
+/// for a non-`file:` URI or one that doesn't name a `.java` file.
+fn parse_java_file_uri(uri_str: &str) -> Option<PathBuf> {
+    let uri: Uri = uri_str.parse().ok()?;
+    let path = uri.to_file_path()?.into_owned();
+    path.extension().is_some_and(|e| e == "java").then_some(path)
+}
+
+/// Whether `path` lives under any of `module_roots`. Checks the literal path
+/// first, then the canonicalized path — so a path keyed non-canonically (e.g.
+/// macOS `/var` vs the canonical `/private/var`, as a prior full-project run's
+/// stored diagnostics may be) is still recognized as belonging to a checked
+/// module. A missing/unreadable path falls back to the literal check only (it
+/// can't escape via a symlink if it doesn't resolve).
+fn path_under_any_module(path: &Path, module_roots: &[PathBuf]) -> bool {
+    if module_roots.iter().any(|m| path.starts_with(m)) {
+        return true;
+    }
+    std::fs::canonicalize(path)
+        .map(|canon| module_roots.iter().any(|m| canon.starts_with(m)))
+        .unwrap_or(false)
+}
+
+/// [`path_under_any_module`] for a document URI key — parses the `file:` URI to
+/// a path first; `false` for a non-`file:` URI.
+fn uri_is_under_module(uri_str: &str, module_roots: &[PathBuf]) -> bool {
+    let Ok(uri) = uri_str.parse::<Uri>() else {
+        return false;
+    };
+    let Some(path) = uri.to_file_path() else {
+        return false;
+    };
+    path_under_any_module(path.as_ref(), module_roots)
 }
 
 impl Backend {
@@ -114,42 +166,237 @@ impl Backend {
     /// extension's trust-gated `java-vsix-lite.checkProject`) — see the module
     /// doc comment on `javac` for the security invariants this must never
     /// violate.
+    ///
+    /// `scope` selects the whole workspace (the manual command — unchanged
+    /// behavior, full diagnostic-map replacement) or a set of saved documents'
+    /// modules (the automatic on-save/on-load check — compiles only affected
+    /// modules with sibling sources reachable via `-sourcepath`, and replaces
+    /// diagnostics only within those modules). See [`javac::JavacCheckScope`].
+    ///
     /// Concurrency (one run at a time) is enforced by the caller
     /// (`execute_command`), which claims `javac_running` before calling this
     /// and releases it afterward; this method assumes that's already done.
-    pub(crate) async fn run_check_project(&self) -> serde_json::Value {
+    pub(crate) async fn run_check_project(
+        &self,
+        scope: javac::JavacCheckScope,
+    ) -> serde_json::Value {
+        match scope {
+            javac::JavacCheckScope::Project => self.run_check_full_project().await,
+            javac::JavacCheckScope::Modules { document_uris } => {
+                self.run_check_scoped(document_uris).await
+            }
+        }
+    }
+
+    /// The full-workspace check: every discovered source root compiled as one
+    /// explicit input set, replacing the entire javac diagnostic map. This is
+    /// the manual `Java: Check Project (javac)` behavior, unchanged.
+    async fn run_check_full_project(&self) -> serde_json::Value {
         let Some(project_root) = self.project_root() else {
             return serde_json::json!({
                 "status": "error",
                 "message": "no project root (open a workspace folder or a file under a Maven/Gradle project)",
             });
         };
-
-        let javac_path = match javac::locate_javac(
-            self.jdk_home_override.get().and_then(|o| o.as_deref()),
-        ) {
-            Some(path) => path,
-            None => {
-                return serde_json::json!({
-                    "status": "javac-not-found",
-                    "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
-                });
-            }
-        };
-
         let classpath = self.classpath();
-        let roots = {
+        let mut roots = {
             let docs = self.documents.lock().await;
             let mut roots = self.source_roots(&docs, &project_root);
             roots.extend(classpath.source_roots().iter().cloned());
             roots
         };
-        let source_files = javac::collect_source_files(&roots);
-        if source_files.is_empty() {
+        // Cover every Maven/Gradle module in the workspace, not just the root
+        // module + currently-open files — so a full-workspace check is actually
+        // complete on a multi-module project (and the scoped-check fallback that
+        // routes here is authoritative). `collect_source_files` dedups roots.
+        // Uses the project root as-is (not canonicalized): the paths must stay
+        // in the same space as the client's document URIs so published
+        // diagnostics attach to the right files.
+        roots.extend(javac::discover_workspace_source_roots(&project_root));
+        match self
+            .execute_javac_check(&project_root, roots, Vec::new())
+            .await
+        {
+            CheckExecution::Terminal(value) => value,
+            CheckExecution::Completed {
+                grouped,
+                error_count,
+                warning_count,
+            } => {
+                // Whole-project run: the map is authoritative for every file.
+                self.publish_javac_diagnostics(grouped).await;
+                serde_json::json!({
+                    "status": "ok",
+                    "errorCount": error_count,
+                    "warningCount": warning_count,
+                })
+            }
+        }
+    }
+
+    /// The scoped (automatic) check: resolve each saved document to its
+    /// Maven/Gradle module, compile only those modules (with every workspace
+    /// source root on `-sourcepath` so sibling sources resolve without being
+    /// compiled eagerly), and replace javac diagnostics only within the
+    /// checked modules. A malformed/empty request is an error — never widened
+    /// into a project compile — and a compiler diagnostic against a file
+    /// *outside* the checked modules means the scoped view is incomplete, so
+    /// the run transparently falls back to one full-project check.
+    async fn run_check_scoped(&self, document_uris: Vec<String>) -> serde_json::Value {
+        if document_uris.is_empty() {
             return serde_json::json!({
                 "status": "error",
-                "message": "no .java source files found under the discovered source roots",
+                "message": "scoped check requires at least one document URI",
             });
+        }
+        let Some(project_root) = self.project_root() else {
+            return serde_json::json!({
+                "status": "error",
+                "message": "no project root (open a workspace folder or a file under a Maven/Gradle project)",
+            });
+        };
+        // Canonicalized workspace root — used ONLY for the security containment
+        // check (which must resolve symlinks). Module resolution, source
+        // collection, and diagnostic keying all use the *original* path space
+        // so published diagnostics attach to the client's document URIs.
+        let Ok(workspace_canonical) = std::fs::canonicalize(&project_root) else {
+            return serde_json::json!({
+                "status": "error",
+                "message": "could not canonicalize the workspace root",
+            });
+        };
+
+        // Resolve every saved document to an in-workspace `.java` file and the
+        // module that owns it. Any invalid/outside URI is a hard error (never
+        // silently widened to a project compile).
+        let mut module_roots: Vec<PathBuf> = Vec::new();
+        let mut explicit_roots: Vec<PathBuf> = Vec::new();
+        {
+            let docs = self.documents.lock().await;
+            for uri_str in &document_uris {
+                let Some(file) = parse_java_file_uri(uri_str) else {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": format!("not a file: .java URI: {uri_str}"),
+                    });
+                };
+                // Security gate only: reject anything whose real (symlink-
+                // resolved) path escapes the workspace. The canonical result is
+                // deliberately NOT used for resolution below.
+                if javac::canonical_within_workspace(&file, &workspace_canonical).is_none() {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": format!("document is outside the workspace or unreadable: {uri_str}"),
+                    });
+                }
+
+                let module_root = match javac::nearest_module_root(&file, &project_root) {
+                    Some(root) => root,
+                    None => {
+                        // No build marker up to the workspace root: fall back to
+                        // the workspace root only if the file sits under a
+                        // conventional source root there; otherwise it's an
+                        // unsupported layout for a scoped check.
+                        let src_roots = javac::conventional_source_roots(&project_root);
+                        if src_roots.iter().any(|r| file.starts_with(r)) {
+                            project_root.clone()
+                        } else {
+                            return serde_json::json!({
+                                "status": "unsupported-layout",
+                                "message": format!(
+                                    "{uri_str} is not inside a Maven/Gradle module or a conventional source root; use Check Project (javac) instead"
+                                ),
+                            });
+                        }
+                    }
+                };
+
+                if !module_roots.contains(&module_root) {
+                    module_roots.push(module_root.clone());
+                    explicit_roots.extend(javac::conventional_source_roots(&module_root));
+                }
+                // A nonstandard-layout file may sit outside src/main|test/java:
+                // add its confidently inferred source root too, but only when it
+                // stays inside this module so a scoped compile can't pull in
+                // unrelated trees.
+                if let Some(doc) = docs.get(uri_str) {
+                    if let Some(inferred) = infer_source_root(uri_str, &doc.tree, &doc.text) {
+                        if inferred.starts_with(&module_root)
+                            && !explicit_roots.contains(&inferred)
+                        {
+                            explicit_roots.push(inferred);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sibling-module sources on `-sourcepath`: a bounded, directory-only
+        // scan for module source roots, plus any dependency source roots.
+        let classpath = self.classpath();
+        let mut sourcepath_roots = javac::discover_workspace_source_roots(&project_root);
+        sourcepath_roots.extend(classpath.source_roots().iter().cloned());
+
+        match self
+            .execute_javac_check(&project_root, explicit_roots, sourcepath_roots)
+            .await
+        {
+            CheckExecution::Terminal(value) => value,
+            CheckExecution::Completed {
+                grouped,
+                error_count,
+                warning_count,
+            } => {
+                // If javac flagged a source outside the checked modules (a
+                // sibling reached through -sourcepath), the scoped result is
+                // incomplete — never publish a partial/misleading result.
+                // Redo the run as a full project check instead.
+                let external = grouped
+                    .keys()
+                    .any(|path| !path_under_any_module(Path::new(path), &module_roots));
+                if external {
+                    return self.run_check_full_project().await;
+                }
+                self.publish_javac_diagnostics_scoped(grouped, &module_roots)
+                    .await;
+                serde_json::json!({
+                    "status": "ok",
+                    "scope": "modules",
+                    "errorCount": error_count,
+                    "warningCount": warning_count,
+                })
+            }
+        }
+    }
+
+    /// Shared javac-invocation core for both scopes: locate `javac`, collect
+    /// the explicit source files from `explicit_roots`, apply the JDK/project
+    /// source-level and jdk-too-old guard (keyed off `release_root`), run the
+    /// compiler with `sourcepath_roots` on `-sourcepath`, and parse the result.
+    /// Publishing is left to the caller (project- vs module-scoped).
+    async fn execute_javac_check(
+        &self,
+        release_root: &Path,
+        explicit_roots: Vec<PathBuf>,
+        sourcepath_roots: Vec<PathBuf>,
+    ) -> CheckExecution {
+        let javac_path =
+            match javac::locate_javac(self.jdk_home_override.get().and_then(|o| o.as_deref())) {
+                Some(path) => path,
+                None => {
+                    return CheckExecution::Terminal(serde_json::json!({
+                        "status": "javac-not-found",
+                        "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
+                    }));
+                }
+            };
+
+        let source_files = javac::collect_source_files(&explicit_roots);
+        if source_files.is_empty() {
+            return CheckExecution::Terminal(serde_json::json!({
+                "status": "error",
+                "message": "no .java source files found under the discovered source roots",
+            }));
         }
 
         // JDK level: the JDK home is `<home>/bin/javac`; read its feature
@@ -159,7 +406,7 @@ impl Backend {
             .parent()
             .and_then(|bin| bin.parent())
             .and_then(jvl_classpath::jdk_feature_version);
-        let project_release = jvl_classpath::project_java_release(&project_root);
+        let project_release = jvl_classpath::project_java_release(release_root);
 
         // If the project targets a newer Java than the newest detected JDK,
         // javac can't compile it and would emit a flood of "not supported in
@@ -167,13 +414,13 @@ impl Backend {
         // skip the run entirely.
         if let (Some(proj), Some(jdk)) = (project_release, jdk_release) {
             if jdk < proj {
-                self.publish_jdk_too_old(&project_root, proj, jdk).await;
-                return serde_json::json!({
+                self.publish_jdk_too_old(release_root, proj, jdk).await;
+                return CheckExecution::Terminal(serde_json::json!({
                     "status": "jdk-too-old",
                     "message": format!(
                         "project targets Java {proj} but the newest detected JDK is {jdk}; javac check skipped"
                     ),
-                });
+                }));
             }
         }
 
@@ -189,10 +436,12 @@ impl Backend {
             (None, Some(jdk)) => javac::SourceLevel::JdkDefault(jdk),
             (_, None) => javac::SourceLevel::None,
         };
+        let classpath = self.classpath();
         let config = javac::RunConfig {
             javac_path,
             source_files,
             classpath_entries: classpath.entries().to_vec(),
+            sourcepath_entries: sourcepath_roots,
             timeout: self.javac_timeout(),
             source_level,
         };
@@ -205,28 +454,27 @@ impl Backend {
             });
 
         match outcome {
-            javac::RunOutcome::TimedOut => serde_json::json!({
+            javac::RunOutcome::TimedOut => CheckExecution::Terminal(serde_json::json!({
                 "status": "timeout",
                 "message": format!("javac timed out after {}s and was killed", self.javac_timeout().as_secs()),
-            }),
-            javac::RunOutcome::Cancelled => serde_json::json!({
+            })),
+            javac::RunOutcome::Cancelled => CheckExecution::Terminal(serde_json::json!({
                 "status": "cancelled",
                 "message": "javac was killed by server shutdown",
-            }),
-            javac::RunOutcome::SpawnError(message) => serde_json::json!({
+            })),
+            javac::RunOutcome::SpawnError(message) => CheckExecution::Terminal(serde_json::json!({
                 "status": "spawn-error",
                 "message": message,
-            }),
+            })),
             javac::RunOutcome::Completed { stderr } => {
                 let raw = javac::parse_stderr(&stderr);
                 let (error_count, warning_count) = javac::count_severities(&raw);
                 let grouped = javac::group_diagnostics(raw);
-                self.publish_javac_diagnostics(grouped).await;
-                serde_json::json!({
-                    "status": "ok",
-                    "errorCount": error_count,
-                    "warningCount": warning_count,
-                })
+                CheckExecution::Completed {
+                    grouped,
+                    error_count,
+                    warning_count,
+                }
             }
         }
     }
@@ -301,6 +549,73 @@ impl Backend {
         // every affected URI's diagnostics are computed into an owned
         // snapshot under a single `documents` lock hold, which is then
         // dropped before the `publish_diagnostics` `.await`s below.
+        let snapshot: Vec<(String, Vec<Diagnostic>)> = {
+            let docs = self.documents.lock().await;
+            affected
+                .into_iter()
+                .map(|uri_str| {
+                    let diagnostics = self.compute_diagnostics(&docs, &uri_str);
+                    (uri_str, diagnostics)
+                })
+                .collect()
+        };
+
+        for (uri_str, diagnostics) in snapshot {
+            if let Ok(uri) = uri_str.parse::<Uri>() {
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+            }
+        }
+    }
+
+    /// Scoped counterpart to [`Self::publish_javac_diagnostics`]: replace the
+    /// javac diagnostics only for files **beneath `module_roots`**, preserving
+    /// every other module's diagnostics untouched.
+    ///
+    /// Existing entries under a checked module root are dropped (this run is
+    /// authoritative for them); `new_diags` are inserted; any dropped file not
+    /// re-added was clean this run and is republished empty-of-javac so it
+    /// clears in Problems. Only files inside the checked modules are ever
+    /// republished — no diagnostics are touched outside the requested scope.
+    async fn publish_javac_diagnostics_scoped(
+        &self,
+        new_diags: HashMap<String, Vec<Diagnostic>>,
+        module_roots: &[PathBuf],
+    ) {
+        let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
+            .into_iter()
+            .filter_map(|(path, diags)| {
+                Uri::from_file_path(Path::new(&path)).map(|uri| (uri.as_str().to_string(), diags))
+            })
+            .collect();
+
+        let affected: Vec<String> = {
+            let mut map = self
+                .javac_diagnostics
+                .lock()
+                .expect("javac diagnostics poisoned");
+            let mut affected: HashSet<String> = HashSet::new();
+            // Drop prior diagnostics for files inside the checked modules —
+            // recording each as affected so a now-clean file is republished
+            // (and thereby cleared). Other modules' entries are retained.
+            map.retain(|uri_str, _| {
+                if uri_is_under_module(uri_str, module_roots) {
+                    affected.insert(uri_str.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            // Insert this run's diagnostics (each also affected), overwriting.
+            for (uri_str, diags) in new_map {
+                affected.insert(uri_str.clone());
+                map.insert(uri_str, diags);
+            }
+            affected.into_iter().collect()
+        };
+
+        // Same lock-once-then-publish shape as `publish_javac_diagnostics`.
         let snapshot: Vec<(String, Vec<Diagnostic>)> = {
             let docs = self.documents.lock().await;
             affected
