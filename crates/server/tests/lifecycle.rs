@@ -3600,7 +3600,10 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
     let raw = read_until(&mut reader, "\"id\":2", &mut seen);
     let json: Value = serde_json::from_str(&raw).expect("parse phase-1 result");
     assert_eq!(json["result"]["status"], "ok", "phase 1 status: {raw}");
-    assert_eq!(json["result"]["scope"], "modules", "phase 1 must be scoped: {raw}");
+    assert_eq!(
+        json["result"]["scope"], "modules",
+        "phase 1 must be scoped: {raw}"
+    );
     assert_eq!(
         json["result"]["errorCount"], 0,
         "sibling must resolve via -sourcepath (0 errors): {raw}"
@@ -3662,7 +3665,10 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
     ));
     let raw = read_until(&mut reader, "\"id\":5", &mut seen);
     let json: Value = serde_json::from_str(&raw).expect("parse phase-3 scoped result");
-    assert_eq!(json["result"]["scope"], "modules", "phase 3 scoped result: {raw}");
+    assert_eq!(
+        json["result"]["scope"], "modules",
+        "phase 3 scoped result: {raw}"
+    );
     assert_eq!(
         json["result"]["errorCount"], 0,
         "fixed module A must be clean: {raw}"

@@ -47,7 +47,9 @@ enum CheckExecution {
 fn parse_java_file_uri(uri_str: &str) -> Option<PathBuf> {
     let uri: Uri = uri_str.parse().ok()?;
     let path = uri.to_file_path()?.into_owned();
-    path.extension().is_some_and(|e| e == "java").then_some(path)
+    path.extension()
+        .is_some_and(|e| e == "java")
+        .then_some(path)
 }
 
 /// Whether `path` lives under any of `module_roots`. Checks the literal path
@@ -321,8 +323,7 @@ impl Backend {
                 // unrelated trees.
                 if let Some(doc) = docs.get(uri_str) {
                     if let Some(inferred) = infer_source_root(uri_str, &doc.tree, &doc.text) {
-                        if inferred.starts_with(&module_root)
-                            && !explicit_roots.contains(&inferred)
+                        if inferred.starts_with(&module_root) && !explicit_roots.contains(&inferred)
                         {
                             explicit_roots.push(inferred);
                         }
@@ -380,16 +381,17 @@ impl Backend {
         explicit_roots: Vec<PathBuf>,
         sourcepath_roots: Vec<PathBuf>,
     ) -> CheckExecution {
-        let javac_path =
-            match javac::locate_javac(self.jdk_home_override.get().and_then(|o| o.as_deref())) {
-                Some(path) => path,
-                None => {
-                    return CheckExecution::Terminal(serde_json::json!({
-                        "status": "javac-not-found",
-                        "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
-                    }));
-                }
-            };
+        let javac_path = match javac::locate_javac(
+            self.jdk_home_override.get().and_then(|o| o.as_deref()),
+        ) {
+            Some(path) => path,
+            None => {
+                return CheckExecution::Terminal(serde_json::json!({
+                    "status": "javac-not-found",
+                    "message": "could not locate javac: set $JAVA_HOME or the java-vsix-lite.jdk.home setting (never downloaded)",
+                }));
+            }
+        };
 
         let source_files = javac::collect_source_files(&explicit_roots);
         if source_files.is_empty() {

@@ -529,7 +529,10 @@ fn canonical_within_workspace_accepts_inside_rejects_outside() {
     assert_eq!(canonical_within_workspace(&outside, &ws), None);
 
     // A nonexistent path canonicalizes to None (never a path-string guess).
-    assert_eq!(canonical_within_workspace(&ws.join("Ghost.java"), &ws), None);
+    assert_eq!(
+        canonical_within_workspace(&ws.join("Ghost.java"), &ws),
+        None
+    );
 
     std::fs::remove_dir_all(&ws).ok();
     std::fs::remove_dir_all(&outside_root).ok();
@@ -572,10 +575,22 @@ fn discover_workspace_source_roots_finds_every_module() {
     std::fs::create_dir_all(ws.join("target/classes")).unwrap();
 
     let roots = discover_workspace_source_roots(&ws);
-    assert!(roots.contains(&ws.join("src/main/java")), "root main: {roots:?}");
-    assert!(roots.contains(&ws.join("src/test/java")), "root test: {roots:?}");
-    assert!(roots.contains(&ws.join("mod-a/src/main/java")), "mod-a: {roots:?}");
-    assert!(roots.contains(&ws.join("mod-b/src/main/java")), "mod-b: {roots:?}");
+    assert!(
+        roots.contains(&ws.join("src/main/java")),
+        "root main: {roots:?}"
+    );
+    assert!(
+        roots.contains(&ws.join("src/test/java")),
+        "root test: {roots:?}"
+    );
+    assert!(
+        roots.contains(&ws.join("mod-a/src/main/java")),
+        "mod-a: {roots:?}"
+    );
+    assert!(
+        roots.contains(&ws.join("mod-b/src/main/java")),
+        "mod-b: {roots:?}"
+    );
     // A module's absent test root is simply not listed (only existing dirs).
     assert!(!roots.contains(&ws.join("mod-a/src/test/java")));
 

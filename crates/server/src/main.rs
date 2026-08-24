@@ -2060,9 +2060,7 @@ mod tests {
         })])
         .is_err());
         // Missing documentUris.
-        assert!(
-            parse_check_scope(&[serde_json::json!({ "scope": "modules" })]).is_err()
-        );
+        assert!(parse_check_scope(&[serde_json::json!({ "scope": "modules" })]).is_err());
         // Non-string entry.
         assert!(parse_check_scope(&[serde_json::json!({
             "scope": "modules",
@@ -2070,9 +2068,7 @@ mod tests {
         })])
         .is_err());
         // Unknown scope.
-        assert!(
-            parse_check_scope(&[serde_json::json!({ "scope": "everything" })]).is_err()
-        );
+        assert!(parse_check_scope(&[serde_json::json!({ "scope": "everything" })]).is_err());
         // Non-object argument.
         assert!(parse_check_scope(&[serde_json::json!("modules")]).is_err());
     }

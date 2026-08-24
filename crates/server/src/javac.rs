@@ -274,7 +274,8 @@ pub(crate) fn discover_workspace_source_roots(workspace_root: &Path) -> Vec<Path
             break;
         }
         visited += 1;
-        let is_module = dir == workspace_root || MODULE_MARKERS.iter().any(|m| dir.join(m).is_file());
+        let is_module =
+            dir == workspace_root || MODULE_MARKERS.iter().any(|m| dir.join(m).is_file());
         if is_module {
             for root in conventional_source_roots(&dir) {
                 if seen.insert(root.clone()) {
@@ -778,7 +779,9 @@ fn run_in_scratch(
                          be passed to javac -sourcepath: {}",
                         p.display()
                     ),
-                    None => "source-root entries cannot be joined for javac -sourcepath".to_string(),
+                    None => {
+                        "source-root entries cannot be joined for javac -sourcepath".to_string()
+                    }
                 });
             }
         }
