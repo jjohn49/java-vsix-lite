@@ -155,7 +155,8 @@ fn check_return<'t>(
         )),
         (true, None) => {}
         (false, Some(expression)) => {
-            let Some(expected) = resolve::resolve_type_node(return_type, ctx.doc.source, ctx) else {
+            let Some(expected) = resolve::resolve_type_node(return_type, ctx.doc.source, ctx)
+            else {
                 return;
             };
             let Some(actual) = resolve::resolve_expression_type(expression, ctx) else {
@@ -180,9 +181,9 @@ fn nearest_method<'t>(return_statement: Node<'t>) -> Option<Node<'t>> {
     while let Some(node) = ancestor {
         match node.kind() {
             "method_declaration" => return Some(node),
-            "lambda_expression"
-            | "constructor_declaration"
-            | "compact_constructor_declaration" => return None,
+            "lambda_expression" | "constructor_declaration" | "compact_constructor_declaration" => {
+                return None
+            }
             _ => ancestor = node.parent(),
         }
     }
@@ -191,9 +192,7 @@ fn nearest_method<'t>(return_statement: Node<'t>) -> Option<Node<'t>> {
 
 fn incompatible_return(range: ls_types::Range, message: String) -> Diagnostic {
     let mut diagnostic = diagnostic(range, message);
-    diagnostic.code = Some(NumberOrString::String(
-        INCOMPATIBLE_RETURN_CODE.to_string(),
-    ));
+    diagnostic.code = Some(NumberOrString::String(INCOMPATIBLE_RETURN_CODE.to_string()));
     diagnostic
 }
 
@@ -236,7 +235,11 @@ mod tests {
         }
     }
 
-    fn semantic(src: &str, symbols: &dyn SymbolSource, unresolved_members: bool) -> Vec<Diagnostic> {
+    fn semantic(
+        src: &str,
+        symbols: &dyn SymbolSource,
+        unresolved_members: bool,
+    ) -> Vec<Diagnostic> {
         semantic_for_sources(&[src], 0, symbols, unresolved_members)
     }
 
@@ -254,10 +257,7 @@ mod tests {
         let docs: Vec<_> = sources
             .iter()
             .zip(&trees)
-            .map(|(source, tree)| OpenDoc {
-                source: *source,
-                tree,
-            })
+            .map(|(source, tree)| OpenDoc { source, tree })
             .collect();
         let index = LineIndex::new(sources[current], PositionEncoding::Utf16);
         semantic_diagnostics(&docs, current, &index, symbols, unresolved_members)
@@ -308,9 +308,7 @@ mod tests {
         let diagnostic = &diagnostics[0];
         assert_eq!(
             diagnostic.code,
-            Some(NumberOrString::String(
-                "jvl.incompatibleReturn".to_string()
-            ))
+            Some(NumberOrString::String("jvl.incompatibleReturn".to_string()))
         );
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diagnostic.source.as_deref(), Some("java-vsix-lite"));
@@ -354,16 +352,8 @@ mod tests {
     #[test]
     fn boxed_returns_support_unboxing_and_reject_incompatible_types() {
         let symbols = ObjectAware(vec![
-            (
-                "java.lang.Integer",
-                vec!["java.lang.Number"],
-                Vec::new(),
-            ),
-            (
-                "java.lang.Number",
-                vec!["java.lang.Object"],
-                Vec::new(),
-            ),
+            ("java.lang.Integer", vec!["java.lang.Number"], Vec::new()),
+            ("java.lang.Number", vec!["java.lang.Object"], Vec::new()),
         ]);
         let valid = "class C {
             Integer boxed() { return 1; }
@@ -429,9 +419,7 @@ mod tests {
         for diagnostic in diagnostics {
             assert_eq!(
                 diagnostic.code,
-                Some(NumberOrString::String(
-                    "jvl.incompatibleReturn".to_string()
-                ))
+                Some(NumberOrString::String("jvl.incompatibleReturn".to_string()))
             );
             assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
             assert_eq!(diagnostic.source.as_deref(), Some("java-vsix-lite"));
@@ -482,9 +470,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].code,
-            Some(NumberOrString::String(
-                "jvl.incompatibleReturn".to_string()
-            ))
+            Some(NumberOrString::String("jvl.incompatibleReturn".to_string()))
         );
         assert_eq!(
             diagnostics[0].message,
@@ -503,10 +489,7 @@ mod tests {
         let diagnostics = semantic(&src, &NoSymbols, false);
         assert_eq!(diagnostics.len(), crate::MAX_DIAGNOSTICS);
         assert!(diagnostics.iter().all(|diagnostic| {
-            diagnostic.code
-                == Some(NumberOrString::String(
-                    "jvl.incompatibleReturn".to_string(),
-                ))
+            diagnostic.code == Some(NumberOrString::String("jvl.incompatibleReturn".to_string()))
         }));
     }
 
@@ -546,14 +529,20 @@ mod tests {
     #[test]
     fn missing_recovery_silences_return_check() {
         let src = "class C { boolean m() { return 1 } }\n";
-        assert!(has_recovery(src, true), "fixture must contain a MISSING node");
+        assert!(
+            has_recovery(src, true),
+            "fixture must contain a MISSING node"
+        );
         assert!(return_messages(src, &NoSymbols).is_empty());
     }
 
     #[test]
     fn error_recovery_silences_return_check() {
         let src = "class C { boolean m() { return 1 ???; } }\n";
-        assert!(has_recovery(src, false), "fixture must contain an ERROR node");
+        assert!(
+            has_recovery(src, false),
+            "fixture must contain an ERROR node"
+        );
         assert!(return_messages(src, &NoSymbols).is_empty());
     }
 
@@ -595,8 +584,7 @@ mod tests {
 
     #[test]
     fn incomplete_external_hierarchy_return_is_silent() {
-        let src =
-            "import a.Base; import a.Child; class C { Base m() { return new Child(); } }\n";
+        let src = "import a.Base; import a.Child; class C { Base m() { return new Child(); } }\n";
         let symbols = ObjectAware(vec![
             ("a.Base", vec!["java.lang.Object"], Vec::new()),
             ("a.Child", vec!["a.Missing"], Vec::new()),

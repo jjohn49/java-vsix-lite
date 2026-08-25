@@ -290,7 +290,8 @@ impl Backend {
                 warning_count,
             } => {
                 // Whole-project run: the map is authoritative for every file.
-                self.publish_javac_diagnostics(grouped, &start_versions).await;
+                self.publish_javac_diagnostics(grouped, &start_versions)
+                    .await;
                 serde_json::json!({
                     "status": "ok",
                     "errorCount": error_count,
@@ -844,9 +845,19 @@ mod tests {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                RETURN_MESSAGE,
+            )],
         );
-        assert_eq!(merged.len(), 1, "expected the native entry replaced: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            1,
+            "expected the native entry replaced: {merged:#?}"
+        );
         assert_eq!(merged[0].source.as_deref(), Some("javac"));
         assert_eq!(merged[0].message, RETURN_MESSAGE);
     }
@@ -862,9 +873,19 @@ mod tests {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 0, u32::MAX, DiagnosticSeverity::ERROR, &folded)],
+            vec![javac_diag(
+                4,
+                0,
+                u32::MAX,
+                DiagnosticSeverity::ERROR,
+                &folded,
+            )],
         );
-        assert_eq!(merged.len(), 1, "expected the native entry replaced: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            1,
+            "expected the native entry replaced: {merged:#?}"
+        );
         assert_eq!(merged[0].source.as_deref(), Some("javac"));
     }
 
@@ -883,7 +904,11 @@ mod tests {
                 "incompatible types: String cannot be converted to long",
             )],
         );
-        assert_eq!(merged.len(), 2, "differing payloads must never merge: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            2,
+            "differing payloads must never merge: {merged:#?}"
+        );
     }
 
     /// Only a native diagnostic carrying the `jvl.incompatibleReturn` code
@@ -894,7 +919,13 @@ mod tests {
         let mut merged = vec![native_other(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                RETURN_MESSAGE,
+            )],
         );
         assert_eq!(
             merged.len(),
@@ -914,9 +945,19 @@ mod tests {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 15, 21, DiagnosticSeverity::WARNING, RETURN_MESSAGE)],
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::WARNING,
+                RETURN_MESSAGE,
+            )],
         );
-        assert_eq!(merged.len(), 2, "a javac warning must never dedupe: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            2,
+            "a javac warning must never dedupe: {merged:#?}"
+        );
 
         // (b) non-ERROR native entry against a javac error: native kept.
         let mut downgraded = native_return(4, 15, 20, RETURN_MESSAGE);
@@ -924,7 +965,13 @@ mod tests {
         let mut merged = vec![downgraded];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                RETURN_MESSAGE,
+            )],
         );
         assert_eq!(
             merged.len(),
@@ -942,16 +989,32 @@ mod tests {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(6, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+            vec![javac_diag(
+                6,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                RETURN_MESSAGE,
+            )],
         );
-        assert_eq!(merged.len(), 2, "a different line must never merge: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            2,
+            "a different line must never merge: {merged:#?}"
+        );
 
         // (b) same line, disjoint ranges (two returns on one line — distinct
         // errors that merely share a message).
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(4, 30, 35, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+            vec![javac_diag(
+                4,
+                30,
+                35,
+                DiagnosticSeverity::ERROR,
+                RETURN_MESSAGE,
+            )],
         );
         assert_eq!(
             merged.len(),
@@ -975,10 +1038,20 @@ mod tests {
             &mut merged,
             vec![
                 javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE),
-                javac_diag(9, 0, u32::MAX, DiagnosticSeverity::ERROR, "cannot find symbol"),
+                javac_diag(
+                    9,
+                    0,
+                    u32::MAX,
+                    DiagnosticSeverity::ERROR,
+                    "cannot find symbol",
+                ),
             ],
         );
-        assert_eq!(merged.len(), 4, "only the equivalent entry may go: {merged:#?}");
+        assert_eq!(
+            merged.len(),
+            4,
+            "only the equivalent entry may go: {merged:#?}"
+        );
         // Surviving natives first, in their original order…
         assert_eq!(merged[0].message, "Syntax error");
         assert_eq!(merged[1].message, "cannot resolve member frobnicate");
@@ -996,7 +1069,13 @@ mod tests {
         let mut merged = vec![native_other(1, 0, 4, "Syntax error")];
         merge_javac_diagnostics(
             &mut merged,
-            vec![javac_diag(9, 0, u32::MAX, DiagnosticSeverity::ERROR, "cannot find symbol")],
+            vec![javac_diag(
+                9,
+                0,
+                u32::MAX,
+                DiagnosticSeverity::ERROR,
+                "cannot find symbol",
+            )],
         );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].message, "Syntax error");

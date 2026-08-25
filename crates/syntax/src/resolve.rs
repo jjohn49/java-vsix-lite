@@ -316,9 +316,7 @@ fn resolve_receiver_depth<'t>(
         "field_access" => {
             let obj = recv.child_by_field_name("object")?;
             let field = recv.child_by_field_name("field")?;
-            if let Some(obj_ty) =
-                resolve_receiver_depth(obj, ctx, depth + 1, method_lookup)
-            {
+            if let Some(obj_ty) = resolve_receiver_depth(obj, ctx, depth + 1, method_lookup) {
                 return resolve_member_segment(
                     &obj_ty,
                     node_text(field, ctx.doc.source),
@@ -332,12 +330,9 @@ fn resolve_receiver_depth<'t>(
         "scoped_type_identifier" | "scoped_identifier" => {
             resolve_scoped_path(recv, ctx, method_lookup)
         }
-        "parenthesized_expression" => resolve_receiver_depth(
-            recv.named_child(0)?,
-            ctx,
-            depth + 1,
-            method_lookup,
-        ),
+        "parenthesized_expression" => {
+            resolve_receiver_depth(recv.named_child(0)?, ctx, depth + 1, method_lookup)
+        }
         _ => None,
     }
 }
@@ -355,9 +350,7 @@ fn find_method<'t>(
         MethodLookup::Unique => {
             let mut matches = collect_members(resolved, ctx)
                 .into_iter()
-                .filter(|member| {
-                    member.name() == name && MemberNamespace::Method.matches(member)
-                });
+                .filter(|member| member.name() == name && MemberNamespace::Method.matches(member));
             let member = matches.next()?;
             matches.next().is_none().then_some(member)
         }
@@ -374,9 +367,7 @@ pub(crate) fn is_assignable<'t>(
     match (actual, expected) {
         (
             ResolvedType::Null,
-            ResolvedType::InProject(_)
-            | ResolvedType::External { .. }
-            | ResolvedType::Array { .. },
+            ResolvedType::InProject(_) | ResolvedType::External { .. } | ResolvedType::Array { .. },
         ) => Some(true),
         (ResolvedType::Null, ResolvedType::Null) => Some(true),
         (ResolvedType::Null, _) | (_, ResolvedType::Null) => Some(false),
@@ -385,32 +376,23 @@ pub(crate) fn is_assignable<'t>(
         (ResolvedType::Primitive(actual), ResolvedType::Primitive(expected)) => {
             primitive_assignable(*actual, *expected, true)
         }
-        (
-            ResolvedType::Primitive(actual),
-            ResolvedType::External {
-                fqn: expected, ..
-            },
-        ) => match boxed_primitive(expected) {
-            Some(expected) if *actual == expected => Some(true),
-            Some(expected) => primitive_assignable(*actual, expected, true).map(|_| false),
-            None => external_subtype(primitive_box_fqn(*actual), expected, ctx.symbols),
-        },
-        (
-            ResolvedType::External { fqn: actual, .. },
-            ResolvedType::Primitive(expected),
-        ) => match boxed_primitive(actual) {
-            Some(actual) => primitive_assignable(actual, *expected, false),
-            None => Some(false),
-        },
+        (ResolvedType::Primitive(actual), ResolvedType::External { fqn: expected, .. }) => {
+            match boxed_primitive(expected) {
+                Some(expected) if *actual == expected => Some(true),
+                Some(expected) => primitive_assignable(*actual, expected, true).map(|_| false),
+                None => external_subtype(primitive_box_fqn(*actual), expected, ctx.symbols),
+            }
+        }
+        (ResolvedType::External { fqn: actual, .. }, ResolvedType::Primitive(expected)) => {
+            match boxed_primitive(actual) {
+                Some(actual) => primitive_assignable(actual, *expected, false),
+                None => Some(false),
+            }
+        }
         (ResolvedType::Primitive(_), _) | (_, ResolvedType::Primitive(_)) => Some(false),
-        (
-            ResolvedType::Array {
-                display: actual,
-            },
-            ResolvedType::Array {
-                display: expected,
-            },
-        ) => (actual == expected).then_some(true),
+        (ResolvedType::Array { display: actual }, ResolvedType::Array { display: expected }) => {
+            (actual == expected).then_some(true)
+        }
         (ResolvedType::Array { .. }, _) | (_, ResolvedType::Array { .. }) => None,
         (ResolvedType::InProject(actual), ResolvedType::InProject(expected)) => {
             if actual.doc != ctx.current || expected.doc != ctx.current {
@@ -484,10 +466,7 @@ fn primitive_assignable(
     if constant_narrowing_unknown
         && matches!(
             actual,
-            PrimitiveType::Byte
-                | PrimitiveType::Short
-                | PrimitiveType::Char
-                | PrimitiveType::Int
+            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char | PrimitiveType::Int
         )
         && matches!(
             expected,
@@ -535,11 +514,7 @@ fn type_args_unknown(args: &[String]) -> bool {
     })
 }
 
-fn external_subtype(
-    actual: &str,
-    expected: &str,
-    symbols: &dyn SymbolSource,
-) -> Option<bool> {
+fn external_subtype(actual: &str, expected: &str, symbols: &dyn SymbolSource) -> Option<bool> {
     symbols.class(expected)?;
     let mut path = HashSet::new();
     external_subtype_walk(actual, expected, symbols, &mut path, 0)
@@ -564,13 +539,7 @@ fn external_subtype_walk(
             let mut complete = true;
             let mut found = false;
             for supertype in class.supers {
-                match external_subtype_walk(
-                    &supertype,
-                    expected,
-                    symbols,
-                    path,
-                    depth + 1,
-                ) {
+                match external_subtype_walk(&supertype, expected, symbols, path, depth + 1) {
                     Some(true) => {
                         found = true;
                         break;
@@ -638,8 +607,7 @@ fn resolve_name_depth<'t>(
         // `String`. Resolving `value` directly would give `List` and mis-flag
         // every member access on the loop variable.
         if binding.decl_node.kind() == "enhanced_for_statement" {
-            let iterable =
-                resolve_receiver_depth(value, ctx, depth + 1, method_lookup)?;
+            let iterable = resolve_receiver_depth(value, ctx, depth + 1, method_lookup)?;
             return iterable_element_type(&iterable.ty, ctx).map(instance);
         }
         return resolve_receiver_depth(value, ctx, depth + 1, method_lookup)
@@ -1036,9 +1004,7 @@ fn member_result_type<'t>(
             };
             resolve_type_node(ty_node, m.source, ctx).map(instance)
         }
-        HierMember::External(m) => {
-            external_result_type(m, recv, ctx, method_lookup).map(instance)
-        }
+        HierMember::External(m) => external_result_type(m, recv, ctx, method_lookup).map(instance),
     }
 }
 
@@ -1075,8 +1041,7 @@ fn external_result_type<'t>(
         // value type. Semantic resolution must stay unknown so diagnostics do
         // not infer from its erased bound; historical receiver resolution may
         // still use the declared result to keep completion/hover chains alive.
-        if (substituted.contains('{')
-            || type_args_unknown(std::slice::from_ref(&substituted)))
+        if (substituted.contains('{') || type_args_unknown(std::slice::from_ref(&substituted)))
             && matches!(method_lookup, MethodLookup::Unique)
         {
             return None;
@@ -1111,7 +1076,6 @@ fn template_has_missing_arg(template: &str, arg_count: usize) -> bool {
     }
     false
 }
-
 
 /// Resolve a rendered display type (`Stream<String>`, `String`,
 /// `MyType`) back to a receiver type: the in-project table first, then the
@@ -1558,9 +1522,7 @@ pub(crate) fn member_names(resolved: &Resolved<'_>, ctx: &Ctx<'_, '_>) -> (HashS
     );
     if matches!(
         &resolved.ty,
-        ResolvedType::InProject(_)
-            | ResolvedType::External { .. }
-            | ResolvedType::Array { .. }
+        ResolvedType::InProject(_) | ResolvedType::External { .. } | ResolvedType::Array { .. }
     ) {
         match ctx.symbols.class("java.lang.Object") {
             Some(object) => names.extend(object.members.into_iter().map(|m| m.name)),
@@ -2513,10 +2475,7 @@ mod value_type_tests {
         let docs: Vec<OpenDoc<'_>> = sources
             .iter()
             .zip(&trees)
-            .map(|(source, tree)| OpenDoc {
-                source: *source,
-                tree,
-            })
+            .map(|(source, tree)| OpenDoc { source, tree })
             .collect();
         let table = TypeTable::build(&docs, current);
         let imports = Imports::parse(docs[current].tree, docs[current].source);
@@ -2560,12 +2519,7 @@ mod value_type_tests {
                     result_member("size", "int size()", None, "int"),
                     result_member("clear", "void clear()", None, "void"),
                     result_member("values", "Object[] values()", None, "Object[]"),
-                    result_member(
-                        "pick",
-                        "String pick()",
-                        Some("java.lang.String"),
-                        "String",
-                    ),
+                    result_member("pick", "String pick()", Some("java.lang.String"), "String"),
                     result_member(
                         "pick",
                         "String pick(int)",
@@ -2599,15 +2553,11 @@ mod value_type_tests {
     }
 
     fn value_call(method: &str) -> String {
-        format!(
-            "import test.Values; class C {{ Object m(Values v) {{ return v.{method}(); }} }}"
-        )
+        format!("import test.Values; class C {{ Object m(Values v) {{ return v.{method}(); }} }}")
     }
 
     fn static_value_call(method: &str) -> String {
-        format!(
-            "import test.Values; class C {{ Object m() {{ return Values.{method}(); }} }}"
-        )
+        format!("import test.Values; class C {{ Object m() {{ return Values.{method}(); }} }}")
     }
 
     #[test]
@@ -2638,8 +2588,7 @@ mod value_type_tests {
         for primitive in [
             "boolean", "byte", "short", "int", "long", "char", "float", "double",
         ] {
-            let src =
-                format!("class C {{ {primitive} m({primitive} value) {{ return value; }} }}");
+            let src = format!("class C {{ {primitive} m({primitive} value) {{ return value; }} }}");
             assert_eq!(
                 expression_display(&src, &NoSymbols).as_deref(),
                 Some(primitive),
@@ -2650,11 +2599,7 @@ mod value_type_tests {
 
     #[test]
     fn external_member_results_preserve_primitive_void_and_array_types() {
-        for (method, expected) in [
-            ("size", "int"),
-            ("clear", "void"),
-            ("values", "Object[]"),
-        ] {
+        for (method, expected) in [("size", "int"), ("clear", "void"), ("values", "Object[]")] {
             assert_eq!(
                 expression_display(&value_call(method), &ValueSymbols).as_deref(),
                 Some(expected),
@@ -2666,10 +2611,7 @@ mod value_type_tests {
     #[test]
     fn array_access_preserves_primitive_element_type() {
         let src = "class C { int m(int[] values) { return values[0]; } }";
-        assert_eq!(
-            expression_display(src, &NoSymbols).as_deref(),
-            Some("int")
-        );
+        assert_eq!(expression_display(src, &NoSymbols).as_deref(), Some("int"));
     }
 
     #[test]
@@ -2774,12 +2716,20 @@ mod value_type_tests {
         ];
         for (primitive_type, wrapper) in mappings {
             assert_eq!(
-                assign(primitive(primitive_type), external(wrapper, &[]), &NoSymbols),
+                assign(
+                    primitive(primitive_type),
+                    external(wrapper, &[]),
+                    &NoSymbols
+                ),
                 Some(true),
                 "boxing {primitive_type:?}"
             );
             assert_eq!(
-                assign(external(wrapper, &[]), primitive(primitive_type), &NoSymbols),
+                assign(
+                    external(wrapper, &[]),
+                    primitive(primitive_type),
+                    &NoSymbols
+                ),
                 Some(true),
                 "unboxing {primitive_type:?}"
             );
@@ -2938,10 +2888,7 @@ mod value_type_tests {
     fn class(supers: &[&str], type_params: &[&str]) -> ExternalClass {
         ExternalClass {
             supers: supers.iter().map(|value| value.to_string()).collect(),
-            type_params: type_params
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
+            type_params: type_params.iter().map(|value| value.to_string()).collect(),
             members: Vec::new(),
         }
     }
@@ -2951,14 +2898,12 @@ mod value_type_tests {
     impl SymbolSource for BoxingHierarchySymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             match fqn {
-                "java.lang.Integer" | "java.lang.Long" => Some(class(
-                    &["java.lang.Number", "java.lang.Comparable"],
-                    &[],
-                )),
-                "java.lang.Number" => Some(class(
-                    &["java.lang.Object", "java.io.Serializable"],
-                    &[],
-                )),
+                "java.lang.Integer" | "java.lang.Long" => {
+                    Some(class(&["java.lang.Number", "java.lang.Comparable"], &[]))
+                }
+                "java.lang.Number" => {
+                    Some(class(&["java.lang.Object", "java.io.Serializable"], &[]))
+                }
                 "java.lang.String" => Some(class(
                     &[
                         "java.lang.Object",
@@ -2977,22 +2922,13 @@ mod value_type_tests {
     #[test]
     fn boxing_followed_by_widening_reference_is_assignable() {
         for (actual, expected) in [
-            (
-                PrimitiveType::Int,
-                external("java.lang.Object", &[]),
-            ),
-            (
-                PrimitiveType::Int,
-                external("java.lang.Number", &[]),
-            ),
+            (PrimitiveType::Int, external("java.lang.Object", &[])),
+            (PrimitiveType::Int, external("java.lang.Number", &[])),
             (
                 PrimitiveType::Int,
                 external("java.lang.Comparable", &["java.lang.Integer"]),
             ),
-            (
-                PrimitiveType::Long,
-                external("java.io.Serializable", &[]),
-            ),
+            (PrimitiveType::Long, external("java.io.Serializable", &[])),
         ] {
             assert_eq!(
                 assign(primitive(actual), expected, &BoxingHierarchySymbols),
@@ -3156,17 +3092,10 @@ mod value_type_tests {
                 &IncompleteHierarchySymbols as &dyn SymbolSource,
             ),
             ("test.A", &CyclicHierarchySymbols as &dyn SymbolSource),
-            (
-                "test.Depth0",
-                &DeepHierarchySymbols as &dyn SymbolSource,
-            ),
+            ("test.Depth0", &DeepHierarchySymbols as &dyn SymbolSource),
         ] {
             assert_eq!(
-                assign(
-                    external(actual, &[]),
-                    external("test.Other", &[]),
-                    symbols,
-                ),
+                assign(external(actual, &[]), external("test.Other", &[]), symbols,),
                 None,
                 "{actual}"
             );
@@ -3184,7 +3113,12 @@ mod value_type_tests {
             None
         );
         assert_eq!(
-            in_project_assign(&["class Current {}", "class Foreign {}"], 0, "Foreign", "Foreign"),
+            in_project_assign(
+                &["class Current {}", "class Foreign {}"],
+                0,
+                "Foreign",
+                "Foreign"
+            ),
             None,
             "another open document must not influence current diagnostics"
         );

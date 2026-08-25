@@ -3948,7 +3948,9 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
         let slice = &seen[mark..];
         let have_response = slice.iter().any(|f| f.contains("\"id\":2"));
         let have_publish = slice.iter().any(|f| {
-            f.contains("publishDiagnostics") && f.contains(&uri) && f.contains("\"source\":\"javac\"")
+            f.contains("publishDiagnostics")
+                && f.contains(&uri)
+                && f.contains("\"source\":\"javac\"")
         });
         if have_response && have_publish {
             break;
@@ -3981,9 +3983,9 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
     let matching: Vec<&Value> = diagnostics
         .iter()
         .filter(|d| {
-            d["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("incompatible types: String cannot be converted to int"))
+            d["message"].as_str().is_some_and(|m| {
+                m.starts_with("incompatible types: String cannot be converted to int")
+            })
         })
         .collect();
     assert_eq!(
@@ -4029,8 +4031,7 @@ fn javac_result_started_before_edit_cannot_reintroduce_error() {
     let src_path = src_dir.join("Sample.java");
     std::fs::write(&src_path, WRONG_RETURN_SOURCE).expect("write Sample.java");
     let marker = root.join("javac-started");
-    let jdk_home =
-        write_fake_javac_jdk(&root, &wrong_return_stderr(&src_path), Some((&marker, 3)));
+    let jdk_home = write_fake_javac_jdk(&root, &wrong_return_stderr(&src_path), Some((&marker, 3)));
 
     let bin = env!("CARGO_BIN_EXE_jvl-server");
     let mut child: Child = Command::new(bin)
@@ -4084,7 +4085,8 @@ fn javac_result_started_before_edit_cannot_reintroduce_error() {
 
     // Fix the buffer WHILE the compiler is still sleeping on the stale
     // input: the native error clears immediately.
-    let fixed = "package demo;\n\npublic class Sample {\n    int code() {\n        return 1;\n    }\n}\n";
+    let fixed =
+        "package demo;\n\npublic class Sample {\n    int code() {\n        return 1;\n    }\n}\n";
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":2}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
         json_escape(fixed)
