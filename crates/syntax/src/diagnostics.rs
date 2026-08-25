@@ -303,11 +303,12 @@ fn check_initializers<'t>(
     }
 }
 
-/// Unreachable-statement rule: only plain `block` nodes are inspected (switch
-/// case groups are a different grammar node and stay silent, conservatively).
-/// A `return`/`throw`/`break`/`continue` statement followed by a later named
-/// non-comment sibling marks the first such sibling dead. One diagnostic per
-/// block; recovery anywhere inside the block mutes it.
+/// Unreachable-statement rule: plain `block` nodes are inspected (switch case
+/// groups are a different grammar node and stay silent, conservatively).
+/// Direct abrupt statements and `try` statements proven unable to complete
+/// normally make the first later non-comment sibling unreachable. A `finally`
+/// block remains independently reachable and is analyzed as its own block.
+/// One warning per block; recovery anywhere inside the block mutes the rule.
 fn check_unreachable(block: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) {
     if block.has_error() {
         return;
@@ -319,18 +320,73 @@ fn check_unreachable(block: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) 
             continue;
         }
         if terminated {
-            out.push(coded_diagnostic(
+            let mut diagnostic = coded_diagnostic(
                 index.range(statement),
                 UNREACHABLE_CODE,
                 "unreachable statement".to_string(),
-            ));
+            );
+            diagnostic.severity = Some(DiagnosticSeverity::WARNING);
+            out.push(diagnostic);
             return;
         }
-        terminated = matches!(
-            statement.kind(),
-            "return_statement" | "throw_statement" | "break_statement" | "continue_statement"
-        );
+        terminated = !can_complete_normally(statement);
     }
+}
+
+/// Conservative subset of JLS §14.22 normal-completion analysis. Only direct
+/// abrupt statements, blocks, and `try` forms are modeled; every other shape
+/// returns `true` so unsupported control flow can only suppress a warning.
+fn can_complete_normally(statement: Node) -> bool {
+    match statement.kind() {
+        "return_statement" | "throw_statement" | "break_statement" | "continue_statement" => false,
+        "block" | "constructor_body" => block_can_complete_normally(statement),
+        "try_statement" | "try_with_resources_statement" => try_can_complete_normally(statement),
+        _ => true,
+    }
+}
+
+fn block_can_complete_normally(block: Node) -> bool {
+    let mut cursor = block.walk();
+    block
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .last()
+        .map(can_complete_normally)
+        .unwrap_or(true)
+}
+
+/// A `try` can complete normally iff its body or any catch can complete
+/// normally and its `finally` (when present) can complete normally. All catch
+/// clauses are considered; counting an unreachable catch can only produce
+/// conservative silence. The `finally` block itself is always walked
+/// separately by [`check_unreachable`], even when a pending return/throw exists.
+fn try_can_complete_normally(statement: Node) -> bool {
+    let Some(body) = statement.child_by_field_name("body") else {
+        return true;
+    };
+    let mut body_or_catch = block_can_complete_normally(body);
+    let mut finally_can_complete = true;
+    let mut cursor = statement.walk();
+    for child in statement.named_children(&mut cursor) {
+        match child.kind() {
+            "catch_clause" => {
+                if let Some(body) = child.child_by_field_name("body") {
+                    body_or_catch |= block_can_complete_normally(body);
+                }
+            }
+            "finally_clause" => {
+                let mut finally_cursor = child.walk();
+                let finally_block = child
+                    .named_children(&mut finally_cursor)
+                    .find(|node| node.kind() == "block");
+                if let Some(block) = finally_block {
+                    finally_can_complete = block_can_complete_normally(block);
+                }
+            }
+            _ => {}
+        }
+    }
+    body_or_catch && finally_can_complete
 }
 
 /// Count identifier spellings once for file-wide private-member usage checks.
@@ -1290,7 +1346,7 @@ mod tests {
             diagnostic.code,
             Some(NumberOrString::String(UNREACHABLE_CODE.to_string()))
         );
-        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(diagnostic.source.as_deref(), Some("java-vsix-lite"));
         assert_eq!(diagnostic.message, "unreachable statement");
         // The range covers the first dead statement.
@@ -1370,6 +1426,111 @@ mod tests {
             has_recovery(src, false),
             "fixture must contain an ERROR node"
         );
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn finally_runs_after_return_without_becoming_unreachable() {
+        let src = "class C {
+            void m() {
+                try { return; }
+                finally { cleanup(); }
+            }
+            void cleanup() { }
+        }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn following_statement_is_unreachable_when_try_and_catches_return() {
+        let src = "class C {
+            int m() {
+                try { return 1; }
+                catch (Exception e) { return 2; }
+                finally { cleanup(); }
+                return 3;
+            }
+            void cleanup() { }
+        }\n";
+        let diagnostics = hygiene(src, false);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].range, range_of(src, "return 3;"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn normal_catch_keeps_statement_after_try_reachable() {
+        let src = "class C {
+            void m() {
+                try { return; }
+                catch (Exception e) { cleanup(); }
+                finally { cleanup(); }
+                cleanup();
+            }
+            void cleanup() { }
+        }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn abrupt_finally_makes_following_statement_unreachable() {
+        let src = "class C {
+            void m() {
+                try { cleanup(); }
+                finally { return; }
+                after();
+            }
+            void cleanup() { }
+            void after() { }
+        }\n";
+        let diagnostics = hygiene(src, false);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].range, range_of(src, "after();"));
+    }
+
+    #[test]
+    fn statements_after_returns_inside_try_catch_and_finally_are_unreachable() {
+        let src = "class C {
+            void a() { try { return; cleanup(); } finally { cleanup(); } }
+            void b() { try { cleanup(); } catch (Exception e) { return; cleanup(); } }
+            void c() { try { cleanup(); } finally { return; cleanup(); } }
+            void cleanup() { }
+        }\n";
+        let diagnostics = hygiene(src, false);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)));
+    }
+
+    #[test]
+    fn nested_try_completion_propagates_through_finally() {
+        let src = "class C {
+            void m() {
+                try {
+                    try { return; }
+                    finally { cleanup(); }
+                } finally { cleanup(); }
+                cleanup();
+            }
+            void cleanup() { }
+        }\n";
+        let diagnostics = hygiene(src, false);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn recovery_in_try_catch_finally_stays_silent() {
+        let src = "class C {
+            void m() {
+                try { return; }
+                catch (Exception e) { return ???; }
+                finally { cleanup(); }
+                cleanup();
+            }
+            void cleanup() { }
+        }\n";
+        assert!(has_recovery(src, false));
         assert!(hygiene_messages(src, false).is_empty());
     }
 
