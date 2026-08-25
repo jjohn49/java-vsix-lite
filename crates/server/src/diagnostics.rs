@@ -79,45 +79,63 @@ fn uri_is_under_module(uri_str: &str, module_roots: &[PathBuf]) -> bool {
     path_under_any_module(path.as_ref(), module_roots)
 }
 
-/// The first line of a diagnostic message with any `incompatible types: `
-/// prefix stripped — the payload compared for native/javac equivalence.
-/// javac folds `required:`/`found:` continuation lines into its message;
-/// only the first line carries the comparable summary.
-fn stripped_first_line(message: &str) -> &str {
-    let first = message.lines().next().unwrap_or("");
-    first.strip_prefix("incompatible types: ").unwrap_or(first)
+/// Native codes `javac` can independently confirm: the type-directed return
+/// and initializer checks and the unreachable-statement check. `jvl.unused`
+/// is deliberately absent — javac has no equivalent diagnostic, so an unused
+/// warning is never deduplicated.
+const JAVAC_CONFIRMABLE_CODES: [&str; 3] = [
+    jvl_syntax::INCOMPATIBLE_RETURN_CODE,
+    jvl_syntax::INCOMPATIBLE_ASSIGNMENT_CODE,
+    jvl_syntax::UNREACHABLE_CODE,
+];
+
+/// Whether two first message lines carry the same payload. javac folds
+/// `required:`/`found:` continuation lines into its message, so only the
+/// first line is comparable; the `incompatible types: ` prefix strips ONLY
+/// when present on BOTH sides — otherwise the lines compare verbatim (javac
+/// emits `unreachable statement` exactly, with no prefix).
+fn equivalent_payload(native: &str, javac: &str) -> bool {
+    let native = native.lines().next().unwrap_or("");
+    let javac = javac.lines().next().unwrap_or("");
+    match (
+        native.strip_prefix("incompatible types: "),
+        javac.strip_prefix("incompatible types: "),
+    ) {
+        (Some(native), Some(javac)) => native == javac,
+        _ => native == javac,
+    }
 }
 
-/// Whether `javac` confirms `native` as the same incompatible-return error.
-/// Deliberately narrow — ALL of: the native entry carries the return-check
-/// code (`jvl.incompatibleReturn`), both severities are ERROR, the ranges
-/// overlap on the same line, and the first message lines agree after
-/// stripping the `incompatible types: ` prefix. Anything less (a syntax/
-/// structural/member rule, a warning, a different line, a disjoint range,
-/// a different payload) is never treated as the same error.
-fn javac_confirms_native_return(native: &Diagnostic, javac: &Diagnostic) -> bool {
+/// Whether `javac` confirms `native` as the same error. Deliberately narrow —
+/// ALL of: the native entry carries one of [`JAVAC_CONFIRMABLE_CODES`], both
+/// severities are ERROR, the ranges overlap on the same line, and the first
+/// message lines carry an equivalent payload ([`equivalent_payload`]).
+/// Anything less (a syntax/structural/member rule, an unused warning, a
+/// different line, a disjoint range, a different payload) is never treated
+/// as the same error.
+fn javac_confirms_native(native: &Diagnostic, javac: &Diagnostic) -> bool {
     matches!(
         &native.code,
-        Some(NumberOrString::String(code)) if code == jvl_syntax::INCOMPATIBLE_RETURN_CODE
+        Some(NumberOrString::String(code)) if JAVAC_CONFIRMABLE_CODES.contains(&code.as_str())
     ) && native.severity == Some(DiagnosticSeverity::ERROR)
         && javac.severity == Some(DiagnosticSeverity::ERROR)
         && native.range.start.line == javac.range.start.line
         && native.range.start.character < javac.range.end.character
         && javac.range.start.character < native.range.end.character
-        && stripped_first_line(&native.message) == stripped_first_line(&javac.message)
+        && equivalent_payload(&native.message, &javac.message)
 }
 
 /// Merge a file's stored `javac` diagnostics into its freshly computed
 /// native set, preferring the compiler for an equivalent current result:
 /// every native entry some javac diagnostic confirms (see
-/// [`javac_confirms_native_return`]) is removed, then ALL javac diagnostics
+/// [`javac_confirms_native`]) is removed, then ALL javac diagnostics
 /// are appended in their original order. Surviving natives keep their
 /// order; unrelated diagnostics are never deduplicated.
 fn merge_javac_diagnostics(diagnostics: &mut Vec<Diagnostic>, javac: Vec<Diagnostic>) {
     diagnostics.retain(|native| {
         !javac
             .iter()
-            .any(|javac| javac_confirms_native_return(native, javac))
+            .any(|javac| javac_confirms_native(native, javac))
     });
     diagnostics.extend(javac);
 }
@@ -158,7 +176,7 @@ impl Backend {
     /// Syntax, immediate semantic, and structural diagnostics for a document
     /// already stored under `uri`, plus any `javac` diagnostics still on file
     /// for `uri` — merged in via [`merge_javac_diagnostics`], which removes a
-    /// native return error that an equivalent compiler result confirms and
+    /// native error that an equivalent compiler result confirms and
     /// appends every javac entry, never clobbering anything unrelated.
     /// Unlike the native
     /// diagnostics, the `javac` diagnostics don't require `uri` to be an open
@@ -190,6 +208,7 @@ impl Backend {
                         .get()
                         .copied()
                         .unwrap_or(true),
+                    self.unused_diagnostics.get().copied().unwrap_or(true),
                 ));
                 let filename = filename_from_uri(uri);
                 let expected_package = self.expected_package(uri);
@@ -762,11 +781,9 @@ mod tests {
     /// wrong-return fixture (`int code() { return "bad"; }`).
     const RETURN_MESSAGE: &str = "incompatible types: String cannot be converted to int";
 
-    /// A native return diagnostic exactly as `jvl_syntax`'s return check
-    /// emits it (Task 2 contract): code `jvl.incompatibleReturn`, severity
-    /// ERROR, source `java-vsix-lite`, single-line range on the returned
-    /// expression.
-    fn native_return(line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
+    /// A native diagnostic exactly as the syntax crate emits it for `code`:
+    /// severity ERROR, source `java-vsix-lite`, single-line range.
+    fn native_coded(code: &str, line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
         Diagnostic {
             range: Range {
                 start: Position {
@@ -779,13 +796,25 @@ mod tests {
                 },
             },
             severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String(
-                jvl_syntax::INCOMPATIBLE_RETURN_CODE.to_string(),
-            )),
+            code: Some(NumberOrString::String(code.to_string())),
             source: Some("java-vsix-lite".to_string()),
             message: message.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A native return diagnostic exactly as `jvl_syntax`'s return check
+    /// emits it (Task 2 contract): code `jvl.incompatibleReturn`, severity
+    /// ERROR, source `java-vsix-lite`, single-line range on the returned
+    /// expression.
+    fn native_return(line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
+        native_coded(
+            jvl_syntax::INCOMPATIBLE_RETURN_CODE,
+            line,
+            start,
+            end,
+            message,
+        )
     }
 
     /// A native diagnostic that is NOT the return rule — a syntax,
@@ -1080,5 +1109,149 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].message, "Syntax error");
         assert_eq!(merged[1].source.as_deref(), Some("javac"));
+    }
+
+    /// javac confirms a native incompatible-initializer error exactly like a
+    /// return error: `jvl.incompatibleAssignment` is a dedupable code, the
+    /// folded `required:`/`found:` continuation lines are ignored, and the
+    /// `incompatible types: ` prefix strips when present on BOTH first lines.
+    #[test]
+    fn merge_replaces_equivalent_native_assignment_diagnostic() {
+        let message = "incompatible types: int cannot be converted to boolean";
+        let folded = format!("{message}\n  required: boolean\n  found:    int");
+        let mut merged = vec![native_coded(
+            jvl_syntax::INCOMPATIBLE_ASSIGNMENT_CODE,
+            4,
+            15,
+            20,
+            message,
+        )];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                4,
+                0,
+                u32::MAX,
+                DiagnosticSeverity::ERROR,
+                &folded,
+            )],
+        );
+        assert_eq!(
+            merged.len(),
+            1,
+            "expected the native entry replaced: {merged:#?}"
+        );
+        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+    }
+
+    /// javac emits `unreachable statement` verbatim — no `incompatible
+    /// types: ` prefix on either side — so the first lines compare verbatim
+    /// and the native `jvl.unreachable` entry is replaced.
+    #[test]
+    fn merge_replaces_equivalent_native_unreachable_diagnostic() {
+        let mut merged = vec![native_coded(
+            jvl_syntax::UNREACHABLE_CODE,
+            7,
+            8,
+            22,
+            "unreachable statement",
+        )];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                7,
+                8,
+                9,
+                DiagnosticSeverity::ERROR,
+                "unreachable statement",
+            )],
+        );
+        assert_eq!(
+            merged.len(),
+            1,
+            "expected the native entry replaced: {merged:#?}"
+        );
+        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+    }
+
+    /// The `incompatible types: ` prefix strips only when BOTH first lines
+    /// carry it; a prefix on one side only compares verbatim and never
+    /// merges.
+    #[test]
+    fn merge_requires_prefix_on_both_sides_or_neither() {
+        let mut merged = vec![native_coded(
+            jvl_syntax::UNREACHABLE_CODE,
+            7,
+            8,
+            22,
+            "unreachable statement",
+        )];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                7,
+                8,
+                9,
+                DiagnosticSeverity::ERROR,
+                "incompatible types: unreachable statement",
+            )],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "a one-sided prefix must never merge: {merged:#?}"
+        );
+    }
+
+    /// `jvl.unused` never merges — javac cannot emit it. Neither the real
+    /// shape (WARNING + Unnecessary tag) nor a hypothetical ERROR-severity
+    /// entry is in the dedupable-code list.
+    #[test]
+    fn merge_never_dedupes_unused_diagnostics() {
+        // (a) as actually emitted: WARNING severity, Unnecessary tag.
+        let mut warning = native_coded("jvl.unused", 4, 15, 20, "unused local variable 'x'");
+        warning.severity = Some(DiagnosticSeverity::WARNING);
+        warning.tags = Some(vec![DiagnosticTag::UNNECESSARY]);
+        let mut merged = vec![warning];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::WARNING,
+                "unused local variable 'x'",
+            )],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "unused warnings must never merge: {merged:#?}"
+        );
+
+        // (b) even a hypothetical ERROR-severity `jvl.unused` entry with an
+        // exactly matching javac error survives: the code is not in the list.
+        let mut merged = vec![native_coded(
+            "jvl.unused",
+            4,
+            15,
+            20,
+            "unused local variable 'x'",
+        )];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                "unused local variable 'x'",
+            )],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "jvl.unused is never dedupable: {merged:#?}"
+        );
     }
 }

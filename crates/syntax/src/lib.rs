@@ -53,7 +53,9 @@ mod structural;
 pub use codeaction::{code_actions, ActionSketch, KIND_ORGANIZE_IMPORTS, KIND_QUICKFIX};
 pub use completion::{completion, resolve_documentation, CompletionResult};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
-pub use diagnostics::{semantic_diagnostics, INCOMPATIBLE_RETURN_CODE};
+pub use diagnostics::{
+    semantic_diagnostics, INCOMPATIBLE_ASSIGNMENT_CODE, INCOMPATIBLE_RETURN_CODE, UNREACHABLE_CODE,
+};
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{
     ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource, TypeCandidate,

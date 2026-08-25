@@ -200,6 +200,8 @@ pub(crate) struct Backend {
     pub(crate) project_root_hint: OnceLock<Option<PathBuf>>,
     /// Whether to emit unresolved-member diagnostics (default on; opt-out).
     pub(crate) unresolved_member_diagnostics: OnceLock<bool>,
+    /// Whether to emit unused-code diagnostics (default on; opt-out).
+    pub(crate) unused_diagnostics: OnceLock<bool>,
     /// Ladder step (c): a single unopened project source file, parsed on
     /// demand and cached by path (see [`CachedProjectFile`]). Never held
     /// across an `.await`.
@@ -266,6 +268,7 @@ impl Backend {
             workspace_root: OnceLock::new(),
             project_root_hint: OnceLock::new(),
             unresolved_member_diagnostics: OnceLock::new(),
+            unused_diagnostics: OnceLock::new(),
             project_file_cache: StdMutex::new(HashMap::new()),
             external_stub_cache: StdMutex::new(HashMap::new()),
             workspace_index: workspace_index::WorkspaceIndex::new(),

@@ -233,6 +233,21 @@ fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
         .unwrap_or(true)
 }
 
+/// The `unusedDiagnostics` flag from `initializationOptions`. Default-on,
+/// mirroring `unresolvedMemberDiagnostics`: the unused-code rule inside
+/// `semantic_diagnostics` is name-occurrence based and conservative
+/// (shadowing can only cause silence), so this flag exists only for a user
+/// who wants to opt back out of the warnings, not to gate the always-enabled
+/// return/initializer/unreachable checks.
+fn unused_diagnostics_opt(params: &InitializeParams) -> bool {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.get("unusedDiagnostics"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+}
+
 /// The `classpathDebounceMs` field from `initializationOptions` — the wait
 /// after the last matching build-file change before the classpath
 /// rebuild runs. Defaults to 2000ms; tests override it to a few
@@ -376,6 +391,7 @@ impl LanguageServer for Backend {
         let _ = self
             .unresolved_member_diagnostics
             .set(unresolved_member_diagnostics_opt(&params));
+        let _ = self.unused_diagnostics.set(unused_diagnostics_opt(&params));
         let _ = self
             .supports_rename_file
             .set(supports_rename_file_op(&params));
