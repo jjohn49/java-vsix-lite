@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7 — 2026-08-25
+
+### Fixed
+- The automatic check for pre-existing errors on project load now also
+  runs when a Java file is opened later in the session, not only for
+  files already open at the moment the extension activates — previously
+  this left it a near-permanent no-op whenever no Java file happened to
+  be open yet when the extension started.
+- A background check spanning multiple files no longer silently skips
+  every file in the batch just because one of them sits outside any
+  recognized Maven/Gradle module or conventional source root — the rest
+  are still checked.
+
 ## 0.1.6 — 2026-08-25
 
 ### Added
