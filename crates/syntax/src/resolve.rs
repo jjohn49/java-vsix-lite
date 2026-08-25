@@ -390,23 +390,11 @@ pub(crate) fn is_assignable<'t>(
             ResolvedType::External {
                 fqn: expected, ..
             },
-        ) => {
-            let Some(expected) = boxed_primitive(expected) else {
-                return Some(false);
-            };
-            if *actual == expected {
-                Some(true)
-            } else if *actual == PrimitiveType::Int
-                && matches!(
-                    expected,
-                    PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
-                )
-            {
-                None
-            } else {
-                Some(false)
-            }
-        }
+        ) => match boxed_primitive(expected) {
+            Some(expected) if *actual == expected => Some(true),
+            Some(expected) => primitive_assignable(*actual, expected, true).map(|_| false),
+            None => external_subtype(primitive_box_fqn(*actual), expected, ctx.symbols),
+        },
         (
             ResolvedType::External { fqn: actual, .. },
             ResolvedType::Primitive(expected),
@@ -463,21 +451,12 @@ pub(crate) fn is_assignable<'t>(
 fn primitive_assignable(
     actual: PrimitiveType,
     expected: PrimitiveType,
-    constant_int_unknown: bool,
+    constant_narrowing_unknown: bool,
 ) -> Option<bool> {
     if actual == expected {
         return Some(true);
     }
-    if constant_int_unknown
-        && actual == PrimitiveType::Int
-        && matches!(
-            expected,
-            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
-        )
-    {
-        return None;
-    }
-    Some(matches!(
+    let widening = matches!(
         (actual, expected),
         (PrimitiveType::Byte, PrimitiveType::Short)
             | (PrimitiveType::Byte, PrimitiveType::Int)
@@ -498,7 +477,26 @@ fn primitive_assignable(
             | (PrimitiveType::Long, PrimitiveType::Float)
             | (PrimitiveType::Long, PrimitiveType::Double)
             | (PrimitiveType::Float, PrimitiveType::Double)
-    ))
+    );
+    if widening {
+        return Some(true);
+    }
+    if constant_narrowing_unknown
+        && matches!(
+            actual,
+            PrimitiveType::Byte
+                | PrimitiveType::Short
+                | PrimitiveType::Char
+                | PrimitiveType::Int
+        )
+        && matches!(
+            expected,
+            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
+        )
+    {
+        return None;
+    }
+    Some(false)
 }
 
 fn boxed_primitive(fqn: &str) -> Option<PrimitiveType> {
@@ -513,6 +511,19 @@ fn boxed_primitive(fqn: &str) -> Option<PrimitiveType> {
         "java.lang.Double" => PrimitiveType::Double,
         _ => return None,
     })
+}
+
+fn primitive_box_fqn(primitive: PrimitiveType) -> &'static str {
+    match primitive {
+        PrimitiveType::Boolean => "java.lang.Boolean",
+        PrimitiveType::Byte => "java.lang.Byte",
+        PrimitiveType::Short => "java.lang.Short",
+        PrimitiveType::Int => "java.lang.Integer",
+        PrimitiveType::Long => "java.lang.Long",
+        PrimitiveType::Char => "java.lang.Character",
+        PrimitiveType::Float => "java.lang.Float",
+        PrimitiveType::Double => "java.lang.Double",
+    }
 }
 
 fn type_args_unknown(args: &[String]) -> bool {
@@ -1034,7 +1045,8 @@ fn member_result_type<'t>(
 /// An external member's result type. Prefers the generic `ret_display`
 /// template substituted with the receiver's use-site type arguments (so
 /// `List<String>.get(int)` chains as `String`, `stream()` as
-/// `Stream<String>`); falls back to the erased `ret_fqn`.
+/// `Stream<String>`). First-name receiver lookup may fall back to the erased
+/// `ret_fqn`; unique semantic lookup must not infer a value type from erasure.
 fn external_result_type<'t>(
     m: &ExternalMember,
     recv: &Resolved<'_>,
@@ -1053,7 +1065,9 @@ fn external_result_type<'t>(
             }
             _ => (Vec::new(), Vec::new()),
         };
-        if template_has_missing_arg(display, args.len()) {
+        if matches!(method_lookup, MethodLookup::Unique)
+            && template_has_missing_arg(display, args.len())
+        {
             return None;
         }
         let substituted = substitute_template(display, &args, &type_params);
@@ -1069,6 +1083,9 @@ fn external_result_type<'t>(
         }
         if let Some(resolved) = resolve_display_type(&substituted, m.ret_fqn.as_deref(), ctx) {
             return Some(resolved);
+        }
+        if matches!(method_lookup, MethodLookup::Unique) {
+            return None;
         }
     }
     let fqn = m.ret_fqn.clone()?;
@@ -2561,6 +2578,21 @@ mod value_type_tests {
                         Some("java.lang.Object"),
                         "{0}",
                     ),
+                    ExternalMember {
+                        is_static: true,
+                        ..result_member(
+                            "static_unknown",
+                            "static <T> Object static_unknown()",
+                            Some("java.lang.Object"),
+                            "{0}",
+                        )
+                    },
+                    result_member(
+                        "unknown_result",
+                        "<TResult> TResult unknown_result()",
+                        Some("java.lang.Object"),
+                        "TResult",
+                    ),
                 ],
             })
         }
@@ -2569,6 +2601,12 @@ mod value_type_tests {
     fn value_call(method: &str) -> String {
         format!(
             "import test.Values; class C {{ Object m(Values v) {{ return v.{method}(); }} }}"
+        )
+    }
+
+    fn static_value_call(method: &str) -> String {
+        format!(
+            "import test.Values; class C {{ Object m() {{ return Values.{method}(); }} }}"
         )
     }
 
@@ -2649,6 +2687,33 @@ mod value_type_tests {
     fn unresolved_generic_member_result_stays_unknown() {
         assert_eq!(
             expression_display(&value_call("unknown"), &ValueSymbols),
+            None
+        );
+    }
+
+    #[test]
+    fn first_lookup_retains_erased_raw_and_static_generic_results() {
+        for (src, receiver_kind) in [
+            (value_call("unknown"), "raw"),
+            (static_value_call("static_unknown"), "static"),
+        ] {
+            assert_eq!(
+                receiver_display(&src, &ValueSymbols).as_deref(),
+                Some("Object"),
+                "{receiver_kind} generic receiver must retain erased First lookup"
+            );
+            assert_eq!(
+                expression_display(&src, &ValueSymbols),
+                None,
+                "{receiver_kind} generic result must remain unknown for Unique lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_multi_character_method_type_variable_stays_unknown() {
+        assert_eq!(
+            expression_display(&value_call("unknown_result"), &ValueSymbols),
             None
         );
     }
@@ -2754,12 +2819,71 @@ mod value_type_tests {
     }
 
     #[test]
+    fn potential_constant_narrowing_is_unknown_for_primitive_and_boxed_targets() {
+        fn boxed_target(primitive: PrimitiveType) -> &'static str {
+            match primitive {
+                PrimitiveType::Byte => "java.lang.Byte",
+                PrimitiveType::Short => "java.lang.Short",
+                PrimitiveType::Char => "java.lang.Character",
+                _ => unreachable!("only constant-narrowing targets are used"),
+            }
+        }
+
+        for (actual, expected) in [
+            (PrimitiveType::Byte, PrimitiveType::Char),
+            (PrimitiveType::Short, PrimitiveType::Byte),
+            (PrimitiveType::Short, PrimitiveType::Char),
+            (PrimitiveType::Char, PrimitiveType::Byte),
+            (PrimitiveType::Char, PrimitiveType::Short),
+            (PrimitiveType::Int, PrimitiveType::Byte),
+            (PrimitiveType::Int, PrimitiveType::Short),
+            (PrimitiveType::Int, PrimitiveType::Char),
+        ] {
+            assert_eq!(
+                assign(primitive(actual), primitive(expected), &NoSymbols),
+                None,
+                "{actual:?} to {expected:?}"
+            );
+            assert_eq!(
+                assign(
+                    primitive(actual),
+                    external(boxed_target(expected), &[]),
+                    &NoSymbols,
+                ),
+                None,
+                "{actual:?} to boxed {expected:?}"
+            );
+        }
+
+        for (actual, expected) in [
+            (PrimitiveType::Long, PrimitiveType::Byte),
+            (PrimitiveType::Float, PrimitiveType::Short),
+            (PrimitiveType::Double, PrimitiveType::Char),
+        ] {
+            assert_eq!(
+                assign(primitive(actual), primitive(expected), &NoSymbols),
+                Some(false),
+                "{actual:?} to {expected:?}"
+            );
+            assert_eq!(
+                assign(
+                    primitive(actual),
+                    external(boxed_target(expected), &[]),
+                    &NoSymbols,
+                ),
+                Some(false),
+                "{actual:?} to boxed {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn primitive_reference_mismatches_are_proven_incompatible() {
         assert_eq!(
             assign(
                 primitive(PrimitiveType::Int),
                 external("java.lang.String", &[]),
-                &NoSymbols,
+                &BoxingHierarchySymbols,
             ),
             Some(false)
         );
@@ -2767,7 +2891,7 @@ mod value_type_tests {
             assign(
                 external("java.lang.String", &[]),
                 primitive(PrimitiveType::Int),
-                &NoSymbols,
+                &BoxingHierarchySymbols,
             ),
             Some(false)
         );
@@ -2820,6 +2944,72 @@ mod value_type_tests {
                 .collect(),
             members: Vec::new(),
         }
+    }
+
+    struct BoxingHierarchySymbols;
+
+    impl SymbolSource for BoxingHierarchySymbols {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            match fqn {
+                "java.lang.Integer" | "java.lang.Long" => Some(class(
+                    &["java.lang.Number", "java.lang.Comparable"],
+                    &[],
+                )),
+                "java.lang.Number" => Some(class(
+                    &["java.lang.Object", "java.io.Serializable"],
+                    &[],
+                )),
+                "java.lang.String" => Some(class(
+                    &[
+                        "java.lang.Object",
+                        "java.lang.Comparable",
+                        "java.io.Serializable",
+                    ],
+                    &[],
+                )),
+                "java.lang.Comparable" => Some(class(&[], &["T"])),
+                "java.io.Serializable" | "java.lang.Object" => Some(class(&[], &[])),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn boxing_followed_by_widening_reference_is_assignable() {
+        for (actual, expected) in [
+            (
+                PrimitiveType::Int,
+                external("java.lang.Object", &[]),
+            ),
+            (
+                PrimitiveType::Int,
+                external("java.lang.Number", &[]),
+            ),
+            (
+                PrimitiveType::Int,
+                external("java.lang.Comparable", &["java.lang.Integer"]),
+            ),
+            (
+                PrimitiveType::Long,
+                external("java.io.Serializable", &[]),
+            ),
+        ] {
+            assert_eq!(
+                assign(primitive(actual), expected, &BoxingHierarchySymbols),
+                Some(true),
+                "{actual:?} boxing plus widening reference"
+            );
+        }
+
+        assert_eq!(
+            assign(
+                primitive(PrimitiveType::Int),
+                external("java.lang.String", &[]),
+                &BoxingHierarchySymbols,
+            ),
+            Some(false),
+            "the complete Integer hierarchy proves String incompatible"
+        );
     }
 
     struct HierarchySymbols;
