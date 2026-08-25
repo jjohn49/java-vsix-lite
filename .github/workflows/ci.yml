@@ -87,6 +87,25 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install build tools
         run: apk add --no-cache build-base
+      - name: Install JDK
+        # The debug-adapter and classpath-layer JDK discovery
+        # (`jvl_classpath::best_jdk`) already scans `/usr/lib/jvm`, but the
+        # `lifecycle.rs` test helpers' own `discover_java_home` deliberately
+        # checks *only* `$JAVA_HOME` (never a PATH search), and `dap.rs`'s
+        # fixture setup runs the bare `javac`/`java` command names (PATH
+        # only, no `$JAVA_HOME` lookup) — export both so every JDK-gated
+        # test in this workspace actually runs here instead of silently
+        # skipping (`lifecycle.rs`) or hard failing (`dap.rs`). The apk
+        # package does not symlink javac onto PATH itself, so the
+        # well-known install path (confirmed against Alpine's package file
+        # listing) is used directly, with a hard failure if a future
+        # package revision moves it rather than silently exporting a bogus
+        # JAVA_HOME/PATH.
+        run: |
+          apk add --no-cache openjdk21-jdk
+          test -x /usr/lib/jvm/java-21-openjdk/bin/javac
+          echo "JAVA_HOME=/usr/lib/jvm/java-21-openjdk" >> "$GITHUB_ENV"
+          echo "/usr/lib/jvm/java-21-openjdk/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Fetch dependencies
         run: cargo fetch --locked

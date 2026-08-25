@@ -177,6 +177,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
+  // M8b follow-up: the one-shot activation sweep below only covers Java
+  // documents already open at that exact instant — in practice activation
+  // routinely completes before the user (or a restored session) has opened
+  // any Java file at all, leaving that sweep a permanent no-op. Cover the
+  // realistic case too: opening a Java file later in the session schedules
+  // the same debounced, single-flighted module check as a save, so its
+  // pre-existing errors surface without requiring an edit first.
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (
+        doc.languageId === "java" &&
+        doc.uri.scheme === "file" &&
+        javacBackgroundCheckEnabled()
+      ) {
+        scheduleSaveCheck(doc.uri.toString());
+      }
+    }),
+  );
+
   // M8b follow-up: granting trust mid-session unlocks the background check
   // — run the on-load pass then, since activation skipped it.
   context.subscriptions.push(

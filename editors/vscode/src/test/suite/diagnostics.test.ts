@@ -137,19 +137,18 @@ suite("diagnostics pipeline", () => {
         "incompatible types: String cannot be converted to int",
       );
 
-      // Save to trigger the automatic (trust-gated, checkOnSave) javac pass.
-      // When a JDK is available javac republishes the same incompatibility
-      // and the server dedupes it against the native entry; without a JDK
-      // the native diagnostic simply stands. Either way the editor must end
-      // with exactly ONE matching incompatibility — never two.
+      // Save to trigger the automatic (trust-gated, checkOnSave) javac pass,
+      // then explicitly run the manual `Check Project` command and await its
+      // full request/response round trip as the deterministic "the compiler
+      // pass has completed and republished" signal. A content-based poll
+      // (e.g. waiting for a `source: "javac"` diagnostic) cannot serve that
+      // role here: when a JDK is available, javac CONFIRMS the exact same
+      // incompatibility the native pass already reported, and the merge
+      // keeps the native entry in place rather than swapping in javac's
+      // redundant copy (see `merge_javac_diagnostics`) — so `source` stays
+      // `"java-vsix-lite"` even after a real, successful compiler pass.
       assert.ok(await doc.save(), "save failed");
-      await waitFor(
-        () =>
-          vscode.languages
-            .getDiagnostics(uri)
-            .some((d) => d.source === "javac"),
-        60_000,
-      );
+      await vscode.commands.executeCommand("java-vsix-lite.checkProject");
       const matching = vscode.languages
         .getDiagnostics(uri)
         .filter((d) => /String cannot be converted to int/.test(d.message));

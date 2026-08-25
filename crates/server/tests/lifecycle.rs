@@ -3527,6 +3527,115 @@ fn check_scoped_rejects_invalid_and_outside_uris() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+/// A "modules" batch mixing a real, checkable module file with a stray file
+/// the server can't resolve to any module/source root (the exact shape a
+/// real editor session produces: e.g. one open document lives under a
+/// dot-directory test fixture outside any `src/main/java` convention) must
+/// still check whatever it CAN resolve — one unsupported-layout straggler
+/// must never silently drop every other, perfectly valid file in the same
+/// batch. Only when EVERY uri in the batch is unsupported does the request
+/// fail with `"unsupported-layout"` (phase 2) — this is the one case, not a
+/// batch-wide veto by a single bad entry.
+/// Skips gracefully if no JDK is discoverable.
+#[test]
+fn check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one() {
+    let Some(java_home) = discover_java_home() else {
+        eprintln!(
+            "skipping check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one: no JDK discoverable"
+        );
+        return;
+    };
+
+    let root = temp_root("scoped-mixed");
+    let a_dir = root.join("mod-a/src/main/java/a");
+    std::fs::create_dir_all(&a_dir).expect("mod-a dirs");
+    std::fs::write(root.join("mod-a/pom.xml"), "<project/>").expect("mod-a pom");
+    let a_path = a_dir.join("A.java");
+    // A genuine compile error so a nonzero errorCount proves this module was
+    // actually checked, not silently skipped alongside the stray file.
+    let a_broken =
+        "package a;\npublic class A {\n    void m() {\n        int x = \"nope\";\n    }\n}\n";
+    std::fs::write(&a_path, a_broken).expect("write A");
+
+    // A real .java file inside the workspace, but outside any Maven/Gradle
+    // module and outside the workspace-root conventional source roots —
+    // mirrors a dot-directory test fixture deliberately kept off the javac
+    // source walk (see the VS Code suite's `.syntax-fixture/Syntax.java`).
+    let stray_dir = root.join("stray");
+    std::fs::create_dir_all(&stray_dir).expect("stray dir");
+    let stray_path = stray_dir.join("Stray.java");
+    std::fs::write(&stray_path, "class Stray {}").expect("write Stray");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .env("JAVA_HOME", &java_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let a_uri = format!("file://{}", a_path.display());
+    let stray_uri = format!("file://{}", stray_path.display());
+
+    // Phase 1: a batch with BOTH uris must still check mod-a (the stray
+    // entry is silently left unchecked, exactly like a save-triggered batch
+    // that happens to include an unrelated open document).
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{a_uri}","{stray_uri}"]}}]}}}}"#
+    ));
+    let raw = read_until(&mut reader, "\"id\":2", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-1 result");
+    assert_eq!(
+        json["result"]["status"], "ok",
+        "the resolvable half of a mixed batch must still be checked: {raw}"
+    );
+    assert_eq!(
+        json["result"]["scope"], "modules",
+        "phase 1 must stay scoped, never widen to a project check: {raw}"
+    );
+    assert_eq!(
+        json["result"]["errorCount"], 1,
+        "mod-a's real error must be reported despite the stray uri: {raw}"
+    );
+
+    // Phase 2: a batch where EVERY uri is unsupported must still fail —
+    // tolerance for a partial batch is not tolerance for an empty one.
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{stray_uri}"]}}]}}}}"#
+    ));
+    let raw = read_until(&mut reader, "\"id\":3", &mut seen);
+    let json: Value = serde_json::from_str(&raw).expect("parse phase-2 result");
+    assert_eq!(
+        json["result"]["status"], "unsupported-layout",
+        "an all-unsupported batch must still fail clearly: {raw}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The heart of the scoped-check design, end to end against real `javac` on a
 /// two-module Maven project (`mod-a` depends on `mod-b`):
 ///

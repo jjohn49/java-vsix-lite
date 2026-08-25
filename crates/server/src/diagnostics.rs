@@ -331,10 +331,17 @@ impl Backend {
     /// Maven/Gradle module, compile only those modules (with every workspace
     /// source root on `-sourcepath` so sibling sources resolve without being
     /// compiled eagerly), and replace javac diagnostics only within the
-    /// checked modules. A malformed/empty request is an error — never widened
-    /// into a project compile — and a compiler diagnostic against a file
-    /// *outside* the checked modules means the scoped view is incomplete, so
-    /// the run transparently falls back to one full-project check.
+    /// checked modules. A malformed/empty request, a non-`.java`/non-`file:`
+    /// URI, or a URI outside the workspace is a hard error for the whole
+    /// request — never silently widened into a project compile. A URI that
+    /// simply can't be resolved to any module/source root (`unsupported-
+    /// layout`) is different: it is silently left unchecked rather than
+    /// vetoing the rest of an otherwise-valid batch (a real editor session
+    /// routinely batches an unrelated stray document alongside legitimate
+    /// saves/opens) — the request only fails that way when EVERY uri in the
+    /// batch is unsupported. A compiler diagnostic against a file *outside*
+    /// the checked modules means the scoped view is incomplete, so the run
+    /// transparently falls back to one full-project check.
     async fn run_check_scoped(&self, document_uris: Vec<String>) -> serde_json::Value {
         if document_uris.is_empty() {
             return serde_json::json!({
@@ -360,10 +367,13 @@ impl Backend {
         };
 
         // Resolve every saved document to an in-workspace `.java` file and the
-        // module that owns it. Any invalid/outside URI is a hard error (never
-        // silently widened to a project compile).
+        // module that owns it. A non-`.java`/non-`file:` URI or one outside
+        // the workspace is a hard error for the whole request (never silently
+        // widened into a project compile); a URI with no recognizable module
+        // is instead skipped (see `unsupported_layout` below).
         let mut module_roots: Vec<PathBuf> = Vec::new();
         let mut explicit_roots: Vec<PathBuf> = Vec::new();
+        let mut unsupported_layout: Option<String> = None;
         // Same-lock version snapshot as `run_check_full_project`: the
         // revision baseline handed to `publish_javac_diagnostics_scoped`.
         let start_versions: HashMap<String, i32> = {
@@ -390,18 +400,18 @@ impl Backend {
                     None => {
                         // No build marker up to the workspace root: fall back to
                         // the workspace root only if the file sits under a
-                        // conventional source root there; otherwise it's an
-                        // unsupported layout for a scoped check.
+                        // conventional source root there; otherwise this one
+                        // uri has an unsupported layout for a scoped check —
+                        // leave it unchecked and keep resolving the rest of
+                        // the batch (see the doc comment above).
                         let src_roots = javac::conventional_source_roots(&project_root);
                         if src_roots.iter().any(|r| file.starts_with(r)) {
                             project_root.clone()
                         } else {
-                            return serde_json::json!({
-                                "status": "unsupported-layout",
-                                "message": format!(
-                                    "{uri_str} is not inside a Maven/Gradle module or a conventional source root; use Check Project (javac) instead"
-                                ),
-                            });
+                            if unsupported_layout.is_none() {
+                                unsupported_layout = Some(uri_str.clone());
+                            }
+                            continue;
                         }
                     }
                 };
@@ -422,6 +432,19 @@ impl Backend {
                         }
                     }
                 }
+            }
+            if module_roots.is_empty() {
+                // Every uri in the batch was unsupported — nothing to check,
+                // unlike a partial batch (see the doc comment above).
+                let uri_str = unsupported_layout.expect(
+                    "non-empty document_uris with no resolved module roots implies at least one unsupported-layout uri",
+                );
+                return serde_json::json!({
+                    "status": "unsupported-layout",
+                    "message": format!(
+                        "{uri_str} is not inside a Maven/Gradle module or a conventional source root; use Check Project (javac) instead"
+                    ),
+                });
             }
             docs.iter()
                 .map(|(uri_str, doc)| (uri_str.clone(), doc.version))
