@@ -220,10 +220,10 @@ fn fqn_from_jvl_src_uri(uri: &str) -> Option<String> {
 }
 
 /// The `unresolvedMemberDiagnostics` flag from `initializationOptions`.
-/// Default-on: the diagnostic itself (`member_diagnostics`) is
-/// conservative and stays silent whenever resolution is incomplete, so this
-/// flag exists only for a user who wants to opt back out, not to gate an
-/// otherwise-risky feature.
+/// Default-on: the member rule inside `semantic_diagnostics` is conservative
+/// and stays silent whenever resolution is incomplete, so this flag exists
+/// only for a user who wants to opt back out of that rule, not to gate the
+/// always-enabled return checks.
 fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
     params
         .initialization_options
@@ -2085,8 +2085,8 @@ mod tests {
     }
 
     /// With no `initializationOptions` at all, unresolved-member
-    /// diagnostics must default to **on** (the conservative gating inside
-    /// `member_diagnostics` is what keeps this safe, not this flag).
+    /// diagnostics must default to **on** (the conservative member gating
+    /// inside `semantic_diagnostics` is what keeps this safe, not this flag).
     #[test]
     fn unresolved_member_diagnostics_defaults_to_true_when_absent() {
         let params = InitializeParams::default();

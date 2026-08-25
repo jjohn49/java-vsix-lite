@@ -106,13 +106,12 @@ impl Backend {
         }
     }
 
-    /// Syntax diagnostics for a document already stored under `uri`, plus
-    /// unresolved-member diagnostics unless that setting has been turned
-    /// off, plus any `javac` diagnostics still on file for `uri` —
-    /// merged in, never clobbering either set. Unlike the first two, the
-    /// `javac` diagnostics don't require `uri` to be an open document: a
-    /// checked file the editor never opened still gets its diagnostics
-    /// published (see `Backend::publish_javac_diagnostics`).
+    /// Syntax, immediate semantic, and structural diagnostics for a document
+    /// already stored under `uri`, plus any `javac` diagnostics still on file
+    /// for `uri` — merged in, never clobbering either set. Unlike the native
+    /// diagnostics, the `javac` diagnostics don't require `uri` to be an open
+    /// document: a checked file the editor never opened still gets its
+    /// diagnostics published (see `Backend::publish_javac_diagnostics`).
     pub(crate) fn compute_diagnostics(
         &self,
         docs: &HashMap<String, Document>,
@@ -122,19 +121,24 @@ impl Backend {
             Some(doc) => {
                 let index = LineIndex::new(&doc.text, self.encoding());
                 let mut d = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
-                if self.unresolved_member_diagnostics.get().copied() == Some(true) {
-                    let open = open_docs(docs, uri, doc);
-                    // Classpath-only, not `CombinedSymbols` — this is a
-                    // synchronous fn on the didOpen/didChange hot path, and
-                    // `ProjectSymbols` needs an async `ensure_workspace_index`
-                    // pass first. The unresolved-member check already stays
-                    // silent whenever a receiver's type doesn't resolve at
-                    // all (see `member_names`'s `complete` flag), so a
-                    // closed-file project type is a missed diagnosis, never a
-                    // false positive — an accepted gap, not a regression.
-                    let symbols = ClasspathSymbols(self.classpath());
-                    d.extend(jvl_syntax::member_diagnostics(&open, 0, &index, &symbols));
-                }
+                let open = open_docs(docs, uri, doc);
+                // Classpath-only, not `CombinedSymbols` — this is a
+                // synchronous fn on the didOpen/didChange hot path, and
+                // `ProjectSymbols` needs an async `ensure_workspace_index`
+                // pass first. Conservative semantic checks stay silent when
+                // project/classpath resolution is incomplete, so a closed-file
+                // project type is a missed diagnosis, never a false positive.
+                let symbols = ClasspathSymbols(self.classpath());
+                d.extend(jvl_syntax::semantic_diagnostics(
+                    &open,
+                    0,
+                    &index,
+                    &symbols,
+                    self.unresolved_member_diagnostics
+                        .get()
+                        .copied()
+                        .unwrap_or(true),
+                ));
                 let filename = filename_from_uri(uri);
                 let expected_package = self.expected_package(uri);
                 d.extend(jvl_syntax::structural_diagnostics(

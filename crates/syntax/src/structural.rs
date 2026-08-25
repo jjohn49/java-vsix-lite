@@ -14,7 +14,7 @@
 //! Single pass, no extra parsing: `structural_diagnostics` walks the tree
 //! once (plus one bounded pass over each type's own direct body children —
 //! never the whole tree again), matching the low-compute constraint the
-//! existing [`crate::syntax_diagnostics`]/[`crate::member_diagnostics`]
+//! existing [`crate::syntax_diagnostics`]/[`crate::semantic_diagnostics`]
 //! already meet.
 
 use std::collections::HashSet;

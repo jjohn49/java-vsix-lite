@@ -777,7 +777,7 @@ pub(crate) fn resolve_object_creation_type<'t>(
 /// Resolve a declared-type node to a receiver type: in-project if the open docs
 /// declare it, else an external FQN (fully-qualified use, or a simple name
 /// resolved through imports + the symbol source).
-fn resolve_type_node<'t>(
+pub(crate) fn resolve_type_node<'t>(
     type_node: Node<'t>,
     source: &'t str,
     ctx: &Ctx<'_, 't>,
