@@ -126,18 +126,25 @@ fn javac_confirms_native(native: &Diagnostic, javac: &Diagnostic) -> bool {
 }
 
 /// Merge a file's stored `javac` diagnostics into its freshly computed
-/// native set, preferring the compiler for an equivalent current result:
-/// every native entry some javac diagnostic confirms (see
-/// [`javac_confirms_native`]) is removed, then ALL javac diagnostics
-/// are appended in their original order. Surviving natives keep their
-/// order; unrelated diagnostics are never deduplicated.
+/// native set, preferring the native entry for an equivalent current
+/// result: a native diagnostic some javac diagnostic confirms (see
+/// [`javac_confirms_native`]) is left exactly as it was — never swapped for
+/// javac's copy, so a save never flips its `source` field or otherwise
+/// changes what's already showing (equivalence already proves the payload
+/// is the same). Only javac diagnostics that confirm no existing native
+/// entry are appended, in their original order, after every native. Native
+/// order and content are otherwise untouched; unrelated diagnostics are
+/// never deduplicated.
 fn merge_javac_diagnostics(diagnostics: &mut Vec<Diagnostic>, javac: Vec<Diagnostic>) {
-    diagnostics.retain(|native| {
-        !javac
-            .iter()
-            .any(|javac| javac_confirms_native(native, javac))
-    });
-    diagnostics.extend(javac);
+    let unmatched: Vec<Diagnostic> = javac
+        .into_iter()
+        .filter(|javac_diag| {
+            !diagnostics
+                .iter()
+                .any(|native| javac_confirms_native(native, javac_diag))
+        })
+        .collect();
+    diagnostics.extend(unmatched);
 }
 
 impl Backend {
@@ -865,12 +872,12 @@ mod tests {
         }
     }
 
-    /// An equivalent current javac result replaces the native return
-    /// diagnostic instead of duplicating it: the native entry is removed and
-    /// the javac diagnostic is appended, leaving exactly one javac-sourced
-    /// incompatibility.
+    /// An equivalent current javac result confirms the native return
+    /// diagnostic instead of replacing it: the native entry is left exactly
+    /// as it was (no source-field flip on save), and the now-redundant
+    /// javac diagnostic is dropped rather than appended as a duplicate.
     #[test]
-    fn merge_replaces_equivalent_native_return_diagnostic() {
+    fn merge_keeps_native_return_diagnostic_when_javac_confirms() {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
         merge_javac_diagnostics(
             &mut merged,
@@ -885,9 +892,9 @@ mod tests {
         assert_eq!(
             merged.len(),
             1,
-            "expected the native entry replaced: {merged:#?}"
+            "expected the confirming javac entry dropped, native kept: {merged:#?}"
         );
-        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+        assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
         assert_eq!(merged[0].message, RETURN_MESSAGE);
     }
 
@@ -913,9 +920,9 @@ mod tests {
         assert_eq!(
             merged.len(),
             1,
-            "expected the native entry replaced: {merged:#?}"
+            "expected the confirming javac entry dropped: {merged:#?}"
         );
-        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+        assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
     }
 
     /// A different first-line payload (after stripping `incompatible
@@ -1053,11 +1060,11 @@ mod tests {
     }
 
     /// Unrelated native diagnostics sharing the line with a confirmed return
-    /// error are untouched: only the one equivalent native entry is removed,
-    /// and every javac diagnostic (matching or not) is appended after the
-    /// surviving native entries.
+    /// error are untouched, and the confirmed native entry itself is kept
+    /// (not swapped for javac's copy): only javac diagnostics with no
+    /// confirming native match are appended, after every surviving native.
     #[test]
-    fn merge_removes_only_the_equivalent_entry_and_appends_javac() {
+    fn merge_keeps_all_natives_and_appends_only_unmatched_javac() {
         let mut merged = vec![
             native_other(4, 8, 14, "Syntax error"),
             native_return(4, 15, 20, RETURN_MESSAGE),
@@ -1079,14 +1086,14 @@ mod tests {
         assert_eq!(
             merged.len(),
             4,
-            "only the equivalent entry may go: {merged:#?}"
+            "all natives survive, only the unmatched javac entry is added: {merged:#?}"
         );
-        // Surviving natives first, in their original order…
+        // Every native, in original order, none swapped…
         assert_eq!(merged[0].message, "Syntax error");
-        assert_eq!(merged[1].message, "cannot resolve member frobnicate");
-        // …then the javac diagnostics, appended in their original order.
-        assert_eq!(merged[2].source.as_deref(), Some("javac"));
-        assert_eq!(merged[2].message, RETURN_MESSAGE);
+        assert_eq!(merged[1].source.as_deref(), Some("java-vsix-lite"));
+        assert_eq!(merged[1].message, RETURN_MESSAGE);
+        assert_eq!(merged[2].message, "cannot resolve member frobnicate");
+        // …then only the javac diagnostic that confirmed nothing.
         assert_eq!(merged[3].source.as_deref(), Some("javac"));
         assert_eq!(merged[3].message, "cannot find symbol");
     }
@@ -1114,9 +1121,10 @@ mod tests {
     /// javac confirms a native incompatible-initializer error exactly like a
     /// return error: `jvl.incompatibleAssignment` is a dedupable code, the
     /// folded `required:`/`found:` continuation lines are ignored, and the
-    /// `incompatible types: ` prefix strips when present on BOTH first lines.
+    /// `incompatible types: ` prefix strips when present on BOTH first
+    /// lines. The native entry is kept; its confirming javac copy is dropped.
     #[test]
-    fn merge_replaces_equivalent_native_assignment_diagnostic() {
+    fn merge_keeps_native_assignment_diagnostic_when_javac_confirms() {
         let message = "incompatible types: int cannot be converted to boolean";
         let folded = format!("{message}\n  required: boolean\n  found:    int");
         let mut merged = vec![native_coded(
@@ -1139,16 +1147,17 @@ mod tests {
         assert_eq!(
             merged.len(),
             1,
-            "expected the native entry replaced: {merged:#?}"
+            "expected the confirming javac entry dropped: {merged:#?}"
         );
-        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+        assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
     }
 
     /// javac emits `unreachable statement` verbatim — no `incompatible
     /// types: ` prefix on either side — so the first lines compare verbatim
-    /// and the native `jvl.unreachable` entry is replaced.
+    /// and the native `jvl.unreachable` entry is kept (its confirming javac
+    /// copy is dropped rather than duplicated).
     #[test]
-    fn merge_replaces_equivalent_native_unreachable_diagnostic() {
+    fn merge_keeps_native_unreachable_diagnostic_when_javac_confirms() {
         let mut merged = vec![native_coded(
             jvl_syntax::UNREACHABLE_CODE,
             7,
@@ -1169,9 +1178,9 @@ mod tests {
         assert_eq!(
             merged.len(),
             1,
-            "expected the native entry replaced: {merged:#?}"
+            "expected the confirming javac entry dropped, native kept: {merged:#?}"
         );
-        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+        assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
     }
 
     /// The `incompatible types: ` prefix strips only when BOTH first lines

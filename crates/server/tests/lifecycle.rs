@@ -1935,10 +1935,13 @@ fn discover_java_home() -> Option<String> {
 /// on disk (neither ever opened) → `checkProject` → a `javac`-sourced
 /// diagnostic published against the broken file's URI and *no*
 /// `publishDiagnostics` at all for the good one; opening the broken file
-/// still shows its stale `javac` diagnostic (merged in, not clobbered); and
-/// editing it clears that diagnostic immediately (stale after edit), well
-/// before any second `checkProject` run. Skips gracefully (like the JDK
-/// round trips above) if no JDK is discoverable in this environment.
+/// then runs the native initializer check too, which independently confirms
+/// the identical incompatibility — the stored `javac` diagnostic is dropped
+/// as redundant rather than duplicating the now-native-sourced one (merged,
+/// not clobbered); and editing it clears that diagnostic immediately (stale
+/// after edit), well before any second `checkProject` run. Skips gracefully
+/// (like the JDK round trips above) if no JDK is discoverable in this
+/// environment.
 #[test]
 fn check_project_javac_round_trip() {
     let Some(java_home) = discover_java_home() else {
@@ -2025,16 +2028,23 @@ fn check_project_javac_round_trip() {
         "Good.java compiled clean — it must never receive a publishDiagnostics notification: {seen:#?}"
     );
 
-    // Opening the broken file still shows its stale javac diagnostic —
-    // merged with (here, zero) syntax diagnostics, not clobbered.
+    // Opening the broken file's native initializer check independently
+    // confirms the identical incompatibility; the stored javac diagnostic
+    // is dropped as redundant (kept-native semantics) rather than
+    // duplicating it, so exactly the native-sourced diagnostic remains.
     let escaped_broken_text = json_escape(broken_text);
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{broken_uri}","languageId":"java","version":1,"text":"{escaped_broken_text}"}}}}}}"#
     ));
     let opened_diags = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
     assert!(
-        opened_diags.contains("\"source\":\"javac\""),
-        "opening the file should still show its stale javac diagnostic: {opened_diags}"
+        opened_diags.contains("jvl.incompatibleAssignment")
+            && opened_diags.contains("\"source\":\"java-vsix-lite\""),
+        "opening the file should show the native diagnostic, confirmed (not duplicated) by the stale javac one: {opened_diags}"
+    );
+    assert!(
+        !opened_diags.contains("\"source\":\"javac\""),
+        "the confirmed javac copy must be dropped, not shown alongside the native one: {opened_diags}"
     );
 
     // Editing it clears the javac diagnostic immediately (stale after
@@ -3707,8 +3717,8 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        b_frame.contains("\"source\":\"javac\""),
-        "module B's diagnostic must be preserved by a module-A scoped check: {b_frame}"
+        b_frame.contains("cannot be converted to int"),
+        "module B's diagnostic must be preserved by a module-A scoped check — its buffer was also synced broken (line ~3649), so the native initializer check may now independently confirm it and keep the native copy rather than javac's surviving: {b_frame}"
     );
     let a_frame = seen[mark..]
         .iter()
@@ -3883,15 +3893,15 @@ fn wrong_return_stderr(path: &std::path::Path) -> String {
     )
 }
 
-/// Task 3: an equivalent compiler result must REPLACE the native return
+/// Task 3: an equivalent compiler result must CONFIRM the native return
 /// diagnostic, never duplicate it. A wrong-return document is open (native
 /// `jvl.incompatibleReturn` published), then a fake `javac` (see
 /// [`write_fake_javac_jdk`]) reports the identical incompatibility for the
 /// same expression. After the check completes, the editor-visible set for
-/// the file must contain exactly ONE matching incompatibility — the
-/// javac-sourced one — not a native+javac pair; and, as a compiler
-/// republish snapshot of a live buffer, the publication must carry the
-/// document's version.
+/// the file must contain exactly ONE matching incompatibility — the native
+/// one, kept in place rather than swapped for javac's copy — not a
+/// native+javac pair; and, as a compiler republish snapshot of a live
+/// buffer, the publication must carry the document's version.
 #[cfg(unix)]
 #[test]
 fn javac_result_does_not_duplicate_native_return_diagnostic() {
@@ -3947,11 +3957,9 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
     for _ in 0..128 {
         let slice = &seen[mark..];
         let have_response = slice.iter().any(|f| f.contains("\"id\":2"));
-        let have_publish = slice.iter().any(|f| {
-            f.contains("publishDiagnostics")
-                && f.contains(&uri)
-                && f.contains("\"source\":\"javac\"")
-        });
+        let have_publish = slice
+            .iter()
+            .any(|f| f.contains("publishDiagnostics") && f.contains(&uri));
         if have_response && have_publish {
             break;
         }
@@ -3994,8 +4002,8 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
         "exactly one matching incompatibility must remain — never a native+javac duplicate: {publication}"
     );
     assert_eq!(
-        matching[0]["source"], "javac",
-        "the surviving equivalent result must be the javac-sourced one: {publication}"
+        matching[0]["source"], "java-vsix-lite",
+        "the surviving equivalent result must be the kept native one, not swapped for javac's copy: {publication}"
     );
     // Compiler republish snapshots of live buffers are versioned too.
     assert_eq!(
