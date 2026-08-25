@@ -1,14 +1,27 @@
 # Changelog
 
+## 0.1.6 — 2026-08-25
+
+### Added
+- Immediate native semantic diagnostics report incompatible method returns
+  and variable/field initializers, unreachable statements (with correct
+  `try`/`catch`/`finally` reachability — a `finally` block is always
+  checked, and a pending return/throw from `try` or `catch` survives a
+  normally-completing `finally`), and unused locals, eligible parameters,
+  and unreferenced private fields/methods — all without waiting for a save
+  or `javac`. Unused warnings can be disabled with
+  `java-vsix-lite.diagnostics.unused`; automatic `javac` remains the broad,
+  revision-safe correctness backstop.
+
+### Changed
+- When the automatic `javac` check confirms a native diagnostic, the native
+  entry is now kept in place instead of being replaced by the compiler's
+  copy — a save no longer flips an already-showing error's source or
+  otherwise changes what's displayed for an already-proven issue.
+
 ## 0.1.5 — 2026-08-24
 
 ### Added
-- Immediate native semantic diagnostics now report incompatible method returns
-  and variable/field initializers, unreachable statements, and unused locals,
-  eligible parameters, and unreferenced private fields/methods without
-  waiting for a save or `javac`. Unused warnings can be disabled with
-  `java-vsix-lite.diagnostics.unused`; automatic `javac` remains the broad,
-  revision-safe correctness backstop.
 - **Java debugging** (launch and attach) via a pure-Rust DAP↔JDWP adapter
   built into the existing `jvl-server` binary (`jvl-server dap`) — no new
   native artifacts, no JVM-side components. F5 on a Java file with a `main`
