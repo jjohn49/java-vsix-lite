@@ -10,15 +10,15 @@ java-vsix-lite provides core Java editing features without the overhead of a JVM
 
 The following local benchmark compares java-vsix-lite with the full language server bundled in Red Hat Java 1.55.0 across five established small Maven projects. Each result is **mean / median / sample standard deviation** from 10 measured fresh-server runs after one unrecorded warm-up.
 
-Across all 50 measured runs per server, the complete workflow averaged **157 ms and 17.9 MiB RSS** for java-vsix-lite versus **9.41 s and 931 MiB RSS** for Red Hat—about **60x faster and 52x lower-memory** for the shared operations tested here.
+Across all 50 measured runs per server, the complete workflow averaged **163 ms and 19.6 MiB RSS** for java-vsix-lite versus **9.56 s and 937 MiB RSS** for Red Hat—about **59x faster and 48x lower-memory** for the shared operations tested here.
 
 | Project | Java files | java-vsix-lite total | Red Hat total | Speedup | java-vsix-lite RSS | Red Hat RSS |
 |---|---:|---:|---:|---:|---:|---:|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) | 49 | 336 / 329 / 14 ms | 13.61 / 13.61 / 0.16 s | 40.5x | 21.5 / 21.8 / 0.7 MiB | 1436 / 1438 / 17 MiB |
-| [Apache Commons CLI](https://github.com/apache/commons-cli) | 87 | 95.8 / 95.8 / 0.5 ms | 8.88 / 8.79 / 0.25 s | 92.7x | 16.8 / 16.9 / 0.4 MiB | 693 / 695 / 31 MiB |
-| [Gson core](https://github.com/google/gson) | 210 | 108 / 108 / 1.2 ms | 9.51 / 9.61 / 0.23 s | 87.9x | 17.4 / 17.3 / 0.4 MiB | 864 / 866 / 55 MiB |
-| [Joda-Time](https://github.com/JodaOrg/joda-time) | 330 | 128 / 124 / 9.7 ms | 7.20 / 7.11 / 0.41 s | 56.3x | 18.1 / 18.1 / 0.4 MiB | 843 / 848 / 12 MiB |
-| [JUnit 4](https://github.com/junit-team/junit4) | 471 | 116 / 114 / 6.7 ms | 7.85 / 7.64 / 0.76 s | 67.4x | 15.9 / 15.7 / 0.6 MiB | 819 / 824 / 17 MiB |
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) | 49 | 348.6 / 357.5 / 21.1 ms | 13.80 / 13.94 / 0.31 s | 39.6x | 26.3 / 26.0 / 1.2 MiB | 1430 / 1432 / 19 MiB |
+| [Apache Commons CLI](https://github.com/apache/commons-cli) | 87 | 110.3 / 100.5 / 15.0 ms | 9.27 / 9.40 / 0.28 s | 84.1x | 18.2 / 18.1 / 0.4 MiB | 727 / 726 / 32 MiB |
+| [Gson core](https://github.com/google/gson) | 210 | 113.2 / 103.2 / 14.9 ms | 9.97 / 10.00 / 0.23 s | 88.0x | 18.4 / 18.4 / 0.4 MiB | 856 / 856 / 60 MiB |
+| [Joda-Time](https://github.com/JodaOrg/joda-time) | 330 | 125.3 / 114.9 / 14.9 ms | 7.31 / 7.40 / 0.14 s | 58.3x | 18.5 / 18.5 / 0.4 MiB | 844 / 842 / 9 MiB |
+| [JUnit 4](https://github.com/junit-team/junit4) | 471 | 115.1 / 107.7 / 19.9 ms | 7.43 / 7.40 / 0.11 s | 64.5x | 16.4 / 16.3 / 0.4 MiB | 827 / 832 / 17 MiB |
 
 “Total” is a sequential first-use workflow: start a fresh server, wait for readiness, open a synthetic Java file inside the project, receive diagnostics, request first and warm JDK completions, request a project/dependency-aware completion, then request first and warm workspace-symbol results. RSS is the observed resident memory of the language-server process tree after those operations.
 
@@ -29,22 +29,22 @@ All values below are **mean / median / sample standard deviation in milliseconds
 
 | Project | Server | Ready | Diagnostics | JDK completion | Project/dependency completion | Workspace symbol |
 |---|---|---:|---:|---:|---:|---:|
-| PetClinic | java-vsix-lite | 1.6 / 2.2 / 1.0 | 260 / 251 / 14 | 3.7 / 3.6 / 0.4 | 1.0 / 1.0 / 0.1 | 0.14 / 0.12 / 0.04 |
-|  | Red Hat | 4356 / 4345 / 71 | 1633 / 1617 / 32 | 6935 / 6936 / 117 | 52.7 / 43.0 / 22.7 | 312 / 326 / 63 |
-| Commons CLI | java-vsix-lite | 0.37 / 0.36 / 0.04 | 15.7 / 15.7 / 0.5 | 5.3 / 5.3 / 0.1 | 3.7 / 3.7 / 0.2 | 0.17 / 0.16 / 0.04 |
-|  | Red Hat | 4431 / 4427 / 48 | 1431 / 1424 / 19 | 2784 / 2659 / 232 | 29.0 / 27.7 / 7.3 | 64 / 58 / 19 |
-| Gson | java-vsix-lite | 0.36 / 0.34 / 0.03 | 14.7 / 14.5 / 0.8 | 11.7 / 11.6 / 0.4 | 10.5 / 10.3 / 0.4 | 0.27 / 0.24 / 0.08 |
-|  | Red Hat | 3949 / 3944 / 55 | 1699 / 1715 / 63 | 375 / 398 / 68 | 132 / 123 / 29 | 3208 / 3211 / 115 |
-| Joda-Time | java-vsix-lite | 0.59 / 0.39 / 0.58 | 16.7 / 14.5 / 6.1 | 18.2 / 17.9 / 1.2 | 20.8 / 20.3 / 1.3 | 0.31 / 0.31 / 0.03 |
-|  | Red Hat | 3511 / 3458 / 148 | 1535 / 1531 / 21 | 370 / 364 / 33 | 221 / 220 / 15 | 1402 / 1339 / 249 |
-| JUnit 4 | java-vsix-lite | 0.80 / 0.38 / 0.89 | 16.7 / 15.0 / 5.2 | 24.6 / 24.7 / 1.0 | 0.38 / 0.34 / 0.12 | 0.34 / 0.33 / 0.04 |
-|  | Red Hat | 3886 / 3691 / 443 | 1641 / 1596 / 139 | 306 / 251 / 97 | 29.1 / 20.2 / 25.0 | 1842 / 1766 / 217 |
+| PetClinic | java-vsix-lite | 14.1 / 2.33 / 17.5 | 14.1 / 2.33 / 17.5 | 269.8 / 265.3 / 20.2 | 3.25 / 3.27 / 0.11 | 0.98 / 0.97 / 0.06 | 0.18 / 0.15 / 0.04 |
+|  | Red Hat | 3378 / 3378 / 133 | 4595 / 4649 / 146 | 1647 / 1644 / 19.7 | 6952 / 6989 / 119 | 42.4 / 41.9 / 2.20 | 275.6 / 293.2 / 61.1 |
+| Commons CLI | java-vsix-lite | 12.6 / 0.37 / 15.8 | 12.6 / 0.37 / 15.8 | 28.2 / 27.8 / 0.97 | 4.96 / 4.98 / 0.22 | 3.70 / 3.67 / 0.16 | 0.17 / 0.16 / 0.03 |
+|  | Red Hat | 3159 / 3150 / 20.2 | 4637 / 4639 / 31.6 | 1446 / 1450 / 16.1 | 2955 / 3063 / 271 | 31.8 / 27.5 / 10.8 | 67.1 / 63.5 / 16.8 |
+| Gson | java-vsix-lite | 12.3 / 0.40 / 15.5 | 12.3 / 0.40 / 15.5 | 18.0 / 17.8 / 0.93 | 10.5 / 10.5 / 0.19 | 10.5 / 10.4 / 0.36 | 0.27 / 0.28 / 0.04 |
+|  | Red Hat | 3213 / 3198 / 59.8 | 4169 / 4161 / 64.4 | 1758 / 1753 / 40.5 | 380.5 / 409.3 / 78.8 | 135.4 / 118.2 / 37.8 | 3399 / 3409 / 132 |
+| Joda-Time | java-vsix-lite | 12.7 / 0.40 / 16.0 | 12.7 / 0.40 / 16.0 | 15.2 / 15.0 / 1.00 | 15.9 / 15.9 / 0.32 | 20.1 / 20.2 / 0.21 | 0.30 / 0.30 / 0.06 |
+|  | Red Hat | 3173 / 3161 / 34.5 | 3617 / 3607 / 43.2 | 1544 / 1536 / 19.5 | 377.1 / 391.4 / 24.1 | 235.8 / 238.7 / 18.8 | 1373 / 1410 / 111 |
+| JUnit 4 | java-vsix-lite | 15.2 / 0.39 / 21.0 | 15.2 / 0.39 / 21.0 | 14.9 / 14.7 / 0.66 | 22.1 / 21.6 / 1.94 | 0.26 / 0.25 / 0.03 | 0.29 / 0.29 / 0.02 |
+|  | Red Hat | 3228 / 3204 / 75.2 | 3738 / 3721 / 75.1 | 1555 / 1537 / 32.9 | 254.0 / 255.2 / 14.6 | 22.5 / 18.9 / 9.10 | 1716 / 1694 / 103 |
 
 </details>
 
 ### Benchmark method and limits
 
-- Tested on an 8-core Apple M1 Pro MacBook Pro with 16 GB RAM and macOS 26.5.2. The java-vsix-lite server was a release build at commit `a358c663`; the comparison used Red Hat Java 1.55.0 for Apple Silicon, including its embedded JRE and standard 100 MiB initial / 2 GiB maximum heap settings.
+- Tested on an 8-core Apple M1 Pro MacBook Pro with 16 GB RAM and macOS 26.5.2. The java-vsix-lite server was a release build at commit `294d8b63`; the comparison used Red Hat Java 1.55.0 for Apple Silicon, including its embedded JRE and standard 100 MiB initial / 2 GiB maximum heap settings.
 - Dependencies were prefetched once with Maven's `dependency:go-offline` **before** timing. Every measured Red Hat run used Maven offline mode with Gradle import disabled, and java-vsix-lite resolved artifacts already in the local Maven cache. No measured run downloaded dependencies.
 - Each measurement launched a new server. Red Hat also received a new JDT workspace/index for every run. Filesystem, OS, and artifact caches remained warm; run order alternated between the two servers.
 - The project-aware request resolved Spring's `ApplicationContext`, Hamcrest's `Matcher`, Commons CLI's `Options`, Gson's `Gson`, or Joda-Time's `DateTime`, depending on the project. This ensures the test goes beyond completing the initialization handshake. Different completion-item counts are not treated as quality scores.

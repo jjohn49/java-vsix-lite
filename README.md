@@ -10,7 +10,7 @@ The full feature list, settings, and security details live in the [VS Code exten
 
 On an Apple Silicon Mac, a release-build benchmark across five established small Maven projects (Spring PetClinic, Apache Commons CLI, Gson, Joda-Time, JUnit 4) compared a first-use workflow — fresh server start, readiness, diagnostics, JDK/project completions, and workspace symbols — against the full JDT server in Red Hat Java 1.55.0.
 
-Across all measured runs the workflow averaged **≈157 ms and ≈17.9 MiB RSS** for java-vsix-lite versus **≈9.4 s and ≈931 MiB RSS** for Red Hat — roughly **60× faster and 52× lower-memory** for the shared operations tested. The installed payload is **≈4.1 MiB** versus **176 MiB**. These figures reflect lower cold-start, idle-memory, and basic-editing overhead; they are not a claim of feature parity. Full per-project results and methodology are in the [extension README](editors/vscode/README.md#measured-footprint).
+Across all measured runs the workflow averaged **≈163 ms and ≈19.6 MiB RSS** for java-vsix-lite versus **≈9.6 s and ≈937 MiB RSS** for Red Hat — roughly **59× faster and 48× lower-memory** for the shared operations tested. The installed payload is **≈4.1 MiB** versus **176 MiB**. These figures reflect lower cold-start, idle-memory, and basic-editing overhead; they are not a claim of feature parity. Full per-project results and methodology are in the [extension README](editors/vscode/README.md#measured-footprint).
 
 ## How it works
 
