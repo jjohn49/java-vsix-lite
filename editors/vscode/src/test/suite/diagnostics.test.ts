@@ -83,4 +83,96 @@ suite("diagnostics pipeline", () => {
         .join("; ")}`,
     );
   });
+
+  test("native return diagnostic arrives without a save and survives the compiler pass", async function () {
+    this.timeout(120_000);
+    // Task 4 proof: the pure-Rust return check must land in the editor's
+    // collection from a `didChange` alone — no save, no subprocess — and the
+    // save-triggered javac pass must dedupe against it, never duplicate it.
+    const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypes.java");
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+    const originalText = doc.getText();
+
+    try {
+      // Replace the returned `1` with `"bad"` via a workspace edit — the
+      // buffer goes dirty and stays dirty; only `didChange` reaches the server.
+      const returnOffset = originalText.indexOf("return 1;");
+      assert.ok(returnOffset >= 0, "fixture must contain `return 1;`");
+      const oneOffset = returnOffset + "return ".length;
+      const breakEdit = new vscode.WorkspaceEdit();
+      breakEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(oneOffset), doc.positionAt(oneOffset + 1)),
+        '"bad"',
+      );
+      assert.ok(await vscode.workspace.applyEdit(breakEdit), "workspace edit was not applied");
+      assert.ok(doc.isDirty, "the edit must leave the buffer unsaved");
+
+      const arrived = await waitFor(
+        () =>
+          vscode.languages
+            .getDiagnostics(uri)
+            .some((d) => d.code === "jvl.incompatibleReturn"),
+        30_000,
+      );
+      assert.ok(
+        arrived,
+        "expected the native return diagnostic on an UNSAVED buffer — the " +
+          "no-save didChange path is broken if this times out",
+      );
+      const native = vscode.languages
+        .getDiagnostics(uri)
+        .filter((d) => d.code === "jvl.incompatibleReturn");
+      assert.strictEqual(
+        native.length,
+        1,
+        `expected exactly one jvl.incompatibleReturn diagnostic, got: ${native
+          .map((d) => d.message)
+          .join("; ")}`,
+      );
+      assert.strictEqual(native[0].source, "java-vsix-lite");
+      assert.strictEqual(
+        native[0].message,
+        "incompatible types: String cannot be converted to int",
+      );
+
+      // Save to trigger the automatic (trust-gated, checkOnSave) javac pass.
+      // When a JDK is available javac republishes the same incompatibility
+      // and the server dedupes it against the native entry; without a JDK
+      // the native diagnostic simply stands. Either way the editor must end
+      // with exactly ONE matching incompatibility — never two.
+      assert.ok(await doc.save(), "save failed");
+      await waitFor(
+        () =>
+          vscode.languages
+            .getDiagnostics(uri)
+            .some((d) => d.source === "javac"),
+        60_000,
+      );
+      const matching = vscode.languages
+        .getDiagnostics(uri)
+        .filter((d) => /String cannot be converted to int/.test(d.message));
+      assert.strictEqual(
+        matching.length,
+        1,
+        `expected exactly one matching incompatibility after the compiler pass ` +
+          `(dedup regression if two), got: ${matching
+            .map((d) => `${d.source}: ${d.message}`)
+            .join("; ")}`,
+      );
+    } finally {
+      // Leave the fixture clean on disk AND in the buffer even when an
+      // assertion above failed — later tests (and later suite runs against
+      // the same checkout) must never see the broken return.
+      const restoreEdit = new vscode.WorkspaceEdit();
+      restoreEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)),
+        originalText,
+      );
+      await vscode.workspace.applyEdit(restoreEdit);
+      await doc.save();
+    }
+  });
 });

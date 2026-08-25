@@ -200,6 +200,47 @@ suite("untrusted workspace", () => {
     );
   });
 
+  test("native return diagnostic is not trust-gated: jvl.incompatibleReturn arrives with no javac", async () => {
+    // Task 4 proof: the pure-Rust return check flags a wrong-typed method
+    // return in an UNTRUSTED workspace — no JDK process, no Workspace Trust,
+    // no automatic compiler setting involved. The complement of the test
+    // above: the javac tier stays silent while the native tier still works.
+    const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypeError.java");
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+
+    const arrived = await waitFor(
+      () =>
+        vscode.languages
+          .getDiagnostics(uri)
+          .some((d) => d.code === "jvl.incompatibleReturn"),
+      30_000,
+    );
+    assert.ok(
+      arrived,
+      "expected the native jvl.incompatibleReturn diagnostic in an untrusted " +
+        "workspace -- the default-tier return check must not be trust-gated",
+    );
+    const native = vscode.languages
+      .getDiagnostics(uri)
+      .filter((d) => d.code === "jvl.incompatibleReturn");
+    assert.strictEqual(native.length, 1, "expected exactly one native return diagnostic");
+    assert.strictEqual(native[0].source, "java-vsix-lite");
+    assert.strictEqual(
+      native[0].message,
+      "incompatible types: String cannot be converted to int",
+    );
+
+    // Same invariant as the test above, on this file: the native proof must
+    // not have come from a leaked compiler run.
+    const javacDiags = vscode.languages.getDiagnostics(uri).filter((d) => d.source === "javac");
+    assert.strictEqual(
+      javacDiags.length,
+      0,
+      "no diagnostic may have source === \"javac\" in an untrusted workspace",
+    );
+  });
+
   test('"Check Project (javac)" refuses to run untrusted and never publishes javac diagnostics', async () => {
     const uri = fixtureUri("src", "main", "java", "demo", "TypeError.java");
     await vscode.workspace.openTextDocument(uri);
