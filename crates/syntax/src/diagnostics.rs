@@ -347,12 +347,15 @@ fn can_complete_normally(statement: Node) -> bool {
 
 fn block_can_complete_normally(block: Node) -> bool {
     let mut cursor = block.walk();
-    block
+    for statement in block
         .named_children(&mut cursor)
         .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
-        .last()
-        .map(can_complete_normally)
-        .unwrap_or(true)
+    {
+        if !can_complete_normally(statement) {
+            return false;
+        }
+    }
+    true
 }
 
 /// A `try` can complete normally iff its body or any catch can complete
@@ -1517,6 +1520,72 @@ mod tests {
         }\n";
         let diagnostics = hygiene(src, false);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn dead_code_after_return_in_try_preserves_abrupt_completion() {
+        let src = "class C {
+            void m() {
+                try { return; dead(); }
+                finally { cleanup(); }
+                after();
+            }
+            void dead() { } void cleanup() { } void after() { }
+        }\n";
+        assert_eq!(
+            hygiene_messages(src, false),
+            ["unreachable statement", "unreachable statement"]
+        );
+    }
+
+    #[test]
+    fn dead_code_after_return_in_catch_preserves_abrupt_completion() {
+        let src = "class C {
+            void m() {
+                try { throw new RuntimeException(); }
+                catch (Exception e) { return; dead(); }
+                finally { cleanup(); }
+                after();
+            }
+            void dead() { } void cleanup() { } void after() { }
+        }\n";
+        assert_eq!(
+            hygiene_messages(src, false),
+            ["unreachable statement", "unreachable statement"]
+        );
+    }
+
+    #[test]
+    fn dead_code_after_return_in_finally_preserves_abrupt_completion() {
+        let src = "class C {
+            void m() {
+                try { cleanup(); }
+                finally { return; dead(); }
+                after();
+            }
+            void dead() { } void cleanup() { } void after() { }
+        }\n";
+        assert_eq!(
+            hygiene_messages(src, false),
+            ["unreachable statement", "unreachable statement"]
+        );
+    }
+
+    #[test]
+    fn dead_code_in_try_with_resources_preserves_abrupt_completion() {
+        let src = "class C {
+            void m() {
+                try (var resource = resource()) { return; dead(); }
+                finally { cleanup(); }
+                after();
+            }
+            AutoCloseable resource() { return null; }
+            void dead() { } void cleanup() { } void after() { }
+        }\n";
+        assert_eq!(
+            hygiene_messages(src, false),
+            ["unreachable statement", "unreachable statement"]
+        );
     }
 
     #[test]
