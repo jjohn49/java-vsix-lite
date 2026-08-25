@@ -66,7 +66,7 @@ The automatic `javac` check is a separate, transient cost: compiling the reposit
 ## Features
 
 - **Syntax highlighting and semantic tokens** — accurate Java token colouring driven by the Rust parser
-- **Diagnostics** — parse errors inline, plus unresolved-member errors (`obj.noSuchMethod()`) when the receiver's full type hierarchy resolves — conservative by design, on by default
+- **Diagnostics** — immediate parse, incompatible-return/initializer, unreachable-statement, unused-code, and conservative unresolved-member feedback without waiting for `javac`; compiler diagnostics remain the automatic trusted-workspace backstop
 - **Completion** — locals, members, chains (`list.stream().filter(...)`), and classpath/project type names with auto-import, including JDK and dependency signatures with generic types rendered (`V get(Object key)` on a `Map<K, V>`) — for project types too, whether or not their file is open
 - **Lombok awareness** — `@Getter`/`@Setter`/`@Data`/`@Value`/`@With`/`@Builder` members are synthesized for completion, chains (`Person.builder().name(…).build()`), hover, and the unresolved-member check — no annotation processor run, and only in files that actually import `lombok.*`
 - **Hover with Javadoc** — signatures and attached Javadoc for project symbols, JDK types (from `src.zip`), and dependencies (from `-sources.jar`)
@@ -105,6 +105,7 @@ Everything works out of the box: the JDK, Maven, Gradle, and the server binary a
 |---|---|---|
 | `java-vsix-lite.javac.checkOnSave` | `true` | Run a **module-scoped** `javac` check automatically on project load and after saving a Java file — only the module(s) owning the saved file(s) are compiled (trusted workspaces only; debounced and silent). The manual **Check Project (javac)** command stays full-workspace. Set to `false` to make the check on-demand only |
 | `java-vsix-lite.diagnostics.unresolvedMembers` | `true` | Report an error for a member access when the receiver's full type hierarchy resolves but declares no such member. Conservative — stays silent whenever resolution is incomplete |
+| `java-vsix-lite.diagnostics.unused` | `true` | Fade and warn on provably unused locals, eligible parameters, and unreferenced private fields/methods. Disable to hide unused-code warnings |
 | `java-vsix-lite.javac.timeoutSecs` | `120` | How long the `javac` check waits before timing out (clamped to 10–600) |
 | `java-vsix-lite.dependencies.autoDownload` | `prompt` | What to do when missing dependencies are detected in a trusted workspace: `prompt` (ask once per session), `always` (download silently), or `never` (disable the automatic check; the manual command still works) |
 | `java-vsix-lite.trace.server` | `off` | Trace the JSON-RPC traffic between VS Code and the server (for debugging) |

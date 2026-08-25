@@ -401,6 +401,9 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
       unresolvedMemberDiagnostics: vscode.workspace
         .getConfiguration("java-vsix-lite")
         .get<boolean>("diagnostics.unresolvedMembers", true),
+      unusedDiagnostics: vscode.workspace
+        .getConfiguration("java-vsix-lite")
+        .get<boolean>("diagnostics.unused", true),
       // M5.4: an explicit override for where to find `javac`, tried before
       // $JAVA_HOME (empty string means "unset" — the server falls back).
       jdkHome: vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home", ""),

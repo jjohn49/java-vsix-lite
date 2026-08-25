@@ -4,6 +4,8 @@
 //! so unknown project/classpath types, overloads, and recovery regions stay
 //! silent.
 
+use std::collections::HashMap;
+
 use ls_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use tree_sitter::Node;
 
@@ -53,6 +55,7 @@ pub fn semantic_diagnostics(
 
     let mut out = Vec::new();
     let root = doc.tree.root_node();
+    let name_counts = unused.then(|| identifier_counts(root, doc.source));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if out.len() >= MAX_DIAGNOSTICS {
@@ -69,13 +72,22 @@ pub fn semantic_diagnostics(
             }
             "field_declaration" => {
                 check_initializers(node, &ctx, index, &mut out);
-                if unused {
-                    check_unused_private_fields(node, root, doc.source, index, &mut out);
+                if let Some(name_counts) = &name_counts {
+                    check_unused_private_fields(
+                        node,
+                        root,
+                        name_counts,
+                        doc.source,
+                        index,
+                        &mut out,
+                    );
                 }
             }
             "block" => check_unreachable(node, index, &mut out),
-            "method_declaration" if unused => {
-                check_unused_method(node, root, doc.source, index, &mut out)
+            "method_declaration" => {
+                if let Some(name_counts) = &name_counts {
+                    check_unused_method(node, root, name_counts, doc.source, index, &mut out);
+                }
             }
             "constructor_declaration" if unused => {
                 check_unused_parameters(node, doc.source, index, &mut out)
@@ -321,6 +333,23 @@ fn check_unreachable(block: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) 
     }
 }
 
+/// Count identifier spellings once for file-wide private-member usage checks.
+/// Declaration identifiers are included, so a count greater than one means
+/// another same-spelled occurrence exists. Shadowing can only raise a count
+/// and mute a warning, preserving the rule's no-false-positive direction.
+fn identifier_counts<'a>(root: Node, source: &'a str) -> HashMap<&'a str, usize> {
+    let mut counts = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            *counts.entry(node_text(node, source)).or_default() += 1;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    counts
+}
+
 /// Whether `name` occurs as an `identifier` anywhere under `scope` other than
 /// at the declaration's own name node. Purely name-occurrence based — field
 /// accesses, method invocations, and `::name` method references all carry
@@ -404,8 +433,8 @@ fn has_override(declaration: Node, source: &str) -> bool {
     let found = modifiers.children(&mut cursor).any(|m| {
         matches!(m.kind(), "annotation" | "marker_annotation")
             && m.child_by_field_name("name")
-                .map(|name| node_text(name, source) == "Override")
-                .unwrap_or(false)
+                .and_then(|name| node_text(name, source).rsplit('.').next())
+                == Some("Override")
     });
     found
 }
@@ -451,6 +480,7 @@ fn check_unused_locals(
 fn check_unused_private_fields(
     field: Node,
     root: Node,
+    name_counts: &HashMap<&str, usize>,
     source: &str,
     index: &LineIndex,
     out: &mut Vec<Diagnostic>,
@@ -473,7 +503,7 @@ fn check_unused_private_fields(
         if name == "serialVersionUID" {
             continue;
         }
-        if !name_used(root, name_node, name, source) {
+        if name_counts.get(name).copied().unwrap_or(0) == 1 {
             out.push(unused_diagnostic(
                 index.range(name_node),
                 format!("unused private field '{name}'"),
@@ -490,6 +520,7 @@ fn check_unused_private_fields(
 fn check_unused_method(
     method: Node,
     root: Node,
+    name_counts: &HashMap<&str, usize>,
     source: &str,
     index: &LineIndex,
     out: &mut Vec<Diagnostic>,
@@ -503,7 +534,7 @@ fn check_unused_method(
     if is_private
         && !has_annotation(method)
         && !root.has_error()
-        && !name_used(root, name_node, name, source)
+        && name_counts.get(name).copied().unwrap_or(0) == 1
     {
         out.push(unused_diagnostic(
             index.range(name_node),
@@ -1422,6 +1453,12 @@ mod tests {
         // Syntactically `@Override` parses on a private method; the rule must
         // skip the whole method (the annotation also mutes the member rule).
         let src = "class C { @Override private void log(int level) { } }\n";
+        assert!(hygiene_messages(src, true).is_empty());
+    }
+
+    #[test]
+    fn qualified_override_annotated_method_parameters_are_silent() {
+        let src = "class C { @java.lang.Override private void log(int level) { } }\n";
         assert!(hygiene_messages(src, true).is_empty());
     }
 
