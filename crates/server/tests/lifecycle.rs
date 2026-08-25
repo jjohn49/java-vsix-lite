@@ -3730,3 +3730,405 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
     assert!(status.success(), "server exited with failure: {status:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Task 3/4: the no-save native return diagnostic, end to end over raw LSP.
+/// Opens a valid document, then makes it wrong-return (`int code() {
+/// return "bad"; }` shape) via `didChange` — with a timestamp taken
+/// immediately before the notification is written. The very next
+/// publication must carry exactly ONE `jvl.incompatibleReturn` ERROR
+/// (source `java-vsix-lite`, exact Task 2 message) and — because live
+/// buffers publish versioned diagnostics — `version` equal to the
+/// `didChange`'s document version. No save and no `workspace/executeCommand`
+/// is ever sent before the assertion, so the arrival is causally
+/// save-free and subprocess-free. The elapsed time is printed as
+/// `native_return_diagnostic_ms=<elapsed>` for observability only — per the
+/// Task 4 brief there is deliberately NO machine-specific timing threshold.
+#[test]
+fn native_return_diagnostic_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let valid = "class Sample {\n    int code() {\n        return 1;\n    }\n}\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///Sample.java","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(valid)
+    ));
+    let opened = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        opened.contains("\"diagnostics\":[]"),
+        "the valid document must open clean: {opened}"
+    );
+
+    // Timestamp IMMEDIATELY before the wrong-return didChange is written.
+    let wrong = "class Sample {\n    int code() {\n        return \"bad\";\n    }\n}\n";
+    let started = std::time::Instant::now();
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///Sample.java","version":2}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
+        json_escape(wrong)
+    ));
+    let publication = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    println!(
+        "native_return_diagnostic_ms={}",
+        started.elapsed().as_millis()
+    );
+
+    let json: Value = serde_json::from_str(&publication).expect("parse publication");
+    let diagnostics = json["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let matching: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|d| d["code"] == "jvl.incompatibleReturn")
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one jvl.incompatibleReturn diagnostic: {publication}"
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "no other diagnostic may accompany the return error here: {publication}"
+    );
+    assert_eq!(matching[0]["severity"], 1, "expected ERROR: {publication}");
+    assert_eq!(
+        matching[0]["source"], "java-vsix-lite",
+        "expected the native source: {publication}"
+    );
+    assert_eq!(
+        matching[0]["message"], "incompatible types: String cannot be converted to int",
+        "expected the exact Task 2 message: {publication}"
+    );
+    // Live buffers publish versioned diagnostics: Some(Document.version).
+    assert_eq!(
+        json["params"]["version"], 2,
+        "an open buffer's publication must carry the document version: {publication}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// A fake-`javac` JDK home for the Task 3 dedup/race lifecycle tests, in
+/// the same spirit as `javac_tests.rs`'s `write_slow_fake_javac` safety
+/// fixture: a `sh` script standing in for the compiler, wired in through
+/// the `jdkHome` initialization option (`java-vsix-lite.jdk.home`), which
+/// `locate_javac` requires to resolve to `<home>/bin/javac`. The script
+/// ignores its arguments, optionally touches `marker` and then sleeps
+/// `sleep_secs` (the stale-race half needs "compiler started, result not
+/// yet delivered" to be observable), then emits `stderr` — a valid javac
+/// wrong-return record — and exits 1 (a nonzero exit for compile errors is
+/// normal javac behavior). Unix-only, exactly like the existing fixture.
+#[cfg(unix)]
+fn write_fake_javac_jdk(
+    root: &std::path::Path,
+    stderr: &str,
+    marker_then_sleep: Option<(&std::path::Path, u64)>,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let jdk_home = root.join("fakejdk");
+    let bin = jdk_home.join("bin");
+    std::fs::create_dir_all(&bin).expect("create fake jdk bin dir");
+    let delay = match marker_then_sleep {
+        Some((marker, secs)) => format!("touch \"{}\"\nsleep {secs}\n", marker.display()),
+        None => String::new(),
+    };
+    let script = format!("#!/bin/sh\n{delay}cat >&2 <<'JVL_EOF'\n{stderr}\nJVL_EOF\nexit 1\n");
+    let javac = bin.join("javac");
+    std::fs::write(&javac, script).expect("write fake javac");
+    std::fs::set_permissions(&javac, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake javac");
+    jdk_home
+}
+
+/// The wrong-return source used by both fake-javac lifecycle tests. Line 5
+/// (1-based) is `        return "bad";` — the returned expression `"bad"`
+/// spans characters 15..20, so the native return diagnostic and the fake
+/// compiler record (caret at column 15, line length 21) overlap on the
+/// same line with the identical `incompatible types: ` payload.
+#[cfg(unix)]
+const WRONG_RETURN_SOURCE: &str =
+    "package demo;\n\npublic class Sample {\n    int code() {\n        return \"bad\";\n    }\n}\n";
+
+/// The stderr record the fake javac emits for [`WRONG_RETURN_SOURCE`],
+/// exactly as a real javac would echo it for `path`.
+#[cfg(unix)]
+fn wrong_return_stderr(path: &std::path::Path) -> String {
+    format!(
+        "{}:5: error: incompatible types: String cannot be converted to int\n        return \"bad\";\n               ^\n1 error",
+        path.display()
+    )
+}
+
+/// Task 3: an equivalent compiler result must REPLACE the native return
+/// diagnostic, never duplicate it. A wrong-return document is open (native
+/// `jvl.incompatibleReturn` published), then a fake `javac` (see
+/// [`write_fake_javac_jdk`]) reports the identical incompatibility for the
+/// same expression. After the check completes, the editor-visible set for
+/// the file must contain exactly ONE matching incompatibility — the
+/// javac-sourced one — not a native+javac pair; and, as a compiler
+/// republish snapshot of a live buffer, the publication must carry the
+/// document's version.
+#[cfg(unix)]
+#[test]
+fn javac_result_does_not_duplicate_native_return_diagnostic() {
+    let root = temp_root("javac-native-dup");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let src_path = src_dir.join("Sample.java");
+    std::fs::write(&src_path, WRONG_RETURN_SOURCE).expect("write Sample.java");
+    let jdk_home = write_fake_javac_jdk(&root, &wrong_return_stderr(&src_path), None);
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"initializationOptions":{{"jdkHome":"{}"}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#,
+        jdk_home.display()
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let uri = format!("file://{}", src_path.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(WRONG_RETURN_SOURCE)
+    ));
+    let opened = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        opened.contains("jvl.incompatibleReturn"),
+        "the native return diagnostic must arrive on open: {opened}"
+    );
+
+    // Run the (fake) compiler; its publish and its response are written by
+    // independent tower-lsp paths, so collect order-tolerantly until BOTH
+    // the response and a post-check publication for the file have arrived.
+    let mark = seen.len();
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
+    );
+    for _ in 0..128 {
+        let slice = &seen[mark..];
+        let have_response = slice.iter().any(|f| f.contains("\"id\":2"));
+        let have_publish = slice.iter().any(|f| {
+            f.contains("publishDiagnostics") && f.contains(&uri) && f.contains("\"source\":\"javac\"")
+        });
+        if have_response && have_publish {
+            break;
+        }
+        match read_frame(&mut reader) {
+            Some(f) => seen.push(f),
+            None => break,
+        }
+    }
+    let response = seen[mark..]
+        .iter()
+        .find(|f| f.contains("\"id\":2"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        response.contains("\"status\":\"ok\""),
+        "the fake-javac check must complete: {response}"
+    );
+    let publication = seen[mark..]
+        .iter()
+        .rev()
+        .find(|f| f.contains("publishDiagnostics") && f.contains(&uri))
+        .cloned()
+        .expect("a post-check publication for the file");
+
+    let json: Value = serde_json::from_str(&publication).expect("parse publication");
+    let diagnostics = json["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let matching: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("incompatible types: String cannot be converted to int"))
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one matching incompatibility must remain — never a native+javac duplicate: {publication}"
+    );
+    assert_eq!(
+        matching[0]["source"], "javac",
+        "the surviving equivalent result must be the javac-sourced one: {publication}"
+    );
+    // Compiler republish snapshots of live buffers are versioned too.
+    assert_eq!(
+        json["params"]["version"], 1,
+        "the republish for an open buffer must carry the document version: {publication}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Task 3, the revision race: a compiler run STARTED BEFORE an edit must
+/// never reintroduce its (now stale) error. The fake `javac` touches a
+/// marker, sleeps, and only then reports the wrong-return error — so the
+/// test can deterministically fix the buffer via `didChange` while the
+/// compiler is provably in flight. Once the run's response and the
+/// follow-up sync point have arrived, the LAST publication for the file
+/// must contain neither the native return error (the buffer is fixed) nor
+/// the stale javac error (its start version predates the edit).
+#[cfg(unix)]
+#[test]
+fn javac_result_started_before_edit_cannot_reintroduce_error() {
+    let root = temp_root("javac-stale-race");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let src_path = src_dir.join("Sample.java");
+    std::fs::write(&src_path, WRONG_RETURN_SOURCE).expect("write Sample.java");
+    let marker = root.join("javac-started");
+    let jdk_home =
+        write_fake_javac_jdk(&root, &wrong_return_stderr(&src_path), Some((&marker, 3)));
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"initializationOptions":{{"jdkHome":"{}"}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#,
+        jdk_home.display()
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    let uri = format!("file://{}", src_path.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(WRONG_RETURN_SOURCE)
+    ));
+    let opened = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        opened.contains("jvl.incompatibleReturn"),
+        "the native return diagnostic must arrive on open: {opened}"
+    );
+
+    // Start the check, then wait for the marker proving the fake compiler
+    // is running (started against the broken version-1 buffer/file).
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
+    );
+    let mut started = false;
+    for _ in 0..100 {
+        if marker.exists() {
+            started = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(started, "the fake javac never started (no marker file)");
+
+    // Fix the buffer WHILE the compiler is still sleeping on the stale
+    // input: the native error clears immediately.
+    let fixed = "package demo;\n\npublic class Sample {\n    int code() {\n        return 1;\n    }\n}\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":2}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
+        json_escape(fixed)
+    ));
+    let after_fix = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        !after_fix.contains("jvl.incompatibleReturn"),
+        "the native error must clear on the fixing didChange: {after_fix}"
+    );
+
+    // Let the stale compiler run finish: collect frames until its response
+    // arrives, give any (wrongly) queued publication time to hit the wire,
+    // then use a request/response pair as a sync point (same pattern as
+    // did_change_watched_files_ignores_unrelated_file) before judging the
+    // final published state.
+    let _ = read_until(&mut reader, "\"id\":2", &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+
+    let last_publication = seen
+        .iter()
+        .rev()
+        .find(|f| f.contains("publishDiagnostics") && f.contains(&uri))
+        .cloned()
+        .expect("a publication for the file");
+    assert!(
+        !last_publication.contains("jvl.incompatibleReturn"),
+        "the fixed buffer must not show the native return error: {last_publication}"
+    );
+    assert!(
+        !last_publication.contains("\"source\":\"javac\""),
+        "a compiler run started before the edit must never reintroduce its stale error: {last_publication}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

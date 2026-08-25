@@ -581,16 +581,8 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
+        let version = params.text_document.version;
         let encoding = self.encoding();
-
-        // An edit invalidates any javac diagnostics for this file —
-        // they're stale the instant the source they were computed from
-        // changes. Cleared here (rather than left to the next checkProject
-        // run) so they disappear from Problems immediately on edit.
-        self.javac_diagnostics
-            .lock()
-            .expect("javac diagnostics poisoned")
-            .remove(uri.as_str());
 
         // Warm the classpath before taking the documents lock — see
         // `open_document`'s identical call for why: `compute_diagnostics`
@@ -607,7 +599,7 @@ impl LanguageServer for Backend {
                 let Some(doc) = docs.get_mut(uri.as_str()) else {
                     return; // change for a document we never opened
                 };
-                doc.version = params.text_document.version;
+                doc.version = version;
 
                 let mut from_scratch = false;
                 for change in params.content_changes {
@@ -636,11 +628,24 @@ impl LanguageServer for Backend {
                 let old = (!from_scratch).then_some(&doc.tree);
                 doc.tree = self.parse(&doc.text, old);
             }
+            // An edit invalidates any javac diagnostics for this file —
+            // they're stale the instant the source they were computed from
+            // changes. Removed INSIDE the documents critical section, after
+            // the version bump above: the compiler publication paths check
+            // their run's start version and swap the javac map under this
+            // same lock, so an in-flight run can neither observe the
+            // pre-edit version as still current nor re-insert a stale entry
+            // after this removal — and the entry is gone before
+            // `compute_diagnostics` below would merge it.
+            self.javac_diagnostics
+                .lock()
+                .expect("javac diagnostics poisoned")
+                .remove(uri.as_str());
             self.compute_diagnostics(&docs, uri.as_str())
         };
 
         self.client
-            .publish_diagnostics(uri, diagnostics, None)
+            .publish_diagnostics(uri, diagnostics, Some(version))
             .await;
     }
 

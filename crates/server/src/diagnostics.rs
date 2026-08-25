@@ -79,6 +79,49 @@ fn uri_is_under_module(uri_str: &str, module_roots: &[PathBuf]) -> bool {
     path_under_any_module(path.as_ref(), module_roots)
 }
 
+/// The first line of a diagnostic message with any `incompatible types: `
+/// prefix stripped — the payload compared for native/javac equivalence.
+/// javac folds `required:`/`found:` continuation lines into its message;
+/// only the first line carries the comparable summary.
+fn stripped_first_line(message: &str) -> &str {
+    let first = message.lines().next().unwrap_or("");
+    first.strip_prefix("incompatible types: ").unwrap_or(first)
+}
+
+/// Whether `javac` confirms `native` as the same incompatible-return error.
+/// Deliberately narrow — ALL of: the native entry carries the return-check
+/// code (`jvl.incompatibleReturn`), both severities are ERROR, the ranges
+/// overlap on the same line, and the first message lines agree after
+/// stripping the `incompatible types: ` prefix. Anything less (a syntax/
+/// structural/member rule, a warning, a different line, a disjoint range,
+/// a different payload) is never treated as the same error.
+fn javac_confirms_native_return(native: &Diagnostic, javac: &Diagnostic) -> bool {
+    matches!(
+        &native.code,
+        Some(NumberOrString::String(code)) if code == jvl_syntax::INCOMPATIBLE_RETURN_CODE
+    ) && native.severity == Some(DiagnosticSeverity::ERROR)
+        && javac.severity == Some(DiagnosticSeverity::ERROR)
+        && native.range.start.line == javac.range.start.line
+        && native.range.start.character < javac.range.end.character
+        && javac.range.start.character < native.range.end.character
+        && stripped_first_line(&native.message) == stripped_first_line(&javac.message)
+}
+
+/// Merge a file's stored `javac` diagnostics into its freshly computed
+/// native set, preferring the compiler for an equivalent current result:
+/// every native entry some javac diagnostic confirms (see
+/// [`javac_confirms_native_return`]) is removed, then ALL javac diagnostics
+/// are appended in their original order. Surviving natives keep their
+/// order; unrelated diagnostics are never deduplicated.
+fn merge_javac_diagnostics(diagnostics: &mut Vec<Diagnostic>, javac: Vec<Diagnostic>) {
+    diagnostics.retain(|native| {
+        !javac
+            .iter()
+            .any(|javac| javac_confirms_native_return(native, javac))
+    });
+    diagnostics.extend(javac);
+}
+
 impl Backend {
     /// Recompute and republish diagnostics for every currently open
     /// document — used after a classpath swap, since
@@ -91,16 +134,22 @@ impl Backend {
     /// lock is held, then the lock is dropped before the `publish_diagnostics`
     /// `.await`s that follow, so it is never held across an `.await`.
     pub(crate) async fn republish_all_diagnostics(&self) {
-        let snapshot: Vec<(String, Vec<Diagnostic>)> = {
+        let snapshot: Vec<(String, Vec<Diagnostic>, i32)> = {
             let docs = self.documents.lock().await;
-            docs.keys()
-                .map(|uri_str| (uri_str.clone(), self.compute_diagnostics(&docs, uri_str)))
+            docs.iter()
+                .map(|(uri_str, doc)| {
+                    (
+                        uri_str.clone(),
+                        self.compute_diagnostics(&docs, uri_str),
+                        doc.version,
+                    )
+                })
                 .collect()
         };
-        for (uri_str, diagnostics) in snapshot {
+        for (uri_str, diagnostics, version) in snapshot {
             if let Ok(uri) = uri_str.parse::<Uri>() {
                 self.client
-                    .publish_diagnostics(uri, diagnostics, None)
+                    .publish_diagnostics(uri, diagnostics, Some(version))
                     .await;
             }
         }
@@ -108,7 +157,10 @@ impl Backend {
 
     /// Syntax, immediate semantic, and structural diagnostics for a document
     /// already stored under `uri`, plus any `javac` diagnostics still on file
-    /// for `uri` — merged in, never clobbering either set. Unlike the native
+    /// for `uri` — merged in via [`merge_javac_diagnostics`], which removes a
+    /// native return error that an equivalent compiler result confirms and
+    /// appends every javac entry, never clobbering anything unrelated.
+    /// Unlike the native
     /// diagnostics, the `javac` diagnostics don't require `uri` to be an open
     /// document: a checked file the editor never opened still gets its
     /// diagnostics published (see `Backend::publish_javac_diagnostics`).
@@ -158,7 +210,7 @@ impl Backend {
             .expect("javac diagnostics poisoned")
             .get(uri)
         {
-            diagnostics.extend(javac_diags.clone());
+            merge_javac_diagnostics(&mut diagnostics, javac_diags.clone());
         }
         diagnostics
     }
@@ -205,11 +257,19 @@ impl Backend {
             });
         };
         let classpath = self.classpath();
-        let mut roots = {
+        // Snapshot every open document's version under the SAME lock hold
+        // that derives the source roots: this is the revision baseline the
+        // publication step compares against, so a result computed from these
+        // roots can never be attributed to a newer buffer state.
+        let (mut roots, start_versions) = {
             let docs = self.documents.lock().await;
             let mut roots = self.source_roots(&docs, &project_root);
             roots.extend(classpath.source_roots().iter().cloned());
-            roots
+            let start_versions: HashMap<String, i32> = docs
+                .iter()
+                .map(|(uri_str, doc)| (uri_str.clone(), doc.version))
+                .collect();
+            (roots, start_versions)
         };
         // Cover every Maven/Gradle module in the workspace, not just the root
         // module + currently-open files — so a full-workspace check is actually
@@ -230,7 +290,7 @@ impl Backend {
                 warning_count,
             } => {
                 // Whole-project run: the map is authoritative for every file.
-                self.publish_javac_diagnostics(grouped).await;
+                self.publish_javac_diagnostics(grouped, &start_versions).await;
                 serde_json::json!({
                     "status": "ok",
                     "errorCount": error_count,
@@ -277,7 +337,9 @@ impl Backend {
         // silently widened to a project compile).
         let mut module_roots: Vec<PathBuf> = Vec::new();
         let mut explicit_roots: Vec<PathBuf> = Vec::new();
-        {
+        // Same-lock version snapshot as `run_check_full_project`: the
+        // revision baseline handed to `publish_javac_diagnostics_scoped`.
+        let start_versions: HashMap<String, i32> = {
             let docs = self.documents.lock().await;
             for uri_str in &document_uris {
                 let Some(file) = parse_java_file_uri(uri_str) else {
@@ -334,7 +396,10 @@ impl Backend {
                     }
                 }
             }
-        }
+            docs.iter()
+                .map(|(uri_str, doc)| (uri_str.clone(), doc.version))
+                .collect()
+        };
 
         // Sibling-module sources on `-sourcepath`: a bounded, directory-only
         // scan for module source roots, plus any dependency source roots.
@@ -362,7 +427,7 @@ impl Backend {
                 if external {
                     return self.run_check_full_project().await;
                 }
-                self.publish_javac_diagnostics_scoped(grouped, &module_roots)
+                self.publish_javac_diagnostics_scoped(grouped, &module_roots, &start_versions)
                     .await;
                 serde_json::json!({
                     "status": "ok",
@@ -485,14 +550,6 @@ impl Backend {
         }
     }
 
-    /// Replace the javac-diagnostics set wholesale with `new_diags`
-    /// (keyed by filesystem path, as `javac` echoed it) and (re)publish
-    /// every affected URI — both newly (or still) diagnosed files and any
-    /// file that had javac diagnostics before this run but doesn't anymore
-    /// (which must be published empty-of-javac to actually clear in the
-    /// client's Problems panel; LSP has no "leave unchanged" — an omitted
-    /// publish just means "nothing changed", not "clear"). Merges with each
-    /// file's other diagnostics via `compute_diagnostics`, never clobbering.
     /// Publish a single diagnostic on the project's build file explaining that
     /// the detected JDK is too old for the project's declared Java level and
     /// the javac check was skipped. Routed through
@@ -529,10 +586,46 @@ impl Backend {
         };
         let mut map: HashMap<String, Vec<Diagnostic>> = HashMap::new();
         map.insert(build_file.to_string_lossy().into_owned(), vec![diag]);
-        self.publish_javac_diagnostics(map).await;
+        // No compile ran, so nothing raced an edit: a fresh version snapshot
+        // makes the publication's revision filter vacuously current.
+        let start_versions: HashMap<String, i32> = {
+            let docs = self.documents.lock().await;
+            docs.iter()
+                .map(|(uri_str, doc)| (uri_str.clone(), doc.version))
+                .collect()
+        };
+        self.publish_javac_diagnostics(map, &start_versions).await;
     }
 
-    async fn publish_javac_diagnostics(&self, new_diags: HashMap<String, Vec<Diagnostic>>) {
+    /// Replace the javac-diagnostics set wholesale with `new_diags`
+    /// (keyed by filesystem path, as `javac` echoed it) and (re)publish
+    /// every affected URI — both newly (or still) diagnosed files and any
+    /// file that had javac diagnostics before this run but doesn't anymore
+    /// (which must be published empty-of-javac to actually clear in the
+    /// client's Problems panel; LSP has no "leave unchanged" — an omitted
+    /// publish just means "nothing changed", not "clear"). Merges with each
+    /// file's other diagnostics via `compute_diagnostics`, never clobbering.
+    ///
+    /// `start_versions` is the caller's open-document version snapshot,
+    /// taken under the documents lock before the compiler ran: a result for
+    /// a file that is open now is discarded unless its start version is
+    /// present and equal to the current `Document.version` (absent or
+    /// different means an edit raced the compile — the result is stale).
+    /// Closed files can't be edited in flight, so they always publish.
+    ///
+    /// Lock order: the revision filter, the javac-map swap, and the
+    /// republish snapshot all happen under ONE `documents` lock hold,
+    /// serializing them against `did_change` (which bumps the version and
+    /// removes the file's javac entry inside its own documents critical
+    /// section). The `javac_diagnostics` guard is scoped shut before
+    /// `compute_diagnostics` re-acquires it per URI, and the documents lock
+    /// is dropped before the publish `.await`s. Live buffers publish with
+    /// `Some(version)`; closed files with `None`.
+    async fn publish_javac_diagnostics(
+        &self,
+        new_diags: HashMap<String, Vec<Diagnostic>>,
+        start_versions: &HashMap<String, i32>,
+    ) {
         let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
             .into_iter()
             .filter_map(|(path, diags)| {
@@ -540,36 +633,41 @@ impl Backend {
             })
             .collect();
 
-        let affected: Vec<String> = {
-            let mut map = self
-                .javac_diagnostics
-                .lock()
-                .expect("javac diagnostics poisoned");
-            let mut affected: HashSet<String> = map.keys().cloned().collect();
-            affected.extend(new_map.keys().cloned());
-            *map = new_map;
-            affected.into_iter().collect()
-        };
-
-        // Same lock-once-then-publish shape as `republish_all_diagnostics`:
-        // every affected URI's diagnostics are computed into an owned
-        // snapshot under a single `documents` lock hold, which is then
-        // dropped before the `publish_diagnostics` `.await`s below.
-        let snapshot: Vec<(String, Vec<Diagnostic>)> = {
+        let snapshot: Vec<(String, Vec<Diagnostic>, Option<i32>)> = {
             let docs = self.documents.lock().await;
+            let new_map: HashMap<String, Vec<Diagnostic>> = new_map
+                .into_iter()
+                .filter(|(uri_str, _)| match docs.get(uri_str) {
+                    Some(doc) => start_versions.get(uri_str) == Some(&doc.version),
+                    None => true,
+                })
+                .collect();
+
+            let affected: Vec<String> = {
+                let mut map = self
+                    .javac_diagnostics
+                    .lock()
+                    .expect("javac diagnostics poisoned");
+                let mut affected: HashSet<String> = map.keys().cloned().collect();
+                affected.extend(new_map.keys().cloned());
+                *map = new_map;
+                affected.into_iter().collect()
+            };
+
             affected
                 .into_iter()
                 .map(|uri_str| {
                     let diagnostics = self.compute_diagnostics(&docs, &uri_str);
-                    (uri_str, diagnostics)
+                    let version = docs.get(&uri_str).map(|doc| doc.version);
+                    (uri_str, diagnostics, version)
                 })
                 .collect()
         };
 
-        for (uri_str, diagnostics) in snapshot {
+        for (uri_str, diagnostics, version) in snapshot {
             if let Ok(uri) = uri_str.parse::<Uri>() {
                 self.client
-                    .publish_diagnostics(uri, diagnostics, None)
+                    .publish_diagnostics(uri, diagnostics, version)
                     .await;
             }
         }
@@ -577,7 +675,9 @@ impl Backend {
 
     /// Scoped counterpart to [`Self::publish_javac_diagnostics`]: replace the
     /// javac diagnostics only for files **beneath `module_roots`**, preserving
-    /// every other module's diagnostics untouched.
+    /// every other module's diagnostics untouched. The same revision filter,
+    /// single documents-lock hold, and versioned publication apply — see the
+    /// project-wide function's doc comment for the lock-order reasoning.
     ///
     /// Existing entries under a checked module root are dropped (this run is
     /// authoritative for them); `new_diags` are inserted; any dropped file not
@@ -588,6 +688,7 @@ impl Backend {
         &self,
         new_diags: HashMap<String, Vec<Diagnostic>>,
         module_roots: &[PathBuf],
+        start_versions: &HashMap<String, i32>,
     ) {
         let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
             .into_iter()
@@ -596,49 +697,309 @@ impl Backend {
             })
             .collect();
 
-        let affected: Vec<String> = {
-            let mut map = self
-                .javac_diagnostics
-                .lock()
-                .expect("javac diagnostics poisoned");
-            let mut affected: HashSet<String> = HashSet::new();
-            // Drop prior diagnostics for files inside the checked modules —
-            // recording each as affected so a now-clean file is republished
-            // (and thereby cleared). Other modules' entries are retained.
-            map.retain(|uri_str, _| {
-                if uri_is_under_module(uri_str, module_roots) {
-                    affected.insert(uri_str.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            // Insert this run's diagnostics (each also affected), overwriting.
-            for (uri_str, diags) in new_map {
-                affected.insert(uri_str.clone());
-                map.insert(uri_str, diags);
-            }
-            affected.into_iter().collect()
-        };
-
-        // Same lock-once-then-publish shape as `publish_javac_diagnostics`.
-        let snapshot: Vec<(String, Vec<Diagnostic>)> = {
+        let snapshot: Vec<(String, Vec<Diagnostic>, Option<i32>)> = {
             let docs = self.documents.lock().await;
+            // Same revision filter as `publish_javac_diagnostics`.
+            let new_map: HashMap<String, Vec<Diagnostic>> = new_map
+                .into_iter()
+                .filter(|(uri_str, _)| match docs.get(uri_str) {
+                    Some(doc) => start_versions.get(uri_str) == Some(&doc.version),
+                    None => true,
+                })
+                .collect();
+
+            let affected: Vec<String> = {
+                let mut map = self
+                    .javac_diagnostics
+                    .lock()
+                    .expect("javac diagnostics poisoned");
+                let mut affected: HashSet<String> = HashSet::new();
+                // Drop prior diagnostics for files inside the checked modules —
+                // recording each as affected so a now-clean file is republished
+                // (and thereby cleared). Other modules' entries are retained.
+                map.retain(|uri_str, _| {
+                    if uri_is_under_module(uri_str, module_roots) {
+                        affected.insert(uri_str.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                // Insert this run's diagnostics (each also affected), overwriting.
+                for (uri_str, diags) in new_map {
+                    affected.insert(uri_str.clone());
+                    map.insert(uri_str, diags);
+                }
+                affected.into_iter().collect()
+            };
+
             affected
                 .into_iter()
                 .map(|uri_str| {
                     let diagnostics = self.compute_diagnostics(&docs, &uri_str);
-                    (uri_str, diagnostics)
+                    let version = docs.get(&uri_str).map(|doc| doc.version);
+                    (uri_str, diagnostics, version)
                 })
                 .collect()
         };
 
-        for (uri_str, diagnostics) in snapshot {
+        for (uri_str, diagnostics, version) in snapshot {
             if let Ok(uri) = uri_str.parse::<Uri>() {
                 self.client
-                    .publish_diagnostics(uri, diagnostics, None)
+                    .publish_diagnostics(uri, diagnostics, version)
                     .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Task 2 native return contract's message for the canonical
+    /// wrong-return fixture (`int code() { return "bad"; }`).
+    const RETURN_MESSAGE: &str = "incompatible types: String cannot be converted to int";
+
+    /// A native return diagnostic exactly as `jvl_syntax`'s return check
+    /// emits it (Task 2 contract): code `jvl.incompatibleReturn`, severity
+    /// ERROR, source `java-vsix-lite`, single-line range on the returned
+    /// expression.
+    fn native_return(line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String(
+                jvl_syntax::INCOMPATIBLE_RETURN_CODE.to_string(),
+            )),
+            source: Some("java-vsix-lite".to_string()),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A native diagnostic that is NOT the return rule — a syntax,
+    /// structural, or member diagnostic (no `jvl.incompatibleReturn` code).
+    fn native_other(line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("java-vsix-lite".to_string()),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A compiler diagnostic exactly as `javac::group_diagnostics` builds it:
+    /// source `javac`, no code, column-derived single-line range.
+    fn javac_diag(
+        line: u32,
+        start: u32,
+        end: u32,
+        severity: DiagnosticSeverity,
+        message: &str,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            },
+            severity: Some(severity),
+            source: Some("javac".to_string()),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// An equivalent current javac result replaces the native return
+    /// diagnostic instead of duplicating it: the native entry is removed and
+    /// the javac diagnostic is appended, leaving exactly one javac-sourced
+    /// incompatibility.
+    #[test]
+    fn merge_replaces_equivalent_native_return_diagnostic() {
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+        );
+        assert_eq!(merged.len(), 1, "expected the native entry replaced: {merged:#?}");
+        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+        assert_eq!(merged[0].message, RETURN_MESSAGE);
+    }
+
+    /// Equivalence compares only the FIRST message line, after stripping the
+    /// `incompatible types: ` prefix — javac folds `required:`/`found:`
+    /// continuation lines into its message and they must not defeat the
+    /// match. A line-wide javac range (no caret parsed → character 0 to
+    /// u32::MAX) still overlaps the native expression range on that line.
+    #[test]
+    fn merge_matches_first_message_line_and_line_wide_javac_range() {
+        let folded = format!("{RETURN_MESSAGE}\n  required: int\n  found:    String");
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 0, u32::MAX, DiagnosticSeverity::ERROR, &folded)],
+        );
+        assert_eq!(merged.len(), 1, "expected the native entry replaced: {merged:#?}");
+        assert_eq!(merged[0].source.as_deref(), Some("javac"));
+    }
+
+    /// A different first-line payload (after stripping `incompatible
+    /// types: `) is NOT equivalent — both diagnostics survive.
+    #[test]
+    fn merge_requires_equal_stripped_payload() {
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(
+                4,
+                15,
+                21,
+                DiagnosticSeverity::ERROR,
+                "incompatible types: String cannot be converted to long",
+            )],
+        );
+        assert_eq!(merged.len(), 2, "differing payloads must never merge: {merged:#?}");
+    }
+
+    /// Only a native diagnostic carrying the `jvl.incompatibleReturn` code
+    /// can be replaced. A same-line, same-message native diagnostic WITHOUT
+    /// that code (syntax/structural/member rules) is never deduplicated.
+    #[test]
+    fn merge_requires_native_return_code() {
+        let mut merged = vec![native_other(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "a non-return native diagnostic must never be removed: {merged:#?}"
+        );
+        assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
+        assert_eq!(merged[1].source.as_deref(), Some("javac"));
+    }
+
+    /// Both severities must be ERROR: a javac WARNING never confirms (and so
+    /// never removes) a native return error, and a hypothetical non-ERROR
+    /// native entry is never removed by a javac error.
+    #[test]
+    fn merge_requires_error_severity_on_both_sides() {
+        // (a) javac warning against a native error: both kept.
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 15, 21, DiagnosticSeverity::WARNING, RETURN_MESSAGE)],
+        );
+        assert_eq!(merged.len(), 2, "a javac warning must never dedupe: {merged:#?}");
+
+        // (b) non-ERROR native entry against a javac error: native kept.
+        let mut downgraded = native_return(4, 15, 20, RETURN_MESSAGE);
+        downgraded.severity = Some(DiagnosticSeverity::WARNING);
+        let mut merged = vec![downgraded];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "a non-error native entry must never be removed: {merged:#?}"
+        );
+    }
+
+    /// Confirmation requires overlapping ranges on the SAME line: an equal
+    /// payload on a different line, or a disjoint range on the same line,
+    /// keeps both diagnostics.
+    #[test]
+    fn merge_requires_overlapping_ranges_on_same_line() {
+        // (a) same payload, different line.
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(6, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+        );
+        assert_eq!(merged.len(), 2, "a different line must never merge: {merged:#?}");
+
+        // (b) same line, disjoint ranges (two returns on one line — distinct
+        // errors that merely share a message).
+        let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(4, 30, 35, DiagnosticSeverity::ERROR, RETURN_MESSAGE)],
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "disjoint same-line ranges must never merge: {merged:#?}"
+        );
+    }
+
+    /// Unrelated native diagnostics sharing the line with a confirmed return
+    /// error are untouched: only the one equivalent native entry is removed,
+    /// and every javac diagnostic (matching or not) is appended after the
+    /// surviving native entries.
+    #[test]
+    fn merge_removes_only_the_equivalent_entry_and_appends_javac() {
+        let mut merged = vec![
+            native_other(4, 8, 14, "Syntax error"),
+            native_return(4, 15, 20, RETURN_MESSAGE),
+            native_other(4, 22, 30, "cannot resolve member frobnicate"),
+        ];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![
+                javac_diag(4, 15, 21, DiagnosticSeverity::ERROR, RETURN_MESSAGE),
+                javac_diag(9, 0, u32::MAX, DiagnosticSeverity::ERROR, "cannot find symbol"),
+            ],
+        );
+        assert_eq!(merged.len(), 4, "only the equivalent entry may go: {merged:#?}");
+        // Surviving natives first, in their original order…
+        assert_eq!(merged[0].message, "Syntax error");
+        assert_eq!(merged[1].message, "cannot resolve member frobnicate");
+        // …then the javac diagnostics, appended in their original order.
+        assert_eq!(merged[2].source.as_deref(), Some("javac"));
+        assert_eq!(merged[2].message, RETURN_MESSAGE);
+        assert_eq!(merged[3].source.as_deref(), Some("javac"));
+        assert_eq!(merged[3].message, "cannot find symbol");
+    }
+
+    /// With no equivalent native entry at all, merging is a plain append —
+    /// the pre-existing `compute_diagnostics` behavior is preserved.
+    #[test]
+    fn merge_without_equivalent_is_plain_append() {
+        let mut merged = vec![native_other(1, 0, 4, "Syntax error")];
+        merge_javac_diagnostics(
+            &mut merged,
+            vec![javac_diag(9, 0, u32::MAX, DiagnosticSeverity::ERROR, "cannot find symbol")],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].message, "Syntax error");
+        assert_eq!(merged[1].source.as_deref(), Some("javac"));
     }
 }

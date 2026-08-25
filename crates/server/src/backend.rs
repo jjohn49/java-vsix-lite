@@ -649,7 +649,7 @@ impl Backend {
             self.compute_diagnostics(&docs, uri.as_str())
         };
         self.client
-            .publish_diagnostics(uri, diagnostics, None)
+            .publish_diagnostics(uri, diagnostics, Some(version))
             .await;
     }
 
