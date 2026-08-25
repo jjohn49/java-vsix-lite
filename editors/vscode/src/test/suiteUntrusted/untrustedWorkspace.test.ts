@@ -243,4 +243,32 @@ suite("untrusted workspace", () => {
       `expected the untrusted-workspace refusal message from downloadDependencies(), got: ${message}`,
     );
   });
+
+  test("debugging refuses to start untrusted (provider aborts before any process spawns)", async () => {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    let started: boolean | undefined;
+    const message = await captureErrorMessage(async () => {
+      started = await vscode.debug.startDebugging(folder, {
+        type: "java-vsix-lite",
+        name: "untrusted-launch",
+        request: "launch",
+        mainClass: "demo.Sample",
+      });
+    });
+    assert.strictEqual(
+      started,
+      false,
+      "startDebugging must resolve false untrusted -- resolveDebugConfiguration " +
+        "returned undefined, aborting the session",
+    );
+    assert.ok(
+      message && /untrusted workspace/i.test(message),
+      `expected the untrusted-workspace refusal message from the debug provider, got: ${message}`,
+    );
+    assert.strictEqual(
+      vscode.debug.activeDebugSession,
+      undefined,
+      "no debug session may exist after the untrusted refusal",
+    );
+  });
 });

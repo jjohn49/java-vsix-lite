@@ -1,0 +1,19 @@
+[package]
+name = "jvl-debug"
+description = "Pure-Rust DAP↔JDWP debug adapter (no JVM-side components, no build-script execution) shipped inside jvl-server as the `dap` subcommand"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+jvl-classpath = { version = "0.1.0", path = "../classpath" }
+# Same pinned versions as jvl-server (Cargo.lock is the supply-chain source of
+# truth); both protocols (DAP JSON framing, JDWP binary) are hand-rolled so no
+# new third-party crates enter the dependency graph.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { workspace = true, features = ["net", "process", "io-util", "sync", "rt", "macros", "time"] }
+tracing.workspace = true

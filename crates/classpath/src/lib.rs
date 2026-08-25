@@ -415,6 +415,66 @@ pub fn project_java_release(root: &Path) -> Option<u32> {
     None
 }
 
+/// Bound on the directory-walk depth for [`module_output_dirs`] — a build
+/// tree deeper than this is pathological for module discovery.
+const OUTPUT_DIR_WALK_MAX_DEPTH: usize = 8;
+
+/// Bound on directories visited by [`module_output_dirs`] — keeps a
+/// pathological tree from turning candidate discovery into unbounded work
+/// (the same defensive posture as the rest of this crate).
+const OUTPUT_DIR_WALK_MAX_DIRS: usize = 4096;
+
+/// Conventional build-output directory *candidates* for every Maven/Gradle
+/// module under `root`: `<module>/target/classes` for a `pom.xml` module,
+/// `<module>/build/classes/java/main` + `<module>/build/resources/main` for a
+/// `build.gradle(.kts)` module. Candidates are returned **without existence
+/// filtering** — the caller decides what "none exist" means (the debugger
+/// treats it as "project not built yet"). A bounded directory walk: hidden
+/// dirs, `target`/`build`/`node_modules`, and symlinks are skipped; depth is
+/// capped at [`OUTPUT_DIR_WALK_MAX_DEPTH`] and visited directories at
+/// [`OUTPUT_DIR_WALK_MAX_DIRS`]. No build execution, no file reads beyond
+/// directory listing.
+pub fn module_output_dirs(root: &Path) -> Vec<PathBuf> {
+    const SKIPPED: [&str; 3] = ["target", "build", "node_modules"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if visited >= OUTPUT_DIR_WALK_MAX_DIRS {
+            break;
+        }
+        visited += 1;
+        if dir.join("pom.xml").is_file() {
+            out.push(dir.join("target/classes"));
+        }
+        if dir.join("build.gradle").is_file() || dir.join("build.gradle.kts").is_file() {
+            out.push(dir.join("build/classes/java/main"));
+            out.push(dir.join("build/resources/main"));
+        }
+        if depth >= OUTPUT_DIR_WALK_MAX_DEPTH {
+            continue;
+        }
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || SKIPPED.contains(&name_str.as_ref()) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    out
+}
+
 /// The Gradle user home — `$GRADLE_USER_HOME` when set to a non-empty path
 /// (Gradle's own override, standard in CI and governed environments where the
 /// cache lives outside `$HOME`), else `~/.gradle`. `None` only when neither is
@@ -763,6 +823,47 @@ mod tests {
             "expected at least one parameterized constructor: {:?}",
             ctors
         );
+    }
+
+    #[test]
+    fn module_output_dirs_finds_maven_gradle_and_nested_modules() {
+        let base = std::env::temp_dir().join(format!(
+            "jvl-output-dirs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Root Maven module with a nested Maven submodule, plus a sibling
+        // Gradle module; a hidden dir and a `target` dir must not be walked.
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("gradle-mod")).unwrap();
+        std::fs::create_dir_all(base.join(".hidden/inner")).unwrap();
+        std::fs::create_dir_all(base.join("target/nested")).unwrap();
+        std::fs::write(base.join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("sub/pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("gradle-mod/build.gradle"), "").unwrap();
+        std::fs::write(base.join(".hidden/inner/pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("target/nested/pom.xml"), "<project/>").unwrap();
+
+        let dirs = module_output_dirs(&base);
+        assert!(dirs.contains(&base.join("target/classes")), "{dirs:?}");
+        assert!(dirs.contains(&base.join("sub/target/classes")), "{dirs:?}");
+        assert!(
+            dirs.contains(&base.join("gradle-mod/build/classes/java/main")),
+            "{dirs:?}"
+        );
+        assert!(
+            dirs.contains(&base.join("gradle-mod/build/resources/main")),
+            "{dirs:?}"
+        );
+        // Candidates are returned without existence filtering (none exist).
+        assert!(dirs.iter().all(|d| !d.exists()), "{dirs:?}");
+        // Hidden and build-output dirs are never walked.
+        assert_eq!(dirs.len(), 4, "{dirs:?}");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
 

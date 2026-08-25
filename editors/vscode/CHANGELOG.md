@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.5 — 2026-08-24
+
+### Added
+- **Java debugging** (launch and attach) via a pure-Rust DAP↔JDWP adapter
+  built into the existing `jvl-server` binary (`jvl-server dap`) — no new
+  native artifacts, no JVM-side components. F5 on a Java file with a `main`
+  method works with no `launch.json`. Supported: line breakpoints, stepping
+  (over/into/out), pause, threads, stack traces with source mapping,
+  variable inspection (locals, `this`, object fields, arrays, strings),
+  caught/uncaught exception break filters with exception details, program
+  output in the Debug Console, and `stopOnEntry`. The debuggee classpath
+  uses explicit `classPaths` when given, else existing Maven/Gradle build
+  output plus resolved dependency jars, else a one-shot `javac -g`
+  auto-compile. Expression evaluation and hot code replace are not
+  supported. Debugging runs project code, so it is disabled in untrusted
+  workspaces; the JVM is chosen by the machine-scoped
+  `java-vsix-lite.jdk.home` setting (never by the workspace), and the JDWP
+  connection is loopback-only.
+
 ## 0.1.4 — 2026-08-23
 
 ### Changed

@@ -16,8 +16,9 @@
 //! workspaces (see `javac`'s module doc comment), plus on demand via a
 //! manual command.
 //!
-//! Invariant: **stdout is reserved for the LSP wire protocol.** All logging goes
-//! to stderr via `tracing`.
+//! Invariant: **stdout is reserved for the wire protocol** — LSP by default,
+//! DAP when launched as `jvl-server dap` (the debug adapter subcommand; see
+//! `jvl-debug`). All logging goes to stderr via `tracing`.
 
 #![forbid(unsafe_code)]
 
@@ -1981,13 +1982,14 @@ fn print_version_and_exit_if_requested() {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     print_version_and_exit_if_requested();
 
-    // Logs go to stderr; stdout is the LSP transport. ANSI is disabled because
-    // the editor's output panel renders raw escape codes as a jumble; the noisy
-    // module-path target is dropped; and the default filter mutes the LSP
-    // framework's debug chatter (e.g. spurious cancel-request notices).
+    // Logs go to stderr; stdout is the wire transport (LSP, or DAP for the
+    // `dap` subcommand). ANSI is disabled because the editor's output panel
+    // renders raw escape codes as a jumble; the noisy module-path target is
+    // dropped; and the default filter mutes the LSP framework's debug
+    // chatter (e.g. spurious cancel-request notices).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -1999,6 +2001,14 @@ async fn main() {
         )
         .init();
 
+    // `jvl-server dap`: run the DAP↔JDWP debug adapter instead of the LSP
+    // server — same binary, so packaging is unchanged. Stdout becomes the
+    // DAP wire (same reserved-stdout invariant).
+    if std::env::args().nth(1).as_deref() == Some("dap") {
+        tracing::info!("starting java-vsix-lite debug adapter");
+        return jvl_debug::run_stdio_adapter().await;
+    }
+
     tracing::info!("starting java-vsix-lite language server");
 
     let stdin = tokio::io::stdin();
@@ -2009,6 +2019,7 @@ async fn main() {
         .custom_method("jvl/missingDependencies", Backend::missing_dependencies)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]

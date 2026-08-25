@@ -199,6 +199,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
+  // Debugging: the DAP adapter is the same machine-scoped `jvl-server`
+  // binary (env override → machine setting → bundled) run with the `dap`
+  // subcommand, so a workspace can never redirect which binary debugs it.
+  // The configuration provider enforces the Workspace Trust gate — the
+  // debugger runs project code, so this refusal is load-bearing, exactly
+  // like `checkProject()`'s.
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterDescriptorFactory("java-vsix-lite", {
+      createDebugAdapterDescriptor(): vscode.DebugAdapterDescriptor | undefined {
+        const serverPath = resolveServerPath(context);
+        if (!serverPath) {
+          void vscode.window.showErrorMessage(
+            "java-vsix-lite: could not locate the jvl-server binary for debugging.",
+          );
+          return undefined;
+        }
+        return new vscode.DebugAdapterExecutable(serverPath, ["dap"]);
+      },
+    }),
+  );
+  context.subscriptions.push(
+    vscode.debug.registerDebugConfigurationProvider(
+      "java-vsix-lite",
+      new JavaDebugConfigurationProvider(),
+    ),
+  );
+
   await start(context);
 }
 
@@ -221,6 +248,88 @@ function resolveServerPath(context: vscode.ExtensionContext): string | undefined
   const binary = process.platform === "win32" ? "jvl-server.exe" : "jvl-server";
   const bundled = context.asAbsolutePath(path.join("server", binary));
   return fs.existsSync(bundled) ? bundled : undefined;
+}
+
+// The fully-qualified main class of the active Java editor, when it visibly
+// declares a `public static void main` — powers F5-with-no-launch.json and
+// the generated launch.json template.
+function detectMainClass(): string | undefined {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== "java") {
+    return undefined;
+  }
+  const text = editor.document.getText();
+  if (!/public\s+static\s+void\s+main\s*\(/.test(text)) {
+    return undefined;
+  }
+  const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(text)?.[1];
+  const stem = path.basename(editor.document.uri.fsPath).replace(/\.java$/, "");
+  return pkg ? `${pkg}.${stem}` : stem;
+}
+
+class JavaDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
+  provideDebugConfigurations(): vscode.DebugConfiguration[] {
+    return [
+      {
+        type: "java-vsix-lite",
+        request: "launch",
+        name: "Launch Java program",
+        mainClass: detectMainClass() ?? "",
+      },
+    ];
+  }
+
+  resolveDebugConfiguration(
+    folder: vscode.WorkspaceFolder | undefined,
+    config: vscode.DebugConfiguration,
+  ): vscode.DebugConfiguration | undefined {
+    // Trust gate FIRST: debugging launches (or attaches to) project code.
+    // Returning undefined aborts the session before any process spawns.
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showErrorMessage(
+        "java-vsix-lite: debugging is disabled in untrusted workspaces because it runs project code. Trust this workspace to enable it.",
+      );
+      return undefined;
+    }
+
+    // F5 with no launch.json: synthesize a launch config from the active
+    // Java editor's main class.
+    if (!config.type && !config.request && !config.name) {
+      const mainClass = detectMainClass();
+      if (!mainClass) {
+        void vscode.window.showErrorMessage(
+          "java-vsix-lite: Open the Java file containing the main method, or create a launch.json.",
+        );
+        return undefined;
+      }
+      config = {
+        type: "java-vsix-lite",
+        request: "launch",
+        name: "Launch Java program",
+        mainClass,
+      };
+    }
+
+    // Unconditionally inject the machine-scoped JDK home, overwriting
+    // anything workspace-provided — a workspace launch.json must never be
+    // able to redirect which JVM binary runs (same rationale as the
+    // machine-scoped path settings). Undefined is fine: the adapter falls
+    // back to $JAVA_HOME, then filesystem JDK discovery.
+    const jdkHome = vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home");
+    config.__jvlJdkHome = jdkHome && jdkHome.length > 0 ? jdkHome : undefined;
+
+    // Default the project root (and launch cwd) to the workspace folder.
+    const folderPath = folder?.uri.fsPath;
+    if (folderPath) {
+      if (!config.projectRoot) {
+        config.projectRoot = folderPath;
+      }
+      if (config.request === "launch" && !config.cwd) {
+        config.cwd = folderPath;
+      }
+    }
+    return config;
+  }
 }
 
 const execFileAsync = util.promisify(execFile);

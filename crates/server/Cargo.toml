@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 jvl-classpath = { version = "0.1.0", path = "../classpath" }
+jvl-debug = { version = "0.1.0", path = "../debug" }
 jvl-syntax = { version = "0.1.0", path = "../syntax" }
 serde = { version = "1.0.228", features = ["derive"] }
 # M5.2: promoted from dev-dependencies — `initialized()` now serializes

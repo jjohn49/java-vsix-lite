@@ -3,7 +3,7 @@
   "displayName": "java-vsix-lite",
   "description": "Minimal, low-compute Java language support for VS Code (pure-Rust default tier; optional opt-in javac tier).",
   "icon": "icon.png",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "java-vsix-lite",
   "license": "MIT",
   "repository": {
@@ -32,7 +32,10 @@
     "Linters"
   ],
   "activationEvents": [
-    "onLanguage:java"
+    "onLanguage:java",
+    "onDebugResolve:java-vsix-lite",
+    "onDebugInitialConfigurations",
+    "onDebugDynamicConfigurations:java-vsix-lite"
   ],
   "main": "./dist/extension.js",
   "capabilities": {
@@ -42,7 +45,7 @@
     },
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, the consent-gated dependency download, and Install Dependencies (which runs the project's Maven/Gradle build scripts) all stay disabled until the workspace is trusted.",
+      "description": "The pure-Rust default tier (highlighting, structure, lint, signature IntelliSense) runs in untrusted workspaces — it never executes project code and never touches the network. The optional javac tier, the consent-gated dependency download, Install Dependencies (which runs the project's Maven/Gradle build scripts), and debugging (which launches project code in a JVM) all stay disabled until the workspace is trusted.",
       "restrictedConfigurations": [
         "java-vsix-lite.server.path",
         "java-vsix-lite.jdk.home",
@@ -188,6 +191,149 @@
         "command": "java-vsix-lite.installDependencies",
         "title": "Java: Install Dependencies (runs build tool)",
         "category": "java-vsix-lite"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "java"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "java-vsix-lite",
+        "label": "Java (java-vsix-lite)",
+        "languages": [
+          "java"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "mainClass"
+            ],
+            "properties": {
+              "mainClass": {
+                "type": "string",
+                "description": "Fully-qualified name of the class whose main method to run, e.g. com.example.Main."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Program arguments passed to the main method."
+              },
+              "vmArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "JVM arguments (each a separate argv element, never shell-parsed)."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory of the program. Defaults to projectRoot."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "default": {},
+                "description": "Extra environment variables for the program (overlaid on the inherited environment)."
+              },
+              "projectRoot": {
+                "type": "string",
+                "description": "Project folder used to derive the classpath and source roots. Defaults to the workspace folder."
+              },
+              "classPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Explicit classpath entries. When set, they are used exactly as given; when empty, existing Maven/Gradle build output plus resolved dependency jars are used, falling back to a one-shot javac -g compile."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Break on the first line of the main method."
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "port"
+            ],
+            "properties": {
+              "hostName": {
+                "type": "string",
+                "default": "localhost",
+                "description": "Host of the JVM to attach to (started with -agentlib:jdwp=transport=dt_socket,server=y)."
+              },
+              "port": {
+                "type": "number",
+                "description": "JDWP port of the JVM to attach to."
+              },
+              "timeout": {
+                "type": "number",
+                "default": 30000,
+                "description": "How long to retry the connection, in milliseconds."
+              },
+              "projectRoot": {
+                "type": "string",
+                "description": "Project folder used to discover source roots for stack traces. Defaults to the workspace folder."
+              },
+              "sourcePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Extra source root directories probed when resolving stack-frame sources."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "java-vsix-lite",
+            "request": "launch",
+            "name": "Launch Java program",
+            "mainClass": ""
+          },
+          {
+            "type": "java-vsix-lite",
+            "request": "attach",
+            "name": "Attach to Java process",
+            "hostName": "localhost",
+            "port": 5005
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Java (java-vsix-lite): Launch",
+            "description": "Launch a Java program under the debugger",
+            "body": {
+              "type": "java-vsix-lite",
+              "request": "launch",
+              "name": "Launch Java program",
+              "mainClass": "^\"${1:com.example.Main}\""
+            }
+          },
+          {
+            "label": "Java (java-vsix-lite): Attach",
+            "description": "Attach to a JVM started with -agentlib:jdwp",
+            "body": {
+              "type": "java-vsix-lite",
+              "request": "attach",
+              "name": "Attach to Java process",
+              "hostName": "localhost",
+              "port": 5005
+            }
+          }
+        ]
       }
     ]
   },
