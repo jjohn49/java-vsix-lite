@@ -106,25 +106,18 @@ fn equivalent_payload(native: &str, javac: &str) -> bool {
     }
 }
 
-/// Whether `javac` confirms `native` as the same diagnostic. Deliberately
-/// narrow: the native code is allowlisted; incompatible-type rules are native
-/// errors while unreachable code is intentionally a native warning; javac is
-/// always an error; ranges overlap on one line; and first-line payloads agree.
-/// The severity exception lets the compiler replace (not duplicate) the
-/// friendlier immediate unreachable warning after a save.
+/// Whether `javac` confirms `native` as the same error. Deliberately narrow —
+/// ALL of: the native entry carries one of [`JAVAC_CONFIRMABLE_CODES`], both
+/// severities are ERROR, the ranges overlap on the same line, and the first
+/// message lines carry an equivalent payload ([`equivalent_payload`]).
+/// Anything less (a syntax/structural/member rule, an unused warning, a
+/// different line, a disjoint range, a different payload) is never treated
+/// as the same error.
 fn javac_confirms_native(native: &Diagnostic, javac: &Diagnostic) -> bool {
-    let Some(NumberOrString::String(code)) = &native.code else {
-        return false;
-    };
-    if !JAVAC_CONFIRMABLE_CODES.contains(&code.as_str()) {
-        return false;
-    }
-    let expected_native_severity = if code == jvl_syntax::UNREACHABLE_CODE {
-        DiagnosticSeverity::WARNING
-    } else {
-        DiagnosticSeverity::ERROR
-    };
-    native.severity == Some(expected_native_severity)
+    matches!(
+        &native.code,
+        Some(NumberOrString::String(code)) if JAVAC_CONFIRMABLE_CODES.contains(&code.as_str())
+    ) && native.severity == Some(DiagnosticSeverity::ERROR)
         && javac.severity == Some(DiagnosticSeverity::ERROR)
         && native.range.start.line == javac.range.start.line
         && native.range.start.character < javac.range.end.character
@@ -1163,7 +1156,6 @@ mod tests {
             22,
             "unreachable statement",
         )];
-        merged[0].severity = Some(DiagnosticSeverity::WARNING);
         merge_javac_diagnostics(
             &mut merged,
             vec![javac_diag(

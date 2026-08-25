@@ -320,13 +320,11 @@ fn check_unreachable(block: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) 
             continue;
         }
         if terminated {
-            let mut diagnostic = coded_diagnostic(
+            out.push(coded_diagnostic(
                 index.range(statement),
                 UNREACHABLE_CODE,
                 "unreachable statement".to_string(),
-            );
-            diagnostic.severity = Some(DiagnosticSeverity::WARNING);
-            out.push(diagnostic);
+            ));
             return;
         }
         terminated = !can_complete_normally(statement);
@@ -1349,7 +1347,7 @@ mod tests {
             diagnostic.code,
             Some(NumberOrString::String(UNREACHABLE_CODE.to_string()))
         );
-        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diagnostic.source.as_deref(), Some("java-vsix-lite"));
         assert_eq!(diagnostic.message, "unreachable statement");
         // The range covers the first dead statement.
@@ -1458,7 +1456,7 @@ mod tests {
         let diagnostics = hygiene(src, false);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].range, range_of(src, "return 3;"));
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]
@@ -1503,7 +1501,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert!(diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)));
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)));
     }
 
     #[test]
