@@ -110,17 +110,7 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
       - name: Test
-        run: |
-          set +e
-          cargo test --workspace --locked --offline > /tmp/test-output.log 2>&1
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            msg1=$(grep -A 8 "panicked at" /tmp/test-output.log | head -c 3000 | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')
-            echo "::error::PANICS: ${msg1}"
-            msg2=$(tail -c 1500 /tmp/test-output.log | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')
-            echo "::error::TAIL: ${msg2}"
-          fi
-          exit "$status"
+        run: cargo test --workspace --locked --offline
 
   # M8g: extension integration tests — a real VS Code host loads the built
   # extension + server and the suite asserts on the editor-side diagnostics
