@@ -129,13 +129,19 @@ fn check_return<'t>(
     let Some(method) = nearest_method(return_statement) else {
         return;
     };
-    if return_statement.has_error() || method.has_error() {
+    if method.has_error() {
         return;
     }
     let Some(return_type) = method.child_by_field_name("type") else {
         return;
     };
-    let expression = return_statement.named_child(0);
+    let expression = {
+        let mut cursor = return_statement.walk();
+        let expression = return_statement
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"));
+        expression
+    };
     let returns_void = node_text(return_type, ctx.doc.source).trim() == "void";
 
     match (returns_void, expression) {
@@ -430,6 +436,42 @@ mod tests {
             assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
             assert_eq!(diagnostic.source.as_deref(), Some("java-vsix-lite"));
         }
+    }
+
+    #[test]
+    fn comment_only_void_return_is_bare() {
+        let src = "class C { void m() { return /* no value */; } }\n";
+
+        assert!(return_messages(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn comment_only_non_void_return_is_missing_value() {
+        let src = "class C { int m() { return /* no value */; } }\n";
+        let diagnostics = semantic(src, &NoSymbols, false);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "incompatible types: missing return value"
+        );
+        assert_eq!(
+            diagnostics[0].range,
+            range_of(src, "return /* no value */;")
+        );
+    }
+
+    #[test]
+    fn comment_before_return_expression_is_skipped() {
+        let src = "class C { boolean m() { return /* value */ 1; } }\n";
+        let diagnostics = semantic(src, &NoSymbols, false);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "incompatible types: int cannot be converted to boolean"
+        );
+        assert_eq!(diagnostics[0].range, range_of(src, "1"));
     }
 
     #[test]
