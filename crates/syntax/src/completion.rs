@@ -246,7 +246,11 @@ fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> 
             "fqn": fqn,
             "member": member.name,
         })),
-        ResolvedType::InProject(_) | ResolvedType::Array { .. } => None,
+        ResolvedType::InProject(_)
+        | ResolvedType::Primitive(_)
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Array { .. } => None,
     }
 }
 

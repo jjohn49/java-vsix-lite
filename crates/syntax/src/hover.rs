@@ -227,7 +227,11 @@ fn local_var_target<'t>(name: &str, byte: usize, ctx: &Ctx<'_, 't>) -> Option<Ta
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     match &resolved.ty {
         ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source, None)),
-        ResolvedType::External { .. } | ResolvedType::Array { .. } => None,
+        ResolvedType::External { .. }
+        | ResolvedType::Primitive(_)
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Array { .. } => None,
     }
 }
 
@@ -244,7 +248,11 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
             // Javadoc only when the receiver itself is external (we have its FQN).
             let doc = match &resolved.ty {
                 ResolvedType::External { fqn, .. } => ctx.symbols.doc(fqn, Some(name)),
-                ResolvedType::InProject(_) | ResolvedType::Array { .. } => None,
+                ResolvedType::InProject(_)
+                | ResolvedType::Primitive(_)
+                | ResolvedType::Void
+                | ResolvedType::Null
+                | ResolvedType::Array { .. } => None,
             };
             Some(Target::External(m.signature, doc))
         }
@@ -344,9 +352,11 @@ fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t
     let resolved_ty = resolve::resolve_object_creation_type(call, ctx)?;
     let arg_count = call_arg_count(call);
     match resolved_ty {
-        // Array creation is a different node kind — a stray Array resolution
-        // has no constructors to show.
-        ResolvedType::Array { .. } => None,
+        // Only class types can have constructors.
+        ResolvedType::Primitive(_)
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Array { .. } => None,
         ResolvedType::InProject(td) => {
             let ctors = td.constructors();
             let (sig, ctor_doc) = if ctors.is_empty() {

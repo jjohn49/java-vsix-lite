@@ -71,10 +71,10 @@ pub struct Member {
     /// `java.util.stream.Stream`) — what a `recv.member().` chain resolves
     /// through. `None` for primitives, `void`, arrays, and constructors.
     pub ret_fqn: Option<String>,
-    /// The generic return/field type alone, in the same `{i}` template
-    /// convention as [`Member::template`] (`Stream<{0}>`, `{0}`), so a chain
-    /// can substitute use-site type arguments before re-resolving. `None`
-    /// without a `Signature` attribute, for `void`, and for constructors.
+    /// The method return / field type alone, preferring the generic `{i}`
+    /// template form when a `Signature` attribute supplies one and otherwise
+    /// rendered directly from the descriptor (`String`, `int`, `void`,
+    /// `Object[]`). `None` only for constructors.
     pub ret_display: Option<String>,
 }
 

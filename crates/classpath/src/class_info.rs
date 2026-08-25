@@ -55,11 +55,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         if !field_visible(field.access_flags) {
             continue;
         }
-        let ret_display = signature_attr(&field.attributes)
+        let generic_display = signature_attr(&field.attributes)
             .and_then(|sig| generics::field_template(sig, &type_params));
-        let template = ret_display
+        let template = generic_display
             .as_ref()
             .map(|ty| format!("{ty} {}", field.name));
+        let ret_display = Some(generic_display.unwrap_or_else(|| render_field(&field.descriptor)));
         members.push(Member {
             signature: format!("{} {}", render_field(&field.descriptor), field.name),
             template,
@@ -118,7 +119,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             };
             format!("{prefix}{ret} {}({})", method.name, params.join(", "))
         });
-        let ret_display = parsed.map(|(_, ret, _)| ret).filter(|ret| ret != "void");
+        let ret_display = Some(match parsed {
+            Some((_, ret, _)) => ret,
+            None => match &method.descriptor.return_type {
+                ReturnDescriptor::Return(field) => render_field(field),
+                ReturnDescriptor::Void => "void".to_string(),
+            },
+        });
         members.push(Member {
             signature: render_method(&method.name, &method.descriptor),
             template,
@@ -633,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_object_return_without_signature_has_fqn_only() {
+    fn plain_object_return_without_signature_retains_display() {
         let bytes = build(
             "test/S",
             None,
@@ -643,11 +650,11 @@ mod tests {
         let info = parse(&bytes).expect("parses");
         let m = info.members.iter().find(|m| m.name == "trim").unwrap();
         assert_eq!(m.ret_fqn.as_deref(), Some("java.lang.String"));
-        assert_eq!(m.ret_display, None);
+        assert_eq!(m.ret_display.as_deref(), Some("String"));
     }
 
     #[test]
-    fn primitive_void_and_array_returns_have_no_result_type() {
+    fn primitive_void_and_array_returns_retain_displays() {
         let bytes = build(
             "test/P",
             None,
@@ -661,15 +668,15 @@ mod tests {
         let info = parse(&bytes).expect("parses");
         let by = |n: &str| info.members.iter().find(|m| m.name == n).unwrap();
         assert_eq!(by("size").ret_fqn, None);
-        assert_eq!(by("size").ret_display, None);
-        // Even with a Signature attribute, a void return carries no display.
+        assert_eq!(by("size").ret_display.as_deref(), Some("int"));
         assert_eq!(by("clear").ret_fqn, None);
-        assert_eq!(by("clear").ret_display, None);
+        assert_eq!(by("clear").ret_display.as_deref(), Some("void"));
         assert_eq!(by("toArray").ret_fqn, None);
+        assert_eq!(by("toArray").ret_display.as_deref(), Some("Object[]"));
     }
 
     #[test]
-    fn field_declared_type_carries_fqn_and_generic_display() {
+    fn field_declared_types_retain_plain_generic_primitive_and_array_displays() {
         let bytes = build(
             "test/F",
             Some("<E:Ljava/lang/Object;>Ljava/lang/Object;"),
@@ -677,16 +684,20 @@ mod tests {
                 field("out", "Ljava/io/PrintStream;"),
                 field_sig("items", "Ljava/util/List;", "Ljava/util/List<TE;>;"),
                 field("count", "I"),
+                field("values", "[Ljava/lang/Object;"),
             ],
             &[],
         );
         let info = parse(&bytes).expect("parses");
         let by = |n: &str| info.members.iter().find(|m| m.name == n).unwrap();
         assert_eq!(by("out").ret_fqn.as_deref(), Some("java.io.PrintStream"));
-        assert_eq!(by("out").ret_display, None);
+        assert_eq!(by("out").ret_display.as_deref(), Some("PrintStream"));
         assert_eq!(by("items").ret_fqn.as_deref(), Some("java.util.List"));
         assert_eq!(by("items").ret_display.as_deref(), Some("List<{0}>"));
         assert_eq!(by("count").ret_fqn, None);
+        assert_eq!(by("count").ret_display.as_deref(), Some("int"));
+        assert_eq!(by("values").ret_fqn, None);
+        assert_eq!(by("values").ret_display.as_deref(), Some("Object[]"));
     }
 
     #[test]

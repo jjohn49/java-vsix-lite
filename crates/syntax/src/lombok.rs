@@ -253,7 +253,7 @@ pub(crate) fn synthesize(class_node: Node, source: &str) -> Vec<SyntheticMember>
                 signature: format!("void {name}({} {})", field.type_text, field.name),
                 name,
                 is_static: false,
-                ret_display: None,
+                ret_display: Some("void".to_string()),
                 ret_fqn: None,
             });
         }

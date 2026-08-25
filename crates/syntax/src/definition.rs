@@ -129,7 +129,10 @@ fn resolve_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Defi
         return match resolved.ty {
             ResolvedType::InProject(td) => td.decl_site().map(Definition::from_site),
             ResolvedType::External { fqn, .. } => Some(Definition::External { fqn, member: None }),
-            ResolvedType::Array { .. } => None,
+            ResolvedType::Primitive(_)
+            | ResolvedType::Void
+            | ResolvedType::Null
+            | ResolvedType::Array { .. } => None,
         };
     }
 
@@ -221,7 +224,11 @@ fn member_definition<'t>(
             fqn: fqn.clone(),
             member: Some(name.to_string()),
         }),
-        ResolvedType::InProject(_) | ResolvedType::Array { .. } => None,
+        ResolvedType::InProject(_)
+        | ResolvedType::Primitive(_)
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Array { .. } => None,
     }
 }
 

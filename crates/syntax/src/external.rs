@@ -30,9 +30,10 @@ pub struct ExternalMember {
     /// what a `recv.member().` chain resolves through. `None` for
     /// primitives, `void`, arrays, and constructors.
     pub ret_fqn: Option<String>,
-    /// The generic return/field type alone in `{i}` template form
-    /// (`Stream<{0}>`, `{0}`), so chains substitute use-site type arguments
-    /// before re-resolving. `None` without generic info.
+    /// The method return / field type alone, preferring the generic `{i}`
+    /// template form when available and otherwise retaining the descriptor
+    /// display (`String`, `int`, `void`, `Object[]`). `None` only for
+    /// constructors.
     pub ret_display: Option<String>,
 }
 
