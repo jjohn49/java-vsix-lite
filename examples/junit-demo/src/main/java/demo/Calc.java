@@ -2,8 +2,7 @@ package demo;
 
 public class Calc {
     public int add(int a, int b) {
-        int count = 1;
-        return a + b + count;
+        return a + b;
     }
 
     public int divide(int dividend, int divisor) {
@@ -11,17 +10,5 @@ public class Calc {
             throw new ArithmeticException("division by zero");
         }
         return dividend / divisor;
-    }
-
-    private int extracted(int a, int b) {
-        int doubled = a * 2;
-        int total = doubled + b;
-        return total;
-    }
-
-    public int demo(int a, int b) {
-        int doubled = a * 2;
-        int total = doubled + b;
-    return total;
     }
 }
