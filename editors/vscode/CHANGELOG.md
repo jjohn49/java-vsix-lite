@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-08-30
 
 ### Added
 - **JUnit test support**: JUnit 4/5 tests appear in VS Code's Testing view

@@ -3,8 +3,6 @@ package demo;
 public class Calc {
     public int add(int a, int b) {
         int count = 1;
-        int x = 10;
-        x = "";
         return a + b + count;
     }
 
