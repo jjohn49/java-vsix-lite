@@ -174,4 +174,90 @@ suite("diagnostics pipeline", () => {
       await doc.save();
     }
   });
+
+  test("reassignment declaration link lives only in the styled hover", async function () {
+    this.timeout(60_000);
+    // Part D proof: the native reassignment check ships relatedInformation
+    // over the wire, but the client relocates it into the styled hover so
+    // the editor's plain hover block stays a single message line (see
+    // relocateRelatedInformation in styledHover.ts).
+    const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypes.java");
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+    const originalText = doc.getText();
+
+    try {
+      // Turn the method body into an incompatible reassignment (unsaved —
+      // only didChange reaches the server; no javac involved).
+      const bodyOffset = originalText.indexOf("return 1;");
+      assert.ok(bodyOffset >= 0, "fixture must contain `return 1;`");
+      const breakEdit = new vscode.WorkspaceEdit();
+      breakEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(bodyOffset), doc.positionAt(bodyOffset)),
+        "int x = 1;\n        x = true;\n        ",
+      );
+      assert.ok(await vscode.workspace.applyEdit(breakEdit), "workspace edit was not applied");
+
+      const arrived = await waitFor(
+        () =>
+          vscode.languages
+            .getDiagnostics(uri)
+            .some((d) => d.code === "jvl.incompatibleAssignment"),
+        30_000,
+      );
+      assert.ok(arrived, "expected the native reassignment diagnostic on the unsaved buffer");
+      const native = vscode.languages
+        .getDiagnostics(uri)
+        .filter((d) => d.code === "jvl.incompatibleAssignment");
+      assert.strictEqual(native.length, 1, `got: ${native.map((d) => d.message).join("; ")}`);
+      assert.strictEqual(
+        native[0].message,
+        "incompatible types: boolean cannot be converted to int",
+      );
+      // The published diagnostic must carry NO relatedInformation — the
+      // plain hover/Problems row would otherwise duplicate the styled link.
+      assert.ok(
+        !native[0].relatedInformation || native[0].relatedInformation.length === 0,
+        `relatedInformation must be relocated into the styled hover, got: ${JSON.stringify(
+          native[0].relatedInformation,
+        )}`,
+      );
+
+      // The styled hover carries the severity color, code-styled type
+      // names, and the relocated declaration link.
+      const hovers = (await vscode.commands.executeCommand(
+        "vscode.executeHoverProvider",
+        uri,
+        native[0].range.start,
+      )) as vscode.Hover[];
+      const styled = hovers
+        .flatMap((h) => h.contents)
+        .map((c) => (c instanceof vscode.MarkdownString ? c.value : String(c)))
+        .find((v) => v.includes("--vscode-editorError-foreground"));
+      assert.ok(
+        styled,
+        `expected a styled hover section, got: ${JSON.stringify(
+          hovers.flatMap((h) => h.contents),
+        )}`,
+      );
+      assert.ok(
+        styled!.includes("<code>boolean</code>") && styled!.includes("<code>int</code>"),
+        `type names must be code-styled: ${styled}`,
+      );
+      assert.ok(
+        styled!.includes("declared as") && styled!.includes("#L"),
+        `declaration link must be rendered: ${styled}`,
+      );
+    } finally {
+      const restoreEdit = new vscode.WorkspaceEdit();
+      restoreEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)),
+        originalText,
+      );
+      await vscode.workspace.applyEdit(restoreEdit);
+      await doc.save();
+    }
+  });
 });

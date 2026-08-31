@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **JUnit test support**: JUnit 4/5 tests appear in VS Code's Testing view
+  (discovered statically by the language server — no build-tool execution),
+  with run and debug profiles, per-test pass/fail results, and failure
+  messages. Tests run through the built-in debug adapter using the JUnit
+  Platform Console Launcher, downloaded once (HTTPS + checksum verification,
+  with a consent prompt) into `~/.m2/repository`; the version is the new
+  `java-vsix-lite.test.junitLauncherVersion` setting (default `1.13.4`).
+  Running tests executes project code, so it is disabled in untrusted
+  workspaces. Launch configurations gain `includeTestOutputs` and
+  `additionalClassPaths` attributes.
+- Incompatible **reassignments** (`String s = ...; s = 10;`) are now flagged
+  natively (`incompatible types: int cannot be converted to String`), same
+  conservative rules as the existing initializer check; compound operators
+  (`+=` …) stay silent.
+- **Undeclared variables are flagged natively** (`cannot find symbol:
+  variable 'x'`): a bare variable reference with provably no declaration in
+  scope — a deleted declaration that is still referenced, a use before its
+  declaration, or a block-scoped local used after its block — errors
+  immediately, without waiting for `javac`. Conservative like the
+  unresolved-member check (same `diagnostics.unresolvedMembers` setting):
+  silent on parse recovery, unresolvable supertypes, static wildcard
+  imports, and anonymous class bodies; positions where a class name would
+  be legal are never judged.
+- **Extract method** and **inline variable** refactorings, joining the
+  existing rename and extract variable/constant actions. Both are
+  conservative: extraction refuses abrupt control flow, out-params, and
+  `var` captures; inlining refuses reassigned variables and never
+  duplicates a call.
+- **Styled diagnostic hovers**: hovering an error/warning from this
+  extension shows a styled section — severity-colored header, code-styled
+  type names, source/code badge, and (for type-mismatch errors) a clickable
+  "declared as … here" link to the declaration site. While enabled (the
+  default), the declaration link appears only in the styled section, so
+  the editor's plain diagnostic block stays a single message line. Disable
+  with `java-vsix-lite.diagnostics.styledHover` to restore fully plain
+  hovers with standard related-information rows.
+
+### Changed
+- The status bar item now shows live Java error/warning counts with an
+  error/warning background color, and its tooltip reports the server state,
+  diagnostic counts, and the JDK in effect.
+
 ## 0.1.7 — 2026-08-25
 
 ### Fixed

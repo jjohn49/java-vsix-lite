@@ -40,6 +40,7 @@ mod hover;
 mod implementation;
 mod imports;
 mod jdoc;
+mod junit;
 mod lombok;
 mod model;
 mod references;
@@ -54,7 +55,8 @@ pub use codeaction::{code_actions, ActionSketch, KIND_ORGANIZE_IMPORTS, KIND_QUI
 pub use completion::{completion, resolve_documentation, CompletionResult};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::{
-    semantic_diagnostics, INCOMPATIBLE_ASSIGNMENT_CODE, INCOMPATIBLE_RETURN_CODE, UNREACHABLE_CODE,
+    semantic_diagnostics, CANNOT_FIND_SYMBOL_CODE, INCOMPATIBLE_ASSIGNMENT_CODE,
+    INCOMPATIBLE_RETURN_CODE, UNREACHABLE_CODE,
 };
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{
@@ -69,6 +71,7 @@ pub use hover::hover;
 pub use implementation::{
     implementation_target, implementations_in_doc, ImplementationHit, ImplementationTarget,
 };
+pub use junit::{discover_tests, TestClass, TestKind, TestMethod};
 pub use references::{reference_target, references_in_doc, ReferenceHits, ReferenceTarget, Tier};
 pub use rename::{
     collides_with_existing, is_public_top_level_type, is_valid_new_name, prepare_rename,

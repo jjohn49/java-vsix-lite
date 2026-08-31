@@ -116,12 +116,17 @@
         "java-vsix-lite.diagnostics.unresolvedMembers": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics). On by default; disable if you hit a false positive on a hierarchy the resolver can't fully see."
+          "markdownDescription": "Report an error for a member access (`obj.foo()`) when the receiver's type **and its entire supertype chain** resolve but declare no such member, and for a bare variable reference (`use(x)`) with provably no declaration in scope — e.g. a deleted variable that is still referenced. Conservative: stays silent whenever resolution is incomplete (an unknown supertype, a missing dependency JAR, generics, parse recovery, static wildcard imports). On by default; disable if you hit a false positive on a hierarchy the resolver can't fully see."
         },
         "java-vsix-lite.diagnostics.unused": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Report a warning (with the *unnecessary code* fade) for unused local variables, unused parameters of constructors and `private`/`static` methods, and unreferenced `private` fields and methods. Detection is name-occurrence based within the file, so shadowing can only cause silence, never a false warning; `@Override` methods, `main`, catch/lambda parameters, annotated members, and `serialVersionUID` are always skipped. On by default; disable to hide the warnings."
+        },
+        "java-vsix-lite.diagnostics.styledHover": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Render this extension's diagnostics in the editor hover as a styled section: severity color, code-styled type names, and a clickable link to the declaration site. While enabled, the declaration link is shown **only** in the styled section (the editor's plain diagnostic block keeps just its message line). Disable to restore fully plain hovers with the standard related-information rows."
         },
         "java-vsix-lite.jdk.home": {
           "type": "string",
@@ -168,6 +173,11 @@
           ],
           "default": "prompt",
           "markdownDescription": "What to do when missing dependencies are detected, in a trusted workspace: `prompt` asks once per session with a Download / Always / Never choice; `always` downloads silently from then on (same HTTPS + checksum verification, Maven Central only, as `Java: Download Missing Dependencies`); `never` disables the automatic check (the manual command still works). Choosing Always or Never from the prompt updates this setting for the current workspace."
+        },
+        "java-vsix-lite.test.junitLauncherVersion": {
+          "type": "string",
+          "default": "1.13.4",
+          "markdownDescription": "Version of `org.junit.platform:junit-platform-console-standalone` used to run tests from the Test Explorer. Downloaded once (HTTPS + checksum verification, with a consent prompt) into `~/.m2/repository` when absent. Keep to the 1.x line for the Java 8+ baseline — JUnit 6 launchers require Java 17."
         }
       }
     },
@@ -264,6 +274,19 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Break on the first line of the main method."
+              },
+              "includeTestOutputs": {
+                "type": "boolean",
+                "default": false,
+                "description": "Also put each module's test build-output directories (target/test-classes, build/classes/java/test) on the derived classpath. When none exist yet, the auto-compile fallback compiles src/test/java too. Used by test runs."
+              },
+              "additionalClassPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Extra classpath entries inserted ahead of every derived or explicit entry (e.g. the self-contained JUnit console launcher jar for test runs, which must shadow any project-resolved JUnit jars)."
               }
             }
           },

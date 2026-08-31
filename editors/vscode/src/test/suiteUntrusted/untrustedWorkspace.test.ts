@@ -312,4 +312,31 @@ suite("untrusted workspace", () => {
       "no debug session may exist after the untrusted refusal",
     );
   });
+
+  test("test explorer run refuses untrusted and starts no debug session", async () => {
+    const ext = vscode.extensions.getExtension("java-vsix-lite.java-vsix-lite");
+    assert.ok(ext, "extension not found under id java-vsix-lite.java-vsix-lite");
+    const api = (await ext!.activate()) as {
+      testing?: { runProfile: vscode.TestRunProfile };
+    };
+    assert.ok(api?.testing, "activate() must export the testing API");
+
+    const tokenSource = new vscode.CancellationTokenSource();
+    const message = await captureErrorMessage(async () => {
+      await api.testing!.runProfile.runHandler!(
+        new vscode.TestRunRequest(),
+        tokenSource.token,
+      );
+    });
+    assert.strictEqual(
+      message,
+      "java-vsix-lite: running tests is disabled in an untrusted workspace — it runs your project's code. Trust this workspace to enable it.",
+      "the test-run trust gate must show its exact refusal message",
+    );
+    assert.strictEqual(
+      vscode.debug.activeDebugSession,
+      undefined,
+      "no debug session may exist after the untrusted test-run refusal",
+    );
+  });
 });

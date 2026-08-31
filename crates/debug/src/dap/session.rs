@@ -354,12 +354,16 @@ impl Session {
 
         // Classpath assembly can walk the project and run a bounded javac.
         let class_paths = args.class_paths.clone();
+        let include_test_outputs = args.include_test_outputs;
+        let additional_class_paths = args.additional_class_paths.clone();
         let blocking_root = project_root.clone();
         let blocking_jdk = jdk_home.clone();
         let plan = tokio::task::spawn_blocking(move || {
             launch::assemble_classpath(
                 blocking_root.as_deref(),
                 &class_paths,
+                include_test_outputs,
+                &additional_class_paths,
                 blocking_jdk.as_deref(),
             )
         })

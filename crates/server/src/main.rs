@@ -443,9 +443,9 @@ impl LanguageServer for Backend {
                 })),
                 // Add-import quick fixes + "Organize Imports" (VS Code's
                 // shift+alt+O and `source.organizeImports` on save both work
-                // through this), plus extract variable/constant and
-                // source-generate actions (accessors, constructor,
-                // equals/hashCode, toString).
+                // through this), plus extract variable/constant/method,
+                // inline variable, and source-generate actions (accessors,
+                // constructor, equals/hashCode, toString).
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![
@@ -453,6 +453,7 @@ impl LanguageServer for Backend {
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                             CodeActionKind::REFACTOR_EXTRACT,
                             CodeActionKind::new("source.generate"),
+                            CodeActionKind::new("refactor.inline"),
                         ]),
                         resolve_provider: Some(false),
                         work_done_progress_options: Default::default(),
@@ -1805,6 +1806,123 @@ impl Backend {
     }
 }
 
+/// The `jvl/tests` custom request's params: the files to discover JUnit
+/// tests in (the extension batches its `**/src/test/java/**` matches into
+/// one request).
+#[derive(Debug, Deserialize)]
+struct TestsParams {
+    uris: Vec<String>,
+}
+
+/// One discovered test method inside a [`TestsClass`].
+#[derive(Debug, Serialize)]
+struct TestsMethod {
+    name: String,
+    range: Range,
+    kind: &'static str,
+}
+
+/// One class with ≥1 discovered test method. `fqn` is the binary name
+/// (`pkg.Outer$Inner`) the JUnit Platform launcher selects classes by.
+#[derive(Debug, Serialize)]
+struct TestsClass {
+    fqn: String,
+    name: String,
+    range: Range,
+    methods: Vec<TestsMethod>,
+}
+
+/// Per-uri discovery outcome: empty `classes` when the file has no tests,
+/// can't be parsed, or lies outside the workspace root.
+#[derive(Debug, Serialize)]
+struct TestsFile {
+    uri: String,
+    classes: Vec<TestsClass>,
+}
+
+/// The `jvl/tests` custom request's result — one entry per requested uri.
+#[derive(Debug, Serialize)]
+struct TestsResult {
+    files: Vec<TestsFile>,
+}
+
+/// Map one parsed document through the syntax crate's static JUnit discovery.
+fn discovered_test_classes(
+    tree: &Tree,
+    source: &str,
+    encoding: PositionEncoding,
+) -> Vec<TestsClass> {
+    let index = LineIndex::new(source, encoding);
+    jvl_syntax::discover_tests(tree, source, &index)
+        .into_iter()
+        .map(|class| TestsClass {
+            fqn: class.binary_fqn,
+            name: class.name,
+            range: class.range,
+            methods: class
+                .methods
+                .into_iter()
+                .map(|method| TestsMethod {
+                    name: method.name,
+                    range: method.range,
+                    kind: match method.kind {
+                        jvl_syntax::TestKind::JUnit5 => "junit5",
+                        jvl_syntax::TestKind::JUnit4 => "junit4",
+                    },
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+impl Backend {
+    /// `jvl/tests` — static JUnit 4/5 test discovery for the requested
+    /// files, powering the extension's Test Explorer tree. Purely syntactic
+    /// (no execution, no classpath): open documents use their live tree,
+    /// closed files the bounded on-demand parse cache. A uri outside the
+    /// workspace root yields empty classes — this request never widens the
+    /// server's filesystem reach.
+    async fn tests(&self, params: TestsParams) -> Result<TestsResult> {
+        let root_canonical = self
+            .project_root()
+            .and_then(|root| std::fs::canonicalize(root).ok());
+        let mut files = Vec::with_capacity(params.uris.len());
+        for uri in params.uris {
+            let classes = self.tests_in_uri(&uri, root_canonical.as_deref()).await;
+            files.push(TestsFile { uri, classes });
+        }
+        Ok(TestsResult { files })
+    }
+
+    async fn tests_in_uri(&self, uri_str: &str, root_canonical: Option<&Path>) -> Vec<TestsClass> {
+        let Some(root) = root_canonical else {
+            return Vec::new();
+        };
+        let Some(path) = uri_str
+            .parse::<Uri>()
+            .ok()
+            .and_then(|uri| Some(uri.to_file_path()?.into_owned()))
+        else {
+            return Vec::new();
+        };
+        // Containment first (symlink-resolving): reject anything whose real
+        // path escapes the workspace before reading it.
+        let Some(path) = javac::canonical_within_workspace(&path, root) else {
+            return Vec::new();
+        };
+        {
+            let docs = self.documents.lock().await;
+            if let Some(doc) = docs.get(uri_str) {
+                return discovered_test_classes(&doc.tree, &doc.text, self.encoding());
+            }
+        }
+        let Some((text, tree)) = self.parsed_project_file(&path) else {
+            return Vec::new();
+        };
+        discovered_test_classes(&tree, &text, self.encoding())
+    }
+}
+
 /// Adapts `jvl-classpath` to `jvl-syntax`'s `SymbolSource`, converting the
 /// bytecode model into the analysis crate's external-symbol types. Holds an
 /// owned snapshot `Arc` (from `Backend::classpath()`) rather than a borrow,
@@ -2038,6 +2156,7 @@ async fn main() -> std::process::ExitCode {
     let (service, socket) = LspService::build(Backend::new)
         .custom_method("jvl/externalSource", Backend::external_source)
         .custom_method("jvl/missingDependencies", Backend::missing_dependencies)
+        .custom_method("jvl/tests", Backend::tests)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
     std::process::ExitCode::SUCCESS

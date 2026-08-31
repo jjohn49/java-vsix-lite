@@ -4262,3 +4262,108 @@ fn javac_result_started_before_edit_cannot_reintroduce_error() {
     assert!(status.success(), "server exited with failure: {status:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `jvl/tests` performs static JUnit discovery for the requested files: an
+/// open document is analyzed from its live tree, a closed one from disk,
+/// and a uri outside the workspace root yields empty classes (containment —
+/// the request must never widen the server's filesystem reach).
+#[test]
+fn tests_request_discovers_junit_classes_and_respects_containment() {
+    let root = temp_root("junit-tests");
+    let test_dir = root.join("src/test/java/demo");
+    std::fs::create_dir_all(&test_dir).expect("create test source dir");
+    let calc_text = "package demo;\nimport org.junit.jupiter.api.Test;\n\nclass CalcTest {\n    @Test\n    void adds() { }\n}\n";
+    let legacy_text = "package demo;\nimport org.junit.Test;\n\npublic class LegacyTest {\n    @Test\n    public void adds() { }\n}\n";
+    std::fs::write(test_dir.join("CalcTest.java"), calc_text).expect("write CalcTest");
+    std::fs::write(test_dir.join("LegacyTest.java"), legacy_text).expect("write LegacyTest");
+
+    let outside = temp_root("junit-tests-outside");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    std::fs::write(outside.join("OutsideTest.java"), calc_text).expect("write OutsideTest");
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // CalcTest is opened (live-tree path); LegacyTest stays closed (on-disk
+    // parse path); OutsideTest lies outside the workspace root.
+    let calc_uri = format!("{root_uri}/src/test/java/demo/CalcTest.java");
+    let legacy_uri = format!("{root_uri}/src/test/java/demo/LegacyTest.java");
+    let outside_uri = format!("file://{}/OutsideTest.java", outside.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{calc_uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(calc_text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"jvl/tests","params":{{"uris":["{calc_uri}","{legacy_uri}","{outside_uri}"]}}}}"#
+    ));
+    let result = read_until(&mut reader, "\"id\":2", &mut seen);
+    let json: Value = serde_json::from_str(&result).expect("parse jvl/tests response");
+    let files = json["result"]["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 3, "{result}");
+
+    assert_eq!(files[0]["uri"], calc_uri.as_str(), "{result}");
+    let calc_classes = files[0]["classes"].as_array().expect("calc classes");
+    assert_eq!(calc_classes.len(), 1, "{result}");
+    let calc = &calc_classes[0];
+    assert_eq!(calc["fqn"], "demo.CalcTest");
+    assert_eq!(calc["name"], "CalcTest");
+    assert_eq!(calc["range"]["start"]["line"], 3);
+    assert_eq!(calc["range"]["start"]["character"], 6);
+    let calc_methods = calc["methods"].as_array().expect("calc methods");
+    assert_eq!(calc_methods.len(), 1, "{result}");
+    assert_eq!(calc_methods[0]["name"], "adds");
+    assert_eq!(calc_methods[0]["kind"], "junit5");
+    assert_eq!(calc_methods[0]["range"]["start"]["line"], 5);
+    assert_eq!(calc_methods[0]["range"]["start"]["character"], 9);
+
+    assert_eq!(files[1]["uri"], legacy_uri.as_str(), "{result}");
+    let legacy_classes = files[1]["classes"].as_array().expect("legacy classes");
+    assert_eq!(legacy_classes.len(), 1, "{result}");
+    let legacy = &legacy_classes[0];
+    assert_eq!(legacy["fqn"], "demo.LegacyTest");
+    assert_eq!(legacy["name"], "LegacyTest");
+    let legacy_methods = legacy["methods"].as_array().expect("legacy methods");
+    assert_eq!(legacy_methods.len(), 1, "{result}");
+    assert_eq!(legacy_methods[0]["name"], "adds");
+    assert_eq!(legacy_methods[0]["kind"], "junit4");
+
+    assert_eq!(files[2]["uri"], outside_uri.as_str(), "{result}");
+    assert_eq!(
+        files[2]["classes"].as_array().map(Vec::len),
+        Some(0),
+        "a uri outside the workspace must yield empty classes: {result}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}

@@ -122,6 +122,15 @@ pub struct LaunchArgs {
     pub project_root: Option<String>,
     pub class_paths: Vec<String>,
     pub stop_on_entry: bool,
+    /// Also put each module's *test* build-output dirs on the derived
+    /// classpath (test runs); when none exist, assembly falls through to the
+    /// auto-compile fallback so first-run tests work without a prior build.
+    pub include_test_outputs: bool,
+    /// Extra entries inserted verbatim *ahead of* every derived/explicit
+    /// entry — carries the self-contained JUnit console launcher jar for
+    /// test runs, which must shadow any project-resolved JUnit jars (mixed
+    /// versions fail with `NoSuchMethodError` before any test runs).
+    pub additional_class_paths: Vec<String>,
     /// Injected by the extension from the machine-scoped
     /// `java-vsix-lite.jdk.home` setting — never workspace-controlled.
     #[serde(rename = "__jvlJdkHome")]

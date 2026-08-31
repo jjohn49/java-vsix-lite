@@ -1,28 +1,36 @@
 //! Conservative semantic diagnostics: resolvable member accesses, method
-//! returns, variable/field initializers, unreachable statements, and unused
+//! returns, variable/field initializers, reassignments, unreachable
+//! statements, and unused
 //! code. Resolution/analysis must be complete before a diagnostic is emitted,
 //! so unknown project/classpath types, overloads, and recovery regions stay
 //! silent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use ls_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
+use ls_types::{
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
+    NumberOrString, Uri,
+};
 use tree_sitter::Node;
 
 use crate::external::SymbolSource;
 use crate::imports::Imports;
-use crate::model::TypeTable;
+use crate::model::{named_children, TypeDecl, TypeKind, TypeTable};
 use crate::resolve::{self, Ctx, ResolvedType};
 use crate::{diagnostic, node_text, LineIndex, OpenDoc, MAX_DIAGNOSTICS};
 
 /// Stable LSP code for a proven incompatible method return.
 pub const INCOMPATIBLE_RETURN_CODE: &str = "jvl.incompatibleReturn";
 
-/// Stable LSP code for a proven incompatible variable/field initializer.
+/// Stable LSP code for a proven incompatible variable/field initializer or
+/// reassignment.
 pub const INCOMPATIBLE_ASSIGNMENT_CODE: &str = "jvl.incompatibleAssignment";
 
 /// Stable LSP code for a statement that can never execute.
 pub const UNREACHABLE_CODE: &str = "jvl.unreachable";
+
+/// Stable LSP code for a provably undeclared variable/field reference.
+pub const CANNOT_FIND_SYMBOL_CODE: &str = "jvl.cannotFindSymbol";
 
 /// Stable LSP code for unused locals, parameters, and private members.
 const UNUSED_CODE: &str = "jvl.unused";
@@ -36,6 +44,7 @@ pub fn semantic_diagnostics(
     docs: &[OpenDoc],
     current: usize,
     index: &LineIndex,
+    uri: &Uri,
     symbols: &dyn SymbolSource,
     unresolved_members: bool,
     unused: bool,
@@ -56,6 +65,11 @@ pub fn semantic_diagnostics(
     let mut out = Vec::new();
     let root = doc.tree.root_node();
     let name_counts = unused.then(|| identifier_counts(root, doc.source));
+    // The unresolved-identifier rule needs a fully clean parse (recovery can
+    // reattach an identifier anywhere) and knowledge of static imports
+    // (which can bind any bare name).
+    let static_imports =
+        (unresolved_members && !root.has_error()).then(|| StaticImports::parse(root, doc.source));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if out.len() >= MAX_DIAGNOSTICS {
@@ -63,7 +77,8 @@ pub fn semantic_diagnostics(
         }
 
         match node.kind() {
-            "return_statement" => check_return(node, &ctx, index, &mut out),
+            "return_statement" => check_return(node, &ctx, index, uri, &mut out),
+            "assignment_expression" => check_assignment(node, &ctx, index, uri, &mut out),
             "local_variable_declaration" => {
                 check_initializers(node, &ctx, index, &mut out);
                 if unused {
@@ -101,6 +116,11 @@ pub fn semantic_diagnostics(
                 if unresolved_members && node.child_by_field_name("object").is_some() =>
             {
                 check_member(node, "name", "method", &ctx, index, &mut out)
+            }
+            "identifier" => {
+                if let Some(static_imports) = &static_imports {
+                    check_unresolved_identifier(node, &ctx, static_imports, index, &mut out);
+                }
             }
             _ => {}
         }
@@ -165,10 +185,209 @@ fn check_member(
     }
 }
 
+/// Static-import context for the unresolved-identifier rule: a static
+/// import can bind any bare name (a constant), so an identifier matching a
+/// static single import — or any file with a static wildcard import — must
+/// stay silent.
+struct StaticImports {
+    names: HashSet<String>,
+    wildcard: bool,
+}
+
+impl StaticImports {
+    fn parse(root: Node, source: &str) -> StaticImports {
+        let mut names = HashSet::new();
+        let mut wildcard = false;
+        for child in named_children(root) {
+            if child.kind() != "import_declaration" {
+                continue;
+            }
+            let Some(path) = crate::imports::dotted_path(node_text(child, source), "import") else {
+                continue;
+            };
+            // `dotted_path` collapses whitespace, so a static import arrives
+            // as `statica.b.C.member` — peel the keyword off (same trick as
+            // `lombok::file_uses_lombok`).
+            let Some(path) = path.strip_prefix("static") else {
+                continue;
+            };
+            if path.ends_with(".*") {
+                wildcard = true;
+            } else if let Some(simple) = path.rsplit('.').next() {
+                names.insert(simple.to_string());
+            }
+        }
+        StaticImports { names, wildcard }
+    }
+
+    fn may_bind(&self, name: &str) -> bool {
+        self.wildcard || self.names.contains(name)
+    }
+}
+
+/// Whether `id` occupies a position where only a variable/field *value* is
+/// legal Java. Receiver/member/type/label/declaration positions are
+/// excluded — a class or member name would be valid there, and the type
+/// namespace is not this rule's to judge.
+fn is_variable_only_position(id: Node) -> bool {
+    let Some(parent) = id.parent() else {
+        return false;
+    };
+    let in_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|n| n.id() == id.id())
+    };
+    match parent.kind() {
+        "argument_list"
+        | "binary_expression"
+        | "unary_expression"
+        | "update_expression"
+        | "parenthesized_expression"
+        | "array_initializer"
+        | "array_access"
+        | "assignment_expression"
+        | "ternary_expression"
+        | "return_statement"
+        | "throw_statement"
+        | "yield_statement" => true,
+        "variable_declarator" | "enhanced_for_statement" | "cast_expression" => in_field("value"),
+        "instanceof_expression" => in_field("left"),
+        "lambda_expression" => in_field("body"),
+        _ => false,
+    }
+}
+
+/// The name bound by a `catch` clause's parameter, if any.
+fn catch_param_name<'t>(catch_clause: Node<'t>, source: &'t str) -> Option<&'t str> {
+    let parameter = named_children(catch_clause)
+        .into_iter()
+        .find(|c| c.kind() == "catch_formal_parameter")?;
+    if let Some(name) = parameter.child_by_field_name("name") {
+        return Some(node_text(name, source));
+    }
+    // Fallback for grammar variants without a `name` field: the last direct
+    // identifier child is the binding.
+    named_children(parameter)
+        .into_iter()
+        .rev()
+        .find(|c| c.kind() == "identifier")
+        .map(|n| node_text(n, source))
+}
+
+/// Whether a try-with-resources statement binds `name` as a resource.
+fn binds_resource(try_statement: Node, name: &str, source: &str) -> bool {
+    named_children(try_statement)
+        .into_iter()
+        .filter(|c| c.kind() == "resource_specification")
+        .flat_map(named_children)
+        .filter(|c| c.kind() == "resource")
+        .filter_map(|resource| resource.child_by_field_name("name"))
+        .any(|n| node_text(n, source) == name)
+}
+
+/// Unresolved-identifier rule (`jvl.cannotFindSymbol`): a bare identifier in
+/// a value-only position that provably has no binding — not a local,
+/// parameter, pattern, catch/resource binding, static import, or a member
+/// of any enclosing type's fully-resolvable hierarchy. Anything unprovable
+/// (parse recovery, an unresolvable supertype, an anonymous class body, a
+/// static wildcard import) stays silent — the same conservative contract as
+/// every other rule here. This catches the everyday "deleted the
+/// declaration but a use remains" immediately, without waiting for javac.
+fn check_unresolved_identifier<'t>(
+    id: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+    static_imports: &StaticImports,
+    index: &LineIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !is_variable_only_position(id) {
+        return;
+    }
+    let name = node_text(id, ctx.doc.source);
+    if name == "_" || static_imports.may_bind(name) {
+        return;
+    }
+    // Locals, parameters, patterns, and (in-project) fields — the same
+    // position-aware lookup hover and completion use, so scoping matches
+    // Java (a local is invisible before its declaration and outside its
+    // block).
+    if resolve::lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        id.start_byte(),
+        name,
+        ctx.table,
+        ctx.current,
+    )
+    .is_some()
+    {
+        return;
+    }
+    // Bindings the shared lookup doesn't model, plus contexts where absence
+    // can't be proven — one walk up the ancestor chain.
+    let mut enclosing_types: Vec<Node<'t>> = Vec::new();
+    let mut node = id;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "catch_clause" => {
+                if catch_param_name(parent, ctx.doc.source) == Some(name) {
+                    return;
+                }
+            }
+            "try_with_resources_statement" => {
+                if binds_resource(parent, name, ctx.doc.source) {
+                    return;
+                }
+            }
+            // An anonymous class body inherits fields from its created
+            // type; proving absence there isn't worth the complexity.
+            "object_creation_expression"
+                if named_children(parent)
+                    .iter()
+                    .any(|c| c.kind() == "class_body") =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        if TypeKind::from_kind(parent.kind()).is_some() {
+            enclosing_types.push(parent);
+        }
+        node = parent;
+    }
+    if enclosing_types.is_empty() {
+        return;
+    }
+    // Inherited members: every enclosing type's full hierarchy must be
+    // enumerable before absence is proven (an unresolvable supertype could
+    // declare the field). Member names include methods — a same-named
+    // method keeps the rule silent, conservatively.
+    for type_node in enclosing_types {
+        let Some(td) = TypeDecl::from_node(type_node, ctx.doc.source, ctx.current) else {
+            return;
+        };
+        let resolved = resolve::Resolved {
+            ty: ResolvedType::InProject(td),
+            static_only: false,
+        };
+        let (names, complete) = resolve::member_names(&resolved, ctx);
+        if !complete || names.contains(name) {
+            return;
+        }
+    }
+    out.push(coded_diagnostic(
+        index.range(id),
+        CANNOT_FIND_SYMBOL_CODE,
+        format!("cannot find symbol: variable '{name}'"),
+    ));
+}
+
 fn check_return<'t>(
     return_statement: Node<'t>,
     ctx: &Ctx<'_, 't>,
     index: &LineIndex,
+    uri: &Uri,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(method) = nearest_method(return_statement) else {
@@ -188,14 +407,31 @@ fn check_return<'t>(
         expression
     };
     let returns_void = node_text(return_type, ctx.doc.source).trim() == "void";
+    // Presentation metadata: a clickable link to the declared return type.
+    let related = method.child_by_field_name("name").map(|name| {
+        declared_here(
+            uri,
+            index.range(return_type),
+            format!(
+                "method '{}' declared to return '{}' here",
+                node_text(name, ctx.doc.source),
+                node_text(return_type, ctx.doc.source).trim()
+            ),
+        )
+    });
 
+    let mut push = |diagnostic: Diagnostic| {
+        let mut diagnostic = diagnostic;
+        diagnostic.related_information = related.clone();
+        out.push(diagnostic);
+    };
     match (returns_void, expression) {
-        (true, Some(_)) => out.push(coded_diagnostic(
+        (true, Some(_)) => push(coded_diagnostic(
             index.range(return_statement),
             INCOMPATIBLE_RETURN_CODE,
             "incompatible types: unexpected return value".to_string(),
         )),
-        (false, None) => out.push(coded_diagnostic(
+        (false, None) => push(coded_diagnostic(
             index.range(return_statement),
             INCOMPATIBLE_RETURN_CODE,
             "incompatible types: missing return value".to_string(),
@@ -210,7 +446,7 @@ fn check_return<'t>(
                 return;
             };
             if resolve::is_assignable(&actual, &expected, ctx) == Some(false) {
-                out.push(coded_diagnostic(
+                push(coded_diagnostic(
                     index.range(expression),
                     INCOMPATIBLE_RETURN_CODE,
                     format!(
@@ -222,6 +458,22 @@ fn check_return<'t>(
             }
         }
     }
+}
+
+/// A one-entry `related_information` list pointing at a same-document
+/// declaration site.
+fn declared_here(
+    uri: &Uri,
+    range: ls_types::Range,
+    message: String,
+) -> Vec<DiagnosticRelatedInformation> {
+    vec![DiagnosticRelatedInformation {
+        location: Location {
+            uri: uri.clone(),
+            range,
+        },
+        message,
+    }]
 }
 
 fn nearest_method<'t>(return_statement: Node<'t>) -> Option<Node<'t>> {
@@ -301,6 +553,164 @@ fn check_initializers<'t>(
             ));
         }
     }
+}
+
+/// Incompatible-reassignment rule: for a plain `=` assignment whose LHS and
+/// RHS types both resolve, flag a proven mismatch. Compound operators
+/// (`+=` …) carry implicit-cast semantics and stay silent, as do unknown
+/// types (`None` from resolution) and recovery regions.
+fn check_assignment<'t>(
+    assignment: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+    index: &LineIndex,
+    uri: &Uri,
+    out: &mut Vec<Diagnostic>,
+) {
+    // A MISSING `;` after the expression lands on the enclosing statement,
+    // not the assignment node itself, so recovery is checked one level up.
+    if assignment.has_error() || assignment.parent().is_some_and(|parent| parent.has_error()) {
+        return;
+    }
+    let (Some(operator), Some(left), Some(right)) = (
+        assignment.child_by_field_name("operator"),
+        assignment.child_by_field_name("left"),
+        assignment.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if node_text(operator, ctx.doc.source) != "=" {
+        return;
+    }
+    let Some(expected) = resolve::resolve_expression_type(left, ctx) else {
+        return;
+    };
+    let Some(actual) = resolve::resolve_expression_type(right, ctx) else {
+        return;
+    };
+    if resolve::is_assignable(&actual, &expected, ctx) == Some(false) {
+        let mut diagnostic = coded_diagnostic(
+            index.range(right),
+            INCOMPATIBLE_ASSIGNMENT_CODE,
+            format!(
+                "incompatible types: {} cannot be converted to {}",
+                resolve::type_display(&actual),
+                resolve::type_display(&expected)
+            ),
+        );
+        // Presentation metadata only: on a lookup miss the diagnostic ships
+        // without the link (silence over wrong links).
+        if let Some((name_node, type_node)) = lhs_declaration(assignment, left, ctx.doc.source) {
+            diagnostic.related_information = Some(declared_here(
+                uri,
+                index.range(name_node),
+                format!(
+                    "'{}' declared as '{}' here",
+                    node_text(name_node, ctx.doc.source),
+                    node_text(type_node, ctx.doc.source).trim()
+                ),
+            ));
+        }
+        out.push(diagnostic);
+    }
+}
+
+/// The declaration `name`/`type` nodes of a flagged assignment's LHS, found
+/// by a scoped upward textual search: the nearest preceding
+/// `local_variable_declaration` declarator or `formal_parameter` in
+/// enclosing blocks, then the nearest class's `field_declaration`s. A
+/// `this.f` LHS searches fields only (a same-named local must not win).
+fn lhs_declaration<'t>(
+    assignment: Node<'t>,
+    left: Node<'t>,
+    source: &str,
+) -> Option<(Node<'t>, Node<'t>)> {
+    let (name, fields_only) = match left.kind() {
+        "identifier" => (node_text(left, source), false),
+        "field_access" => {
+            let object = left.child_by_field_name("object")?;
+            let field = left.child_by_field_name("field")?;
+            if object.kind() != "this" || field.kind() != "identifier" {
+                return None;
+            }
+            (node_text(field, source), true)
+        }
+        _ => return None,
+    };
+    let at = assignment.start_byte();
+    let mut current = assignment;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "block" | "constructor_body" if !fields_only => {
+                // Nearest preceding declaration in this block wins.
+                let mut nearest = None;
+                for statement in named_children(parent) {
+                    if statement.start_byte() >= at {
+                        break;
+                    }
+                    if statement.kind() != "local_variable_declaration" {
+                        continue;
+                    }
+                    let Some(ty) = statement.child_by_field_name("type") else {
+                        continue;
+                    };
+                    let mut cursor = statement.walk();
+                    for declarator in statement.children_by_field_name("declarator", &mut cursor) {
+                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                            if node_text(name_node, source) == name {
+                                nearest = Some((name_node, ty));
+                            }
+                        }
+                    }
+                }
+                if nearest.is_some() {
+                    return nearest;
+                }
+            }
+            "method_declaration" | "constructor_declaration" if !fields_only => {
+                if let Some(parameters) = parent.child_by_field_name("parameters") {
+                    for parameter in named_children(parameters) {
+                        if parameter.kind() != "formal_parameter" {
+                            continue;
+                        }
+                        if let (Some(name_node), Some(ty)) = (
+                            parameter.child_by_field_name("name"),
+                            parameter.child_by_field_name("type"),
+                        ) {
+                            if node_text(name_node, source) == name {
+                                return Some((name_node, ty));
+                            }
+                        }
+                    }
+                }
+            }
+            "class_body" => {
+                for member in named_children(parent) {
+                    if member.kind() != "field_declaration" {
+                        continue;
+                    }
+                    let Some(ty) = member.child_by_field_name("type") else {
+                        continue;
+                    };
+                    for declarator in named_children(member) {
+                        if declarator.kind() != "variable_declarator" {
+                            continue;
+                        }
+                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                            if node_text(name_node, source) == name {
+                                return Some((name_node, ty));
+                            }
+                        }
+                    }
+                }
+                // Stop at the nearest class — an outer class's same-named
+                // field would be a wrong link.
+                return None;
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    None
 }
 
 /// Unreachable-statement rule: plain `block` nodes are inspected (switch case
@@ -717,7 +1127,16 @@ mod tests {
             .map(|(source, tree)| OpenDoc { source, tree })
             .collect();
         let index = LineIndex::new(sources[current], PositionEncoding::Utf16);
-        semantic_diagnostics(&docs, current, &index, symbols, unresolved_members, unused)
+        let uri: Uri = "file:///Test.java".parse().expect("test uri");
+        semantic_diagnostics(
+            &docs,
+            current,
+            &index,
+            &uri,
+            symbols,
+            unresolved_members,
+            unused,
+        )
     }
 
     fn diags(src: &str, symbols: &dyn SymbolSource) -> Vec<String> {
@@ -774,6 +1193,18 @@ mod tests {
             "incompatible types: int cannot be converted to boolean"
         );
         assert_eq!(diagnostic.range, range_of(src, "1"));
+        // Clickable declaration link: the declared return type, same document.
+        let related = diagnostic
+            .related_information
+            .as_ref()
+            .expect("related information present");
+        assert_eq!(related.len(), 1, "{related:?}");
+        assert_eq!(
+            related[0].message,
+            "method 'm' declared to return 'boolean' here"
+        );
+        assert_eq!(related[0].location.uri.as_str(), "file:///Test.java");
+        assert_eq!(related[0].location.range, range_of(src, "boolean"));
     }
 
     #[test]
@@ -1185,6 +1616,179 @@ mod tests {
         );
     }
 
+    // ---- Rule: unresolved identifiers (`jvl.cannotFindSymbol`) --------------
+
+    #[test]
+    fn undeclared_variable_has_exact_contract() {
+        assert_eq!(CANNOT_FIND_SYMBOL_CODE, "jvl.cannotFindSymbol");
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C { void m() { use(x); } void use(int v) {} }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("jvl.cannotFindSymbol".to_string()))
+        );
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.message, "cannot find symbol: variable 'x'");
+        assert_eq!(diagnostic.range, range_of(src, "x"));
+    }
+
+    #[test]
+    fn declared_bindings_stay_silent() {
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C {
+            int field;
+            void m(int param) {
+                int local = 1;
+                use(field);
+                use(param);
+                use(local);
+                for (int i = 0; i < 3; i++) {
+                    use(i);
+                }
+                for (int n : new int[0]) {
+                    use(n);
+                }
+                Runnable r = () -> use(local);
+            }
+            void use(int v) {}
+        }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn pattern_catch_and_resource_bindings_stay_silent() {
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C {
+            void m(Object o) {
+                if (o instanceof String s) {
+                    use(s);
+                }
+                try (AutoCloseable res = open()) {
+                    use(res);
+                } catch (Exception e) {
+                    use(e);
+                }
+            }
+            void use(Object v) {}
+            AutoCloseable open() { return null; }
+        }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn out_of_scope_and_use_before_declaration_are_flagged() {
+        let symbols = ObjectAware(Vec::new());
+        // A block-scoped local referenced after its block, and an
+        // assignment before the declaration statement — both javac errors.
+        let out_of_scope =
+            "class C { void m() { { int x = 1; use(x); } use(x); } void use(int v) {} }\n";
+        let messages: Vec<String> = semantic(out_of_scope, &symbols, true, false)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(messages, ["cannot find symbol: variable 'x'"]);
+
+        let before_decl = "class C { void m() { y = 1; int y = 2; use(y); } void use(int v) {} }\n";
+        let messages: Vec<String> = semantic(before_decl, &symbols, true, false)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(messages, ["cannot find symbol: variable 'y'"]);
+    }
+
+    #[test]
+    fn unresolvable_supertype_silences_the_identifier_check() {
+        // `Unknown` could declare the field — absence is unprovable.
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C extends Unknown { void m() { use(x); } void use(int v) {} }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn incomplete_object_hierarchy_silences_the_identifier_check() {
+        // With no symbol source even `java.lang.Object` is unknown, so no
+        // hierarchy is ever complete — the rule must stay silent.
+        let src = "class C { void m() { use(x); } void use(int v) {} }\n";
+        let diagnostics = semantic(src, &NoSymbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn inherited_field_from_open_document_stays_silent() {
+        let symbols = ObjectAware(Vec::new());
+        let base = "class Base { int shared; }\n";
+        let current = "class C extends Base { void m() { use(shared); } void use(int v) {} }\n";
+        let diagnostics = semantic_for_sources(&[current, base], 0, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn static_imports_silence_matching_names() {
+        let symbols = ObjectAware(Vec::new());
+        let single = "import static java.lang.Math.PI;
+        class C { double m() { return PI; } }\n";
+        assert!(semantic(single, &symbols, true, false).is_empty());
+
+        // A static wildcard can bind any name — everything stays silent.
+        let wildcard = "import static java.lang.Math.*;
+        class C { double m() { return E; } }\n";
+        assert!(semantic(wildcard, &symbols, true, false).is_empty());
+    }
+
+    #[test]
+    fn class_name_receivers_are_not_flagged() {
+        // `Foo` sits in receiver position, where a type name is legal — the
+        // identifier rule never judges the type namespace.
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C { void m() { Foo.bar(); } }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn recovery_silences_the_identifier_check() {
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C { void m() { use(x) } void use(int v) {} }\n";
+        assert!(
+            has_recovery(src, true) || has_recovery(src, false),
+            "fixture must exercise parse recovery"
+        );
+        assert!(semantic(src, &symbols, true, false).is_empty());
+    }
+
+    #[test]
+    fn anonymous_class_bodies_silence_the_identifier_check() {
+        // The created type could contribute inherited fields; unprovable.
+        let symbols = ObjectAware(Vec::new());
+        let src = "class C {
+            Runnable r = new Runnable() {
+                public void run() {
+                    use(x);
+                }
+            };
+            void use(int v) {}
+        }\n";
+        let diagnostics = semantic(src, &symbols, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn record_components_and_enum_constants_stay_silent() {
+        let symbols = ObjectAware(Vec::new());
+        let record = "record R(int size) { int doubled() { return size * 2; } }\n";
+        assert!(semantic(record, &symbols, true, false).is_empty());
+
+        let with_enum = "enum E { A, B; int m() { return use(A); } int use(E e) { return 0; } }\n";
+        assert!(semantic(with_enum, &symbols, true, false).is_empty());
+    }
+
     // ---- Hygiene rules (initializers, unreachable, unused) ------------------
 
     /// Hygiene-rule diagnostics: member checks off (gated and tested
@@ -1313,6 +1917,154 @@ mod tests {
             "fixture must contain an ERROR node"
         );
         assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    // ---- Rule 1b: incompatible reassignments (`jvl.incompatibleAssignment`) --
+
+    #[test]
+    fn incompatible_reassignment_has_exact_contract() {
+        // `java.lang.Integer` (int's box) must be known for the layer to
+        // prove int is NOT convertible to String.
+        let symbols = ObjectAware(vec![
+            (
+                "java.lang.String",
+                vec!["java.lang.Object"],
+                vec!["valueOf"],
+            ),
+            ("java.lang.Integer", vec!["java.lang.Number"], Vec::new()),
+            ("java.lang.Number", vec!["java.lang.Object"], Vec::new()),
+        ]);
+        let src = "class C { void m() { String jack = String.valueOf(10); jack = 10; } }\n";
+        let diagnostics = semantic(src, &symbols, false, false);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                "jvl.incompatibleAssignment".to_string()
+            ))
+        );
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostic.message,
+            "incompatible types: int cannot be converted to String"
+        );
+        // The range covers the assigned value (the second `10`), not the LHS.
+        let start = src.rfind("10").expect("assigned value present");
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        assert_eq!(
+            diagnostic.range,
+            Range {
+                start: index.position(start),
+                end: index.position(start + 2),
+            }
+        );
+        // Declaration link: the declarator's name node, same document.
+        let related = diagnostic
+            .related_information
+            .as_ref()
+            .expect("related information present");
+        assert_eq!(related.len(), 1, "{related:?}");
+        assert_eq!(related[0].message, "'jack' declared as 'String' here");
+        assert_eq!(related[0].location.uri.as_str(), "file:///Test.java");
+        assert_eq!(related[0].location.range, range_of(src, "jack"));
+    }
+
+    #[test]
+    fn incompatible_reassignment_to_project_type_is_flagged() {
+        let src = "class Box {} class C { void m() { Box b = new Box(); b = 1; } }\n";
+        assert_eq!(
+            hygiene_messages(src, false),
+            ["incompatible types: int cannot be converted to Box"]
+        );
+    }
+
+    #[test]
+    fn compatible_reassignments_are_silent() {
+        let src = "class C { void m() { int x = 1; x = 2; } }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+
+        let widening = "class C { void m() { long l; l = 1; } }\n";
+        assert!(hygiene_messages(widening, false).is_empty());
+    }
+
+    #[test]
+    fn compound_assignments_are_silent() {
+        // Compound operators have implicit-cast semantics (`byte b; b += 1;`
+        // is legal Java), so the rule only inspects plain `=`.
+        let src = "class C { void m() { byte b = 1; b += 1; int i = 1; i += 2; } }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn constant_narrowing_reassignment_is_silent() {
+        // `byte b; b = 1;` is legal Java (assignment conversion narrows
+        // constants), matching the initializer rule's narrowing silence.
+        let src = "class C { void m() { byte b; b = 1; } }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn unknown_reassignment_types_are_silent() {
+        // Flag only on proven `Some(false)`: an undeclared LHS or an
+        // unresolvable RHS (`None`) must stay silent.
+        let src = "class C {
+            void m() {
+                mystery = 10;
+                int x;
+                x = unknownCall();
+            }
+        }\n";
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn null_reassignment_follows_reference_rules() {
+        let valid = "class Box {} class C { void m() { Box b = new Box(); b = null; } }\n";
+        assert!(hygiene_messages(valid, false).is_empty());
+
+        let invalid = "class C { void m() { int i; i = null; } }\n";
+        assert_eq!(
+            hygiene_messages(invalid, false),
+            ["incompatible types: null cannot be converted to int"]
+        );
+    }
+
+    #[test]
+    fn recovery_silences_reassignment_check() {
+        let src = "class C { void m() { boolean flag; flag = 1 } }\n";
+        assert!(
+            has_recovery(src, true),
+            "fixture must exercise MISSING recovery"
+        );
+        assert!(hygiene_messages(src, false).is_empty());
+    }
+
+    #[test]
+    fn field_reassignment_through_this_is_checked() {
+        let src = "class C { int f; void m() { this.f = true; } }\n";
+        let diagnostics = hygiene(src, false);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "incompatible types: boolean cannot be converted to int"
+        );
+        // `this.f` links to the field declarator, never a same-named local.
+        let related = diagnostics[0]
+            .related_information
+            .as_ref()
+            .expect("related information present");
+        assert_eq!(related[0].message, "'f' declared as 'int' here");
+        let f_at = src.find("f;").expect("field declarator present");
+        let index = LineIndex::new(src, PositionEncoding::Utf16);
+        assert_eq!(
+            related[0].location.range,
+            Range {
+                start: index.position(f_at),
+                end: index.position(f_at + 1),
+            }
+        );
     }
 
     #[test]

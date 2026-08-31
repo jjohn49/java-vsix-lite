@@ -187,19 +187,32 @@ impl ClasspathError {
 
 /// Assemble the debuggee classpath per the decided policy:
 /// 1. explicit `classPaths` → used exactly;
-/// 2. else existing Maven/Gradle build-output dirs + dependency jars;
+/// 2. else existing Maven/Gradle build-output dirs + dependency jars —
+///    plus each module's *test* build-output dirs when
+///    `include_test_outputs` is set (a test run whose test outputs don't
+///    exist yet falls through to 3, which compiles `src/test/java` too);
 /// 3. else auto-compile the project's sources with `javac -g` into a
 ///    scratch dir.
+///
+/// `additional_class_paths` (the self-contained JUnit console launcher jar
+/// for test runs) is inserted verbatim *ahead of* every mode's entries: its
+/// classes must win resolution conflicts, or a project depending on a
+/// different JUnit version would mix that version's jars with the
+/// launcher's aligned classes and die with `NoSuchMethodError` before any
+/// test runs. It never overlaps project class dirs, only dependency jars.
 ///
 /// Blocking (filesystem walks, dependency resolution, possibly a `javac`
 /// child up to [`COMPILE_TIMEOUT`]) — call via `spawn_blocking`.
 pub fn assemble_classpath(
     project_root: Option<&Path>,
     explicit_class_paths: &[String],
+    include_test_outputs: bool,
+    additional_class_paths: &[String],
     jdk_home_override: Option<&Path>,
 ) -> Result<ClasspathPlan, ClasspathError> {
+    let mut classpath: Vec<PathBuf> = additional_class_paths.iter().map(PathBuf::from).collect();
     if !explicit_class_paths.is_empty() {
-        let classpath: Vec<PathBuf> = explicit_class_paths.iter().map(PathBuf::from).collect();
+        classpath.extend(explicit_class_paths.iter().map(PathBuf::from));
         let source_roots = project_root.map(discover_source_roots).unwrap_or_default();
         return Ok(ClasspathPlan {
             classpath,
@@ -228,8 +241,22 @@ pub fn assemble_classpath(
         .into_iter()
         .filter(|dir| dir.is_dir())
         .collect();
-    if !existing_outputs.is_empty() {
-        let mut classpath = existing_outputs;
+    let existing_test_outputs: Vec<PathBuf> = if include_test_outputs {
+        jvl_classpath::module_test_output_dirs(root)
+            .into_iter()
+            .filter(|dir| dir.is_dir())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // A test run without any built test classes must NOT use the derived
+    // outputs (the tests wouldn't be on the classpath) — fall through to
+    // the auto-compile fallback, which compiles `src/test/java` too.
+    let derived_usable = !existing_outputs.is_empty()
+        && (!include_test_outputs || !existing_test_outputs.is_empty());
+    if derived_usable {
+        classpath.extend(existing_outputs);
+        classpath.extend(existing_test_outputs);
         classpath.extend(cp.entries().iter().cloned());
         return Ok(ClasspathPlan {
             classpath,
@@ -258,7 +285,7 @@ pub fn assemble_classpath(
     })?;
     match run_javac(&javac, &sources, cp.entries(), &scratch) {
         Ok(()) => {
-            let mut classpath = vec![scratch.clone()];
+            classpath.push(scratch.clone());
             classpath.extend(cp.entries().iter().cloned());
             Ok(ClasspathPlan {
                 classpath,
@@ -430,9 +457,96 @@ mod tests {
 
     #[test]
     fn explicit_class_paths_win_without_derivation() {
-        let plan = assemble_classpath(None, &["/tmp/classes".to_string()], None).unwrap();
+        let plan =
+            assemble_classpath(None, &["/tmp/classes".to_string()], false, &[], None).unwrap();
         assert_eq!(plan.classpath, vec![PathBuf::from("/tmp/classes")]);
         assert!(plan.scratch_dir.is_none());
+    }
+
+    #[test]
+    fn additional_class_paths_precede_explicit_entries() {
+        let plan = assemble_classpath(
+            None,
+            &["/tmp/classes".to_string()],
+            false,
+            &["/tmp/launcher.jar".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.classpath,
+            vec![
+                PathBuf::from("/tmp/launcher.jar"),
+                PathBuf::from("/tmp/classes")
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_mode_adds_test_outputs_with_additional_entries_first() {
+        let root = temp_root("test-outputs");
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        std::fs::create_dir_all(root.join("target/classes")).unwrap();
+        std::fs::create_dir_all(root.join("target/test-classes")).unwrap();
+
+        let plan = assemble_classpath(
+            Some(&root),
+            &[],
+            true,
+            &["/tmp/launcher.jar".to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(plan.scratch_dir.is_none());
+        assert!(
+            plan.classpath.contains(&root.join("target/classes")),
+            "{:?}",
+            plan.classpath
+        );
+        assert!(
+            plan.classpath.contains(&root.join("target/test-classes")),
+            "{:?}",
+            plan.classpath
+        );
+        // Additional entries come FIRST: the self-contained launcher jar
+        // must shadow any project-resolved JUnit jars, or mixed JUnit
+        // versions fail with NoSuchMethodError before any test runs.
+        assert_eq!(
+            plan.classpath.first(),
+            Some(&PathBuf::from("/tmp/launcher.jar"))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn derived_mode_without_test_outputs_is_ignored_for_plain_runs() {
+        let root = temp_root("no-test-outputs-plain");
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        std::fs::create_dir_all(root.join("target/classes")).unwrap();
+
+        // Without includeTestOutputs, missing test dirs don't matter.
+        let plan = assemble_classpath(Some(&root), &[], false, &[], None).unwrap();
+        assert!(plan.scratch_dir.is_none());
+        assert!(
+            plan.classpath.contains(&root.join("target/classes")),
+            "{:?}",
+            plan.classpath
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_test_outputs_force_the_auto_compile_fallback() {
+        let root = temp_root("no-test-outputs");
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        std::fs::create_dir_all(root.join("target/classes")).unwrap();
+
+        // includeTestOutputs with no built test classes must NOT return the
+        // derived-outputs plan; with no sources (and possibly no JDK) the
+        // fallback errors — proving the derived path was rejected.
+        let result = assemble_classpath(Some(&root), &[], true, &[], None);
+        assert!(result.is_err(), "derived outputs must be rejected");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

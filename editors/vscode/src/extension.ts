@@ -22,6 +22,8 @@ import {
 } from "vscode-languageclient/node";
 
 import * as mavenFetch from "./mavenFetch";
+import { activateStyledHover, relocateRelatedInformation } from "./styledHover";
+import { activateTesting, TestingApi } from "./testing";
 
 // M5.4: the one-shot javac check command. The result shape mirrors the
 // server's `checkProject` executeCommand response (see `crates/server/src/
@@ -102,6 +104,94 @@ function coordLabel(coord: ServerCoordinate): string {
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
 
+// ---------------------------------------------------------------------------
+// Status bar: one renderer owns every mutation. State is composed from the
+// server's lifecycle, an optional transient activity (spinner text), and
+// live Java diagnostic counts; nothing else writes `statusBar.*` directly.
+// ---------------------------------------------------------------------------
+
+type ServerStateKind = "starting" | "running" | "stopped" | "missing-binary";
+
+const SERVER_STATE_LABEL: Record<ServerStateKind, string> = {
+  starting: "starting…",
+  running: "default tier active",
+  stopped: "stopped",
+  "missing-binary": "jvl-server binary not found",
+};
+
+let serverState: ServerStateKind = "starting";
+/** Transient activity shown with a spinner (e.g. "checking project (javac)…"). */
+let statusActivity: string | undefined;
+
+function setServerState(state: ServerStateKind): void {
+  serverState = state;
+  renderStatusBar();
+}
+
+function setStatusActivity(activity: string | undefined): void {
+  statusActivity = activity;
+  renderStatusBar();
+}
+
+/** Error/warning counts over every Java file's diagnostics from this
+ * extension's sources (`java-vsix-lite` native tier or `javac`). */
+function javaDiagnosticCounts(): { errors: number; warnings: number } {
+  let errors = 0;
+  let warnings = 0;
+  for (const [uri, diagnostics] of vscode.languages.getDiagnostics()) {
+    if (!uri.path.endsWith(".java")) {
+      continue;
+    }
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.source !== "java-vsix-lite" && diagnostic.source !== "javac") {
+        continue;
+      }
+      if (diagnostic.severity === vscode.DiagnosticSeverity.Error) {
+        errors += 1;
+      } else if (diagnostic.severity === vscode.DiagnosticSeverity.Warning) {
+        warnings += 1;
+      }
+    }
+  }
+  return { errors, warnings };
+}
+
+function renderStatusBar(): void {
+  if (!statusBar) {
+    return;
+  }
+  const { errors, warnings } = javaDiagnosticCounts();
+  const icon = statusActivity
+    ? "$(loading~spin)"
+    : {
+        starting: "$(loading~spin)",
+        running: "$(check)",
+        stopped: "$(warning)",
+        "missing-binary": "$(error)",
+      }[serverState];
+  const counts =
+    errors > 0 || warnings > 0 ? ` $(error) ${errors} $(warning) ${warnings}` : "";
+  statusBar.text = `${icon} Java Lite${counts}`;
+  statusBar.backgroundColor =
+    errors > 0
+      ? new vscode.ThemeColor("statusBarItem.errorBackground")
+      : warnings > 0
+        ? new vscode.ThemeColor("statusBarItem.warningBackground")
+        : undefined;
+
+  const jdkHome =
+    vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home") ||
+    process.env.JAVA_HOME ||
+    "auto-discovered";
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.appendMarkdown(
+    `**java-vsix-lite**: ${statusActivity ?? SERVER_STATE_LABEL[serverState]}\n\n`,
+  );
+  tooltip.appendMarkdown(`$(error) ${errors} errors · $(warning) ${warnings} warnings (Java)\n\n`);
+  tooltip.appendMarkdown(`JDK: ${jdkHome}`);
+  statusBar.tooltip = tooltip;
+}
+
 // Read-only virtual documents for external (JDK/dependency) goto-definition
 // targets: the server resolves these to `jvl-src:/<fqn>.java` `Location`s;
 // this provider fetches their content on demand via the `jvl/externalSource`
@@ -119,12 +209,20 @@ class ExternalSourceProvider implements vscode.TextDocumentContentProvider {
   }
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+/** The extension's exported API (what `extension.activate()` resolves to) —
+ * consumed by the Electron test suites to drive the Test Explorer. */
+export interface ExtensionApi {
+  testing: TestingApi;
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<ExtensionApi> {
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
-  statusBar.text = "$(loading~spin) Java Lite";
-  statusBar.tooltip = "java-vsix-lite language server";
+  renderStatusBar();
   statusBar.show();
   context.subscriptions.push(statusBar);
+  // Live error/warning counts and background color track the editor's
+  // diagnostics collection.
+  context.subscriptions.push(vscode.languages.onDidChangeDiagnostics(() => renderStatusBar()));
 
   context.subscriptions.push(
     vscode.commands.registerCommand("java-vsix-lite.restartServer", async () => {
@@ -245,7 +343,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   );
 
+  // JUnit test support: Test Explorer discovery via the server's `jvl/tests`
+  // request, trust-gated run/debug through the DAP adapter (see testing.ts).
+  const testing = activateTesting(context, () => client);
+
+  // Styled diagnostic hovers: severity-colored re-rendering of this
+  // extension's diagnostics with code-styled type names and clickable
+  // declaration links (see styledHover.ts).
+  activateStyledHover(context);
+
   await start(context);
+  return { testing };
 }
 
 export async function deactivate(): Promise<void> {
@@ -389,8 +497,7 @@ async function checkVersionHandshake(
 async function start(context: vscode.ExtensionContext): Promise<void> {
   const serverPath = resolveServerPath(context);
   if (!serverPath) {
-    statusBar.text = "$(error) Java Lite";
-    statusBar.tooltip = "jvl-server binary not found";
+    setServerState("missing-binary");
     void vscode.window.showErrorMessage(
       "java-vsix-lite: could not locate the `jvl-server` binary. Set `java-vsix-lite.server.path` or the JVL_SERVER_PATH environment variable.",
     );
@@ -440,6 +547,10 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
       // diagnostics handling and silently kills every squiggle, Problems
       // entry, and error file-name decoration (field-reported).
       handleDiagnostics: (uri, diagnostics, next) => {
+        // Move relatedInformation out of the published diagnostics and into
+        // the styled hover, so the editor's plain hover block shows only
+        // the single message line VS Code always renders (styledHover.ts).
+        relocateRelatedInformation(uri, diagnostics);
         next(uri, diagnostics);
         if (!proactiveTriggerFired) {
           proactiveTriggerFired = true;
@@ -512,10 +623,7 @@ async function rebuildClasspath(): Promise<void> {
     return;
   }
 
-  const previousText = statusBar.text;
-  const previousTooltip = statusBar.tooltip;
-  statusBar.text = "$(loading~spin) Java Lite";
-  statusBar.tooltip = "java-vsix-lite: rebuilding classpath…";
+  setStatusActivity("rebuilding classpath…");
   try {
     await client.sendRequest(ExecuteCommandRequest.type, {
       command: SERVER_REBUILD_CLASSPATH_COMMAND,
@@ -532,8 +640,7 @@ async function rebuildClasspath(): Promise<void> {
       `java-vsix-lite: could not rebuild the classpath: ${String(err)}`,
     );
   } finally {
-    statusBar.text = previousText;
-    statusBar.tooltip = previousTooltip;
+    setStatusActivity(undefined);
   }
 }
 
@@ -556,10 +663,7 @@ async function checkProject(): Promise<void> {
     return;
   }
 
-  const previousText = statusBar.text;
-  const previousTooltip = statusBar.tooltip;
-  statusBar.text = "$(loading~spin) Java Lite";
-  statusBar.tooltip = "java-vsix-lite: checking project (javac)…";
+  setStatusActivity("checking project (javac)…");
   try {
     const result = await client.sendRequest(ExecuteCommandRequest.type, {
       command: SERVER_CHECK_PROJECT_COMMAND,
@@ -570,8 +674,7 @@ async function checkProject(): Promise<void> {
   } catch (err) {
     void vscode.window.showErrorMessage(`java-vsix-lite: Check Project failed: ${String(err)}`);
   } finally {
-    statusBar.text = previousText;
-    statusBar.tooltip = previousTooltip;
+    setStatusActivity(undefined);
   }
 }
 
@@ -1425,16 +1528,13 @@ function reportDownloadSummary(
 function updateStatus(state: State): void {
   switch (state) {
     case State.Starting:
-      statusBar.text = "$(loading~spin) Java Lite";
-      statusBar.tooltip = "java-vsix-lite: starting…";
+      setServerState("starting");
       break;
     case State.Running:
-      statusBar.text = "$(check) Java Lite";
-      statusBar.tooltip = "java-vsix-lite: default tier active";
+      setServerState("running");
       break;
     case State.Stopped:
-      statusBar.text = "$(warning) Java Lite";
-      statusBar.tooltip = "java-vsix-lite: stopped";
+      setServerState("stopped");
       break;
   }
 }

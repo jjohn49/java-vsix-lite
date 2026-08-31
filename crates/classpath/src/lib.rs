@@ -435,6 +435,43 @@ const OUTPUT_DIR_WALK_MAX_DIRS: usize = 4096;
 /// [`OUTPUT_DIR_WALK_MAX_DIRS`]. No build execution, no file reads beyond
 /// directory listing.
 pub fn module_output_dirs(root: &Path) -> Vec<PathBuf> {
+    walk_module_dirs(root, |module, out| {
+        if module.join("pom.xml").is_file() {
+            out.push(module.join("target/classes"));
+        }
+        if module.join("build.gradle").is_file() || module.join("build.gradle.kts").is_file() {
+            out.push(module.join("build/classes/java/main"));
+            out.push(module.join("build/resources/main"));
+        }
+    })
+}
+
+/// Test-scope counterpart of [`module_output_dirs`]: the conventional
+/// *test* build-output candidates (`<module>/target/test-classes`,
+/// `<module>/build/classes/java/test`, `<module>/build/resources/test`),
+/// returned without existence filtering under the same bounded walk. Used by
+/// the debugger's test-aware launch to put compiled test classes on the
+/// classpath.
+pub fn module_test_output_dirs(root: &Path) -> Vec<PathBuf> {
+    walk_module_dirs(root, |module, out| {
+        if module.join("pom.xml").is_file() {
+            out.push(module.join("target/test-classes"));
+        }
+        if module.join("build.gradle").is_file() || module.join("build.gradle.kts").is_file() {
+            out.push(module.join("build/classes/java/test"));
+            out.push(module.join("build/resources/test"));
+        }
+    })
+}
+
+/// The shared module-discovery walk behind [`module_output_dirs`] and
+/// [`module_test_output_dirs`]: visit every non-hidden, non-build directory
+/// under `root` (bounded, symlink-free) and let `push_candidates` emit that
+/// module's candidate paths.
+fn walk_module_dirs(
+    root: &Path,
+    mut push_candidates: impl FnMut(&Path, &mut Vec<PathBuf>),
+) -> Vec<PathBuf> {
     const SKIPPED: [&str; 3] = ["target", "build", "node_modules"];
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
@@ -444,13 +481,7 @@ pub fn module_output_dirs(root: &Path) -> Vec<PathBuf> {
             break;
         }
         visited += 1;
-        if dir.join("pom.xml").is_file() {
-            out.push(dir.join("target/classes"));
-        }
-        if dir.join("build.gradle").is_file() || dir.join("build.gradle.kts").is_file() {
-            out.push(dir.join("build/classes/java/main"));
-            out.push(dir.join("build/resources/main"));
-        }
+        push_candidates(&dir, &mut out);
         if depth >= OUTPUT_DIR_WALK_MAX_DEPTH {
             continue;
         }
@@ -856,6 +887,49 @@ mod tests {
         );
         assert!(
             dirs.contains(&base.join("gradle-mod/build/resources/main")),
+            "{dirs:?}"
+        );
+        // Candidates are returned without existence filtering (none exist).
+        assert!(dirs.iter().all(|d| !d.exists()), "{dirs:?}");
+        // Hidden and build-output dirs are never walked.
+        assert_eq!(dirs.len(), 4, "{dirs:?}");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn module_test_output_dirs_finds_maven_gradle_and_nested_modules() {
+        let base = std::env::temp_dir().join(format!(
+            "jvl-test-output-dirs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Same walk as `module_output_dirs`, test-scope candidates.
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("gradle-mod")).unwrap();
+        std::fs::create_dir_all(base.join(".hidden/inner")).unwrap();
+        std::fs::create_dir_all(base.join("target/nested")).unwrap();
+        std::fs::write(base.join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("sub/pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("gradle-mod/build.gradle"), "").unwrap();
+        std::fs::write(base.join(".hidden/inner/pom.xml"), "<project/>").unwrap();
+        std::fs::write(base.join("target/nested/pom.xml"), "<project/>").unwrap();
+
+        let dirs = module_test_output_dirs(&base);
+        assert!(dirs.contains(&base.join("target/test-classes")), "{dirs:?}");
+        assert!(
+            dirs.contains(&base.join("sub/target/test-classes")),
+            "{dirs:?}"
+        );
+        assert!(
+            dirs.contains(&base.join("gradle-mod/build/classes/java/test")),
+            "{dirs:?}"
+        );
+        assert!(
+            dirs.contains(&base.join("gradle-mod/build/resources/test")),
             "{dirs:?}"
         );
         // Candidates are returned without existence filtering (none exist).

@@ -83,10 +83,11 @@ fn uri_is_under_module(uri_str: &str, module_roots: &[PathBuf]) -> bool {
 /// and initializer checks and the unreachable-statement check. `jvl.unused`
 /// is deliberately absent — javac has no equivalent diagnostic, so an unused
 /// warning is never deduplicated.
-const JAVAC_CONFIRMABLE_CODES: [&str; 3] = [
+const JAVAC_CONFIRMABLE_CODES: [&str; 4] = [
     jvl_syntax::INCOMPATIBLE_RETURN_CODE,
     jvl_syntax::INCOMPATIBLE_ASSIGNMENT_CODE,
     jvl_syntax::UNREACHABLE_CODE,
+    jvl_syntax::CANNOT_FIND_SYMBOL_CODE,
 ];
 
 /// Whether two first message lines carry the same payload. javac folds
@@ -97,6 +98,12 @@ const JAVAC_CONFIRMABLE_CODES: [&str; 3] = [
 fn equivalent_payload(native: &str, javac: &str) -> bool {
     let native = native.lines().next().unwrap_or("");
     let javac = javac.lines().next().unwrap_or("");
+    // javac's message is exactly `cannot find symbol` (the `symbol: variable
+    // x` detail lives on folded continuation lines); the native message
+    // carries the name inline — prefix equivalence is the comparable part.
+    if native.starts_with("cannot find symbol") && javac.starts_with("cannot find symbol") {
+        return true;
+    }
     match (
         native.strip_prefix("incompatible types: "),
         javac.strip_prefix("incompatible types: "),
@@ -206,17 +213,23 @@ impl Backend {
                 // project/classpath resolution is incomplete, so a closed-file
                 // project type is a missed diagnosis, never a false positive.
                 let symbols = ClasspathSymbols(self.classpath());
-                d.extend(jvl_syntax::semantic_diagnostics(
-                    &open,
-                    0,
-                    &index,
-                    &symbols,
-                    self.unresolved_member_diagnostics
-                        .get()
-                        .copied()
-                        .unwrap_or(true),
-                    self.unused_diagnostics.get().copied().unwrap_or(true),
-                ));
+                // The stored key already round-tripped through the client's
+                // URI, so this parse cannot realistically fail; a failure
+                // would only skip the semantic pass, never panic.
+                if let Ok(parsed_uri) = uri.parse::<Uri>() {
+                    d.extend(jvl_syntax::semantic_diagnostics(
+                        &open,
+                        0,
+                        &index,
+                        &parsed_uri,
+                        &symbols,
+                        self.unresolved_member_diagnostics
+                            .get()
+                            .copied()
+                            .unwrap_or(true),
+                        self.unused_diagnostics.get().copied().unwrap_or(true),
+                    ));
+                }
                 let filename = filename_from_uri(uri);
                 let expected_package = self.expected_package(uri);
                 d.extend(jvl_syntax::structural_diagnostics(
