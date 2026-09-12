@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9 — 2026-09-11
 
 ### Changed
 - **Hover on a method call shows the call-site signature.** Generic members

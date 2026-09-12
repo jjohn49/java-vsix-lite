@@ -238,7 +238,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jvl-classpath"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cafebabe",
  "jvl-types",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "jvl-debug"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "jvl-classpath",
  "serde",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "jvl-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "jvl-classpath",
  "jvl-debug",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "jvl-syntax"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "jvl-types",
  "ls-types",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "jvl-types"
-version = "0.1.8"
+version = "0.1.9"
 
 [[package]]
 name = "lazy_static"
