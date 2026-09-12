@@ -24,6 +24,10 @@ This harness is **never run in CI**. It is a manual tool for capturing a
 baseline snapshot when comparing the two extensions' behavior; run it by hand
 whenever you want a fresh comparison.
 
+Recorded snapshots live in [`results/`](./results/), one directory per date
+and platform. The latest is summarized, with its timeline, in the
+[root README](../../README.md#inside-vs-code).
+
 ## Usage
 
 ```sh
@@ -344,5 +348,8 @@ few illegible pixels at the edges of an otherwise-empty chart.
    `https://nodejs.org/dist/v<version>/SHASUMS256.txt` (grep both
    `linux-x64` and `linux-arm64` lines) — the image needs whichever one
    matches the machine it's built on.
-5. Re-run `tools/vscode-compare/run.sh` and, if you want a recorded baseline,
-   commit the new `out/comparison.md` (and `out/timeline.svg` if useful).
+5. Re-run `tools/vscode-compare/run.sh --runs 9`. To record the result,
+   copy `out/aggregate.md` plus a representative run's `comparison.md` and
+   `timeline.svg` into `results/<date>-<platform>/` (`out/` itself is
+   gitignored), and update the figures under *Inside VS Code* in the root
+   README.
