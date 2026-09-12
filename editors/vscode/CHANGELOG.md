@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Lambda arguments no longer make overloads look ambiguous.** Overload
+  resolution compared only a lambda's arity and declared parameter types, so
+  `() -> { work(); }` appeared to match every zero-argument functional
+  interface at once and `executorService.submit(() -> { ... })` was reported
+  as `ambiguous method call 'submit'` on code javac compiles. A lambda body
+  is now checked against the target's result type (JLS 15.27.2): a block that
+  returns no value fits `Runnable` but not `Callable<T>`, a block that
+  returns one fits `Callable<T>` but not `Runnable`, and `() -> work()` on a
+  `void work()` is void-compatible only. Where a body genuinely fits both —
+  one that always throws — the value-returning overload is preferred, as JLS
+  15.12.2.5 requires. Calls that are actually ambiguous, such as two
+  overloads taking distinct `void`-returning interfaces, are still reported.
+
 ## 0.1.9 — 2026-09-11
 
 ### Changed

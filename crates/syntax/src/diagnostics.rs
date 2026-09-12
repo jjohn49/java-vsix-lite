@@ -3026,6 +3026,61 @@ mod tests {
         assert!(has_code(wrong, &NoSymbols, INVALID_INVOCATION_CODE));
     }
 
+    /// `ExecutorService.submit(() -> { work(); })` in spring-petclinic was
+    /// reported ambiguous while javac compiled it. A block body returning no
+    /// value is void-compatible only (JLS 15.27.2), so the `Callable`-shaped
+    /// overload is not applicable and there is nothing to be ambiguous with.
+    #[test]
+    fn void_block_lambda_selects_the_void_overload() {
+        let src = "interface Task<T> { T call(); } interface Job { void run(); } \
+                   class C { void work() {} <T> void submit(Task<T> t) {} void submit(Job j) {} \
+                   void m() { submit(() -> { work(); }); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// A value-returning block is value-compatible only, so the mirror case
+    /// must exclude the `Runnable`-shaped overload instead.
+    #[test]
+    fn value_block_lambda_selects_the_value_overload() {
+        let src = "interface Task<T> { T call(); } interface Job { void run(); } \
+                   class C { <T> void submit(Task<T> t) {} void submit(Job j) {} \
+                   void m() { submit(() -> { return 1; }); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// An expression body is only value-compatible if it actually produces a
+    /// value: `() -> work()` on a `void work()` fits `Runnable` alone. Typing
+    /// the expression is what separates this from the case above.
+    #[test]
+    fn void_expression_lambda_selects_the_void_overload() {
+        let src = "interface Task<T> { T call(); } interface Job { void run(); } \
+                   class C { void work() {} <T> void submit(Task<T> t) {} void submit(Job j) {} \
+                   void m() { submit(() -> work()); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// A body that always throws is congruent with *both* descriptors, so
+    /// applicability cannot decide. javac resolves it by the most-specific
+    /// rule — a value result beats `void` — rather than calling it ambiguous.
+    #[test]
+    fn always_throwing_lambda_prefers_the_value_returning_overload() {
+        let src = "interface Task<T> { T call(); } interface Job { void run(); } \
+                   class Boom extends RuntimeException {} \
+                   class C { <T> void submit(Task<T> t) {} void submit(Job j) {} \
+                   void m() { submit(() -> { throw new Boom(); }); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// The narrowing must stay narrow: two overloads whose descriptors are
+    /// both `void` cannot be separated by the lambda rule, and javac reports
+    /// `reference to k is ambiguous` here.
+    #[test]
+    fn lambda_between_two_void_overloads_stays_ambiguous() {
+        let src = "interface G1 { void g(); } interface G2 { void g(); } \
+                   class C { void k(G1 g) {} void k(G2 g) {} void m() { k(() -> {}); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
     #[test]
     fn constructor_method_reference_is_applicable_to_function_target() {
         let src = "interface Factory<T, R> { R make(T value); } \

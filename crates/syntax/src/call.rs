@@ -130,7 +130,7 @@ fn select_candidate<'c, 't>(
         if unknown {
             return Selection::Unknown;
         }
-        return match most_specific(&applicable, ctx) {
+        return match most_specific(&applicable, args, ctx) {
             Some(candidate) => Selection::Selected(candidate, phase),
             None => Selection::Ambiguous,
         };
@@ -263,11 +263,66 @@ fn all_proved(results: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     }
 }
 
+/// When the subtyping pass cannot separate two candidates, JLS 15.12.2.5's
+/// functional-interface clause can: for a lambda argument that is
+/// value-compatible, a descriptor returning a value is more specific than
+/// one returning `void`. This is what makes `ExecutorService.submit(() -> {
+/// throw ...; })` pick `Callable` rather than being ambiguous - that body is
+/// congruent with both `Callable` and `Runnable`, so applicability alone
+/// leaves a tie that only this rule breaks.
+fn narrow_by_lambda_result<'c, 't>(
+    applicable: &[&'c Candidate],
+    args: &[Argument<'t>],
+    ctx: &Ctx<'_, 't>,
+) -> Vec<&'c Candidate> {
+    let mut kept: Vec<&'c Candidate> = applicable.to_vec();
+    for (index, arg) in args.iter().enumerate() {
+        let Argument::Lambda(lambda) = arg else {
+            continue;
+        };
+        // Only a value-compatible lambda triggers the rule; a void-only body
+        // has already eliminated the value-returning candidates.
+        if !matches!(
+            lambda_body_shape(*lambda, ctx),
+            BodyShape::Either | BodyShape::ValueOnly
+        ) {
+            continue;
+        }
+        let result_is_void = |candidate: &Candidate| -> Option<bool> {
+            let parameters = candidate.meta.parameters.clone()?;
+            let parameter = parameters.get(index)?.substitute(&candidate.env);
+            Some(matches!(
+                functional_descriptor(&parameter, ctx)?.result,
+                TypeRef::Void
+            ))
+        };
+        // Unknown descriptors abstain rather than being discarded: dropping
+        // one would silently narrow to a candidate that never won.
+        let value_returning: Vec<&'c Candidate> = kept
+            .iter()
+            .copied()
+            .filter(|c| result_is_void(c) == Some(false))
+            .collect();
+        let void_returning = kept
+            .iter()
+            .filter(|c| result_is_void(c) == Some(true))
+            .count();
+        if !value_returning.is_empty() && value_returning.len() + void_returning == kept.len() {
+            kept = value_returning;
+        }
+    }
+    kept
+}
+
 /// `m1` is more specific than `m2` when each of `m1`'s parameters is a
 /// subtype of the corresponding parameter of `m2` (JLS 15.12.2.5, fixed
 /// arity only). Exactly one candidate dominating every other wins; zero
 /// or more than one is ambiguous.
-fn most_specific<'c>(applicable: &[&'c Candidate], ctx: &Ctx<'_, '_>) -> Option<&'c Candidate> {
+fn most_specific<'c, 't>(
+    applicable: &[&'c Candidate],
+    args: &[Argument<'t>],
+    ctx: &Ctx<'_, 't>,
+) -> Option<&'c Candidate> {
     if applicable.len() == 1 {
         return Some(applicable[0]);
     }
@@ -280,27 +335,45 @@ fn most_specific<'c>(applicable: &[&'c Candidate], ctx: &Ctx<'_, '_>) -> Option<
             .map(|p| p.substitute(&c.env))
             .collect()
     };
-    let mut best: Option<&Candidate> = None;
-    'outer: for m1 in applicable {
-        for m2 in applicable {
-            if std::ptr::eq(*m1, *m2) {
-                continue;
+    let subtyping_winner = |set: &[&'c Candidate]| -> Option<&'c Candidate> {
+        let mut best: Option<&'c Candidate> = None;
+        'outer: for m1 in set {
+            for m2 in set {
+                if std::ptr::eq(*m1, *m2) {
+                    continue;
+                }
+                let (p1, p2) = (params(m1), params(m2));
+                if p1.len() != p2.len() {
+                    return None;
+                }
+                let dominated =
+                    all_proved(p1.iter().zip(&p2).map(|(a, b)| assignable_refs(a, b, ctx)));
+                if dominated != Some(true) {
+                    continue 'outer;
+                }
             }
-            let (p1, p2) = (params(m1), params(m2));
-            if p1.len() != p2.len() {
+            if best.is_some() {
                 return None;
             }
-            let dominated = all_proved(p1.iter().zip(&p2).map(|(a, b)| assignable_refs(a, b, ctx)));
-            if dominated != Some(true) {
-                continue 'outer;
-            }
+            best = Some(m1);
         }
-        if best.is_some() {
-            return None;
-        }
-        best = Some(m1);
+        best
+    };
+    if let Some(best) = subtyping_winner(applicable) {
+        return Some(best);
     }
-    best
+    // Unrelated functional interfaces (`Callable` vs `Runnable`) are not
+    // subtypes of each other, so subtyping can never separate them. Apply
+    // the lambda clause and, if it narrowed anything, decide on that set.
+    let narrowed = narrow_by_lambda_result(applicable, args, ctx);
+    if narrowed.len() < applicable.len() {
+        return if narrowed.len() == 1 {
+            Some(narrowed[0])
+        } else {
+            subtyping_winner(&narrowed)
+        };
+    }
+    None
 }
 
 /// Method candidates named `name` over `recv`'s hierarchy, own type first
@@ -555,10 +628,148 @@ fn lambda_parameters(lambda: Node) -> Vec<Node> {
     }
 }
 
+/// JLS §15.27.2 body compatibility. A lambda is congruent with a function
+/// type only if its body agrees with that descriptor's *result*, not just
+/// its parameters: `() -> { work(); }` is void-compatible only, so it fits
+/// `Runnable` and not `Callable<T>`. Without this distinction every
+/// `ExecutorService.submit(() -> { ... })` looks like it matches both
+/// overloads and gets reported ambiguous, which javac does not do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyShape {
+    /// No `return` yields a value and the body can complete normally.
+    VoidOnly,
+    /// Some `return` yields a value.
+    ValueOnly,
+    /// Both: a statement-expression body, or a block that always throws.
+    Either,
+    /// Not modeled. Imposes no constraint, so an unrecognised shape can only
+    /// fail to narrow an overload set - never wrongly reject a candidate.
+    Unknown,
+}
+
+/// `return`s belonging to *this* lambda. A `return` inside a nested lambda
+/// or an anonymous/local class body belongs to that body instead, so those
+/// subtrees are not descended into.
+fn collect_lambda_returns(block: Node, has_value: &mut bool, has_bare: &mut bool) {
+    let mut stack = vec![block];
+    while let Some(node) = stack.pop() {
+        for child in named_children(node) {
+            match child.kind() {
+                "lambda_expression" | "class_body" => continue,
+                "return_statement" => {
+                    if named_children(child)
+                        .iter()
+                        .any(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+                    {
+                        *has_value = true;
+                    } else {
+                        *has_bare = true;
+                    }
+                }
+                _ => stack.push(child),
+            }
+        }
+    }
+}
+
+/// `while (true)` / `for (;;)`. Such a loop cannot complete normally unless
+/// it breaks, and this deliberately ignores `break`: claiming a loop does
+/// not complete yields [`BodyShape::Either`], which constrains nothing.
+fn is_unconditional_loop(statement: Node, source: &str) -> bool {
+    match statement.child_by_field_name("condition") {
+        None => statement.kind() == "for_statement",
+        Some(condition) => {
+            let text = node_text(condition, source);
+            text.trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                == "true"
+        }
+    }
+}
+
+/// Deliberately narrower than [`crate::diagnostics`]'s unreachable-code
+/// analysis, and biased the opposite way: anything unmodeled is reported as
+/// completing normally, because here a wrong "cannot complete" would make a
+/// value-returning lambda look value-incompatible and reject a real overload.
+fn lambda_block_completes_normally(block: Node, source: &str) -> bool {
+    named_children(block)
+        .into_iter()
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .all(|statement| match statement.kind() {
+            "return_statement" | "throw_statement" => false,
+            "block" => lambda_block_completes_normally(statement, source),
+            "while_statement" | "for_statement" => !is_unconditional_loop(statement, source),
+            _ => true,
+        })
+}
+
+fn lambda_body_shape<'t>(lambda: Node<'t>, ctx: &Ctx<'_, 't>) -> BodyShape {
+    let Some(body) = lambda.child_by_field_name("body") else {
+        return BodyShape::Unknown;
+    };
+    if body.kind() != "block" {
+        return match body.kind() {
+            // A statement expression may be evaluated purely for effect, so
+            // it can satisfy a void descriptor -- but only if it actually
+            // produces a value can it satisfy a non-void one. `() -> work()`
+            // on a `void work()` is void-compatible *only*, which is why the
+            // expression's own type has to be resolved rather than assumed.
+            "method_invocation" => match resolve_expression_type(body, ctx) {
+                Some(resolved) => match resolved.type_ref() {
+                    TypeRef::Void => BodyShape::VoidOnly,
+                    TypeRef::Unknown => BodyShape::Unknown,
+                    _ => BodyShape::Either,
+                },
+                None => BodyShape::Unknown,
+            },
+            // These always produce a value and may also stand alone.
+            "object_creation_expression" | "assignment_expression" | "update_expression" => {
+                BodyShape::Either
+            }
+            // Not a statement expression: it can only produce a value.
+            _ => BodyShape::ValueOnly,
+        };
+    }
+    let mut has_value = false;
+    let mut has_bare = false;
+    collect_lambda_returns(body, &mut has_value, &mut has_bare);
+    match (has_value, has_bare) {
+        // Mixing `return x;` and `return;` does not compile; say nothing.
+        (true, true) => BodyShape::Unknown,
+        (true, false) => BodyShape::ValueOnly,
+        (false, true) => BodyShape::VoidOnly,
+        // No `return` at all is always void-compatible, and additionally
+        // value-compatible when the body cannot complete normally
+        // (`{ throw ...; }`). javac resolves that overlap via the
+        // most-specific rule rather than calling it ambiguous, which
+        // `most_specific` handles.
+        (false, false) => {
+            if lambda_block_completes_normally(body, ctx.doc.source) {
+                BodyShape::VoidOnly
+            } else {
+                BodyShape::Either
+            }
+        }
+    }
+}
+
 fn lambda_compatible<'t>(lambda: Node<'t>, target: &TypeRef, ctx: &Ctx<'_, 't>) -> Option<bool> {
     let descriptor = functional_descriptor(target, ctx)?;
     let parameters = lambda_parameters(lambda);
     if parameters.len() != descriptor.parameters.len() {
+        return Some(false);
+    }
+
+    // Arity and declared parameter types alone cannot separate `Runnable`
+    // from `Callable<T>` -- both take none. The body's shape is what does.
+    let shape_fits = match lambda_body_shape(lambda, ctx) {
+        BodyShape::Unknown | BodyShape::Either => true,
+        BodyShape::VoidOnly => matches!(descriptor.result, TypeRef::Void),
+        BodyShape::ValueOnly => !matches!(descriptor.result, TypeRef::Void),
+    };
+    if !shape_fits {
         return Some(false);
     }
     let declared_checks = parameters
@@ -801,7 +1012,10 @@ fn method_reference_resolution<'t>(
         if unknown {
             return None;
         }
-        let candidate = most_specific(&applicable, ctx)?;
+        // No lambda arguments exist here by construction: a method
+        // reference's arguments are synthesized from the target descriptor,
+        // so JLS 15.12.2.5's lambda clause cannot apply.
+        let candidate = most_specific(&applicable, &[], ctx)?;
         let result = candidate.meta.result.substitute(&candidate.env);
         return resolved_reference(candidate, name, result, false);
     }
