@@ -593,7 +593,7 @@ fn declared_here(
     }]
 }
 
-fn nearest_method<'t>(return_statement: Node<'t>) -> Option<Node<'t>> {
+pub(crate) fn nearest_method<'t>(return_statement: Node<'t>) -> Option<Node<'t>> {
     let mut ancestor = return_statement.parent();
     while let Some(node) = ancestor {
         match node.kind() {
@@ -3123,6 +3123,43 @@ mod tests {
                    class Box<T> { Box(T v) {} T get() { return null; } } \
                    class C { void m() { Box<User> b = new Box<>(new User()); Order o = b.get(); } }\n";
         assert!(has_code(src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    /// A diamond creation is a poly expression: its type arguments come from
+    /// the target, which here also decides *which constructor applies*.
+    /// Inferring `T` from the argument instead yields `Box<Headers>` and a
+    /// bogus return-type error — 63 of them across cbioportal, all from
+    /// `return new ResponseEntity<>(headers, HttpStatus.OK);`.
+    #[test]
+    fn diamond_return_target_selects_the_constructor() {
+        let src = "interface MVMap<K, V> {} class Key {} class Payload {} \
+                   class Headers implements MVMap<Key, Key> {} \
+                   class Box<T> { Box(T body, int code) {} Box(MVMap<Key, Key> headers, int code) {} } \
+                   class C { Box<Payload> m(Headers h) { return new Box<>(h, 1); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// `null` fits both constructors, so applicability cannot decide. While
+    /// `T` is still being inferred the parameter that *is* `T` is the more
+    /// specific one, because a variable can be instantiated to the other
+    /// type and not the reverse.
+    #[test]
+    fn diamond_null_argument_prefers_the_type_variable_constructor() {
+        let src = "interface MVMap<K, V> {} class Key {} class Payload {} \
+                   class Box<T> { Box(T body, int code) {} Box(MVMap<Key, Key> headers, int code) {} } \
+                   class C { Box<Payload> m() { return new Box<>(null, 1); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    /// The same call written with explicit type arguments leaves nothing to
+    /// infer, so the preference above must not apply and the call really is
+    /// ambiguous — javac reports it, and so must this.
+    #[test]
+    fn explicit_type_argument_with_null_stays_ambiguous() {
+        let src = "interface MVMap<K, V> {} class Key {} class Payload {} \
+                   class Box<T> { Box(T body, int code) {} Box(MVMap<Key, Key> headers, int code) {} } \
+                   class C { Box<Payload> m() { return new Box<Payload>(null, 1); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
     }
 
     #[test]

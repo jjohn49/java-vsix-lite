@@ -52,6 +52,13 @@ pub(crate) enum CallResolution {
 struct Candidate {
     meta: MemberMetadata,
     env: Vec<(TypeVariableId, TypeRef)>,
+    /// Class/method type variables still open for inference at this call
+    /// site — non-empty only for a diamond creation, where `<>` leaves the
+    /// class's parameters to be inferred. Empty when the call writes its
+    /// type arguments explicitly, which is what makes
+    /// `new ResponseEntity<String>(null, OK)` ambiguous while
+    /// `new ResponseEntity<>(null, OK)` is not.
+    inferred: Vec<TypeVariableId>,
     /// The member's declared return type as written, kept only so hover can
     /// show `String` where the structured type lowered to `Unknown` (the
     /// class isn't on the classpath). Never used for any type decision.
@@ -373,7 +380,49 @@ fn most_specific<'c, 't>(
             subtyping_winner(&narrowed)
         };
     }
+    // Still tied. While a type argument is being inferred, a candidate whose
+    // parameter *is* that variable is more specific than one with a concrete
+    // type: the variable can be instantiated to that type, not the reverse.
+    // `new ResponseEntity<>(null, OK)` picks `(T, HttpStatusCode)` over
+    // `(MultiValueMap<String,String>, HttpStatusCode)` for exactly this
+    // reason, while the explicit `new ResponseEntity<String>(null, OK)` --
+    // which leaves nothing to infer -- really is ambiguous, and javac says so.
+    let by_variable = narrow_by_inference_variables(applicable);
+    if by_variable.len() < applicable.len() {
+        return if by_variable.len() == 1 {
+            Some(by_variable[0])
+        } else {
+            subtyping_winner(&by_variable)
+        };
+    }
     None
+}
+
+/// Keep only candidates taking an as-yet-uninferred type variable where the
+/// others take a concrete type, position by position. Candidates of
+/// differing arity are left alone: varargs pairings are not modeled here.
+fn narrow_by_inference_variables<'c>(applicable: &[&'c Candidate]) -> Vec<&'c Candidate> {
+    let arity = |c: &Candidate| c.meta.parameters.as_ref().map_or(0, |p| p.len());
+    let first = arity(applicable[0]);
+    if applicable.iter().any(|c| arity(c) != first) {
+        return applicable.to_vec();
+    }
+    let mut kept = applicable.to_vec();
+    for index in 0..first {
+        let takes_variable = |c: &Candidate| {
+            c.meta
+                .parameters
+                .as_ref()
+                .and_then(|p| p.get(index))
+                .is_some_and(|t| matches!(t, TypeRef::Variable(v) if c.inferred.contains(v)))
+        };
+        let generic: Vec<&'c Candidate> =
+            kept.iter().copied().filter(|c| takes_variable(c)).collect();
+        if !generic.is_empty() && generic.len() < kept.len() {
+            kept = generic;
+        }
+    }
+    kept
 }
 
 /// Method candidates named `name` over `recv`'s hierarchy, own type first
@@ -432,6 +481,9 @@ fn method_candidates(
                 out.push(Candidate {
                     meta: meta.clone(),
                     env: env.clone(),
+                    // Method calls resolve against a fixed receiver
+                    // substitution; nothing here is left open.
+                    inferred: Vec::new(),
                     result_display: m.ret_display.clone(),
                     declared_signature: Some(m.signature.clone()),
                 });
@@ -942,6 +994,7 @@ fn method_reference_resolution<'t>(
             .map(|meta| Candidate {
                 meta,
                 env: env.clone(),
+                inferred: Vec::new(),
                 result_display: None,
                 declared_signature: None,
             })
@@ -1633,6 +1686,16 @@ fn expected_argument_type<'t>(
             let diamond = call
                 .child_by_field_name("type")
                 .is_some_and(|node| node_text(node, ctx.doc.source).ends_with("<>"));
+            let inferred: Vec<TypeVariableId> = if diamond {
+                facts
+                    .meta
+                    .type_parameters
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let fixed_env = type_environment(&facts.meta.type_parameters, &args)?;
             let candidates: Vec<Candidate> = facts
                 .members
@@ -1648,6 +1711,7 @@ fn expected_argument_type<'t>(
                     Candidate {
                         meta,
                         env,
+                        inferred: inferred.clone(),
                         result_display: None,
                         declared_signature: None,
                     }
@@ -1713,6 +1777,79 @@ fn infer_env_from_args(
                 .map(|found| (type_parameter.id.clone(), found))
         })
         .collect()
+}
+
+/// The type a diamond creation is required to produce, taken from its
+/// syntactic position.
+///
+/// JLS 15.9.1 makes `new Type<>(...)` a poly expression: its type arguments
+/// come from the target type, and the arguments are only consulted when
+/// there is no target. Inferring from arguments alone types
+/// `return new ResponseEntity<>(headers, HttpStatus.OK);` as
+/// `ResponseEntity<HttpHeaders>` inside a method declared to return
+/// `ResponseEntity<List<Mutation>>` — reporting a return-type error against
+/// code javac accepts, and selecting the wrong constructor on the way.
+fn diamond_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<TypeRef> {
+    let parent = call.parent()?;
+    let is_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|node| node.id() == call.id())
+    };
+    match parent.kind() {
+        // `Box<User> b = new Box<>(...)`
+        "variable_declarator" if is_field("value") => {
+            let declared = parent.parent()?.child_by_field_name("type")?;
+            Some(crate::resolve::resolve_type_node(declared, ctx.doc.source, ctx)?.type_ref())
+        }
+        // `return new Box<>(...);` — the enclosing method's declared return
+        // type. `nearest_method` stops at a `lambda_expression`, so a return
+        // inside a lambda never borrows the outer method's target.
+        "return_statement" => {
+            let method = crate::diagnostics::nearest_method(call)?;
+            let declared = method.child_by_field_name("type")?;
+            Some(crate::resolve::resolve_type_node(declared, ctx.doc.source, ctx)?.type_ref())
+        }
+        // `b = new Box<>(...)`
+        "assignment_expression" if is_field("right") => {
+            let left = parent.child_by_field_name("left")?;
+            Some(resolve_expression_type(left, ctx)?.type_ref())
+        }
+        _ => None,
+    }
+}
+
+/// Bindings for the class's own type parameters read straight off a target
+/// type that names this exact class.
+///
+/// A supertype target (`List<String> xs = new ArrayList<>()`) would need the
+/// supertype's arguments mapped back through the hierarchy to the subclass's
+/// parameters; that is not attempted, and such calls keep the
+/// argument-based inference. An `Unknown` argument disqualifies the whole
+/// target rather than binding a variable to nothing.
+fn diamond_env_from_target(
+    target: &TypeRef,
+    facts: &ClassFacts,
+) -> Option<Vec<(TypeVariableId, TypeRef)>> {
+    let TypeRef::Named { id, args } = target else {
+        return None;
+    };
+    if *id != facts.meta.id
+        || args.is_empty()
+        || args.len() != facts.meta.type_parameters.len()
+        || args.iter().any(|arg| matches!(arg, TypeRef::Unknown))
+    {
+        return None;
+    }
+    Some(
+        facts
+            .meta
+            .type_parameters
+            .iter()
+            .map(|p| p.id.clone())
+            .zip(args.iter().cloned())
+            .collect(),
+    )
 }
 
 /// The type a diamond (`new Type<>(...)`) creation instantiates to, once
@@ -1890,6 +2027,32 @@ pub(crate) fn resolve_constructor_call<'t>(
         .map(|p| p.id.clone())
         .zip(args.iter().cloned())
         .collect();
+    // JLS 15.9.1: a diamond creation is a poly expression, so when its
+    // position fixes the class's type arguments every candidate is judged
+    // under that substitution. That is also what rejects
+    // `ResponseEntity(T body, HttpStatusCode)` for
+    // `new ResponseEntity<>(headers, OK)` in a method returning
+    // `ResponseEntity<List<Mutation>>` — `HttpHeaders` is not a
+    // `List<Mutation>` — leaving the `(MultiValueMap, HttpStatusCode)`
+    // constructor that javac selects.
+    let target_env = diamond
+        .then(|| diamond_target(call, ctx).and_then(|t| diamond_env_from_target(&t, &facts)))
+        .flatten();
+    // A diamond leaves the class's parameters open for inference even when
+    // the target fixes their values; an explicitly written argument list
+    // does not. That difference is what separates
+    // `new ResponseEntity<>(null, OK)` from
+    // `new ResponseEntity<String>(null, OK)`, which javac rejects.
+    let inferred: Vec<TypeVariableId> = if diamond {
+        facts
+            .meta
+            .type_parameters
+            .iter()
+            .map(|p| p.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let candidates: Vec<Candidate> = facts
         .members
         .iter()
@@ -1900,14 +2063,17 @@ pub(crate) fn resolve_constructor_call<'t>(
             // from its own parameters, since no shared use-site substitution
             // exists yet. Non-diamond candidates share the receiver's type
             // arguments.
-            let env = if diamond {
-                infer_env_from_args(&facts.meta.type_parameters, &meta, &call_args)
-            } else {
-                fixed_env.clone()
+            let env = match (diamond, &target_env) {
+                (false, _) => fixed_env.clone(),
+                (true, Some(from_target)) => from_target.clone(),
+                // No usable target: fall back to inferring each candidate's
+                // bindings from its own parameters.
+                (true, None) => infer_env_from_args(&facts.meta.type_parameters, &meta, &call_args),
             };
             Candidate {
                 meta,
                 env,
+                inferred: inferred.clone(),
                 result_display: None,
                 declared_signature: None,
             }

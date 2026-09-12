@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Fixed
+- **Diamond constructors use the target type.** `new Foo<>(...)` inferred its
+  type arguments from the constructor arguments alone, ignoring the type the
+  expression is required to produce. In Spring code that made
+  `return new ResponseEntity<>(headers, HttpStatus.OK);` infer
+  `ResponseEntity<HttpHeaders>` inside a method declared to return
+  `ResponseEntity<List<Mutation>>`, reporting a return-type error on code
+  javac compiles — and picking the wrong constructor on the way. The target
+  type of a `return`, a variable declaration, or an assignment now fixes the
+  class's type arguments, which also decides which constructor applies.
+  Where a candidate's parameter is a type variable still being inferred, it
+  is preferred over one with a concrete type, so `new Foo<>(null, x)`
+  resolves while the explicitly typed `new Foo<Bar>(null, x)` is still
+  reported ambiguous, matching javac. A target naming a supertype
+  (`List<String> xs = new ArrayList<>()`) still infers from the arguments.
 - **Lambda arguments no longer make overloads look ambiguous.** Overload
   resolution compared only a lambda's arity and declared parameter types, so
   `() -> { work(); }` appeared to match every zero-argument functional
