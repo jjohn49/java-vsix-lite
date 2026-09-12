@@ -1,10 +1,6 @@
-//! Call- and type-hierarchy primitives. The server composes these with
-//! its existing bounded scans: incoming calls = the reference scan with
-//! each hit grouped under [`enclosing_callable`]; subtypes = the
-//! implementation scan with each hit wrapped by [`type_decl_at_byte`];
-//! outgoing calls = [`outgoing_call_sites`] resolved through the
-//! go-to-definition ladder. All byte ranges are relative to the document
-//! they were computed from.
+//! Call- and type-hierarchy primitives, composed by the server with its
+//! existing bounded scans (references, implementations, go-to-definition).
+//! All byte ranges are relative to the document they were computed from.
 
 use std::ops::Range;
 
@@ -23,9 +19,8 @@ pub enum CallableKind {
     Type,
 }
 
-/// A method/constructor (or fallback type) declaration, as a call-hierarchy
-/// item wants it: name, kind, the name identifier's range, and the whole
-/// declaration's range.
+/// A method/constructor (or fallback type) declaration, as a
+/// call-hierarchy item wants it.
 #[derive(Clone, Debug)]
 pub struct CallableInfo {
     pub name: String,
@@ -47,9 +42,8 @@ fn callable_info(node: Node, source: &str, kind: CallableKind) -> Option<Callabl
     })
 }
 
-/// The innermost method/constructor declaration containing `byte`, else the
-/// innermost type declaration (kind [`CallableKind::Type`]). `None` outside
-/// any declaration.
+/// The innermost method/constructor declaration containing `byte`, else
+/// the innermost type declaration. `None` outside any declaration.
 pub fn enclosing_callable(doc: &OpenDoc, byte: usize) -> Option<CallableInfo> {
     let mut current = doc
         .tree
@@ -71,9 +65,8 @@ pub fn enclosing_callable(doc: &OpenDoc, byte: usize) -> Option<CallableInfo> {
     }
 }
 
-/// The method/constructor declaration whose **name identifier** starts at
-/// `byte` — the "is the cursor's target actually a callable?" gate for
-/// `prepareCallHierarchy`. `None` for fields, types, locals, anything else.
+/// The method/constructor declaration whose name identifier starts at
+/// `byte`. `None` for fields, types, locals, or anything else.
 pub fn callable_decl_at_name(doc: &OpenDoc, byte: usize) -> Option<CallableInfo> {
     let (node, decl) = callable_name_and_decl(doc, byte)?;
     let kind = match decl.kind() {
@@ -105,9 +98,8 @@ pub struct CallSite {
     pub name_range: Range<usize>,
 }
 
-/// Every call site inside the method/constructor whose name identifier is at
-/// `byte`: plain and chained method invocations, plus `new Foo(...)`
-/// constructor calls (whose "name" is the constructed type).
+/// Every call site inside the method/constructor whose name identifier is
+/// at `byte`: method invocations, chained calls, and `new Foo(...)`.
 pub fn outgoing_call_sites(doc: &OpenDoc, byte: usize) -> Vec<CallSite> {
     let Some((_, decl)) = callable_name_and_decl(doc, byte) else {
         return Vec::new();
@@ -117,12 +109,9 @@ pub fn outgoing_call_sites(doc: &OpenDoc, byte: usize) -> Vec<CallSite> {
     out
 }
 
-/// Iterative pre-order walk — NOT native recursion. A method body can nest
-/// arbitrarily deep (`((((…))))`) from untrusted project source, and Rust
-/// cannot catch a stack overflow (it aborts the whole server); every other
-/// whole-subtree walk in this crate uses a work-stack for the same reason.
-/// Children are pushed reversed so the pop order stays pre-order (left to
-/// right), matching what callers/tests expect.
+/// Iterative pre-order walk, not recursion: untrusted source can nest
+/// arbitrarily deep and Rust can't catch a stack overflow. Children are
+/// pushed reversed so pop order stays left-to-right.
 fn collect_call_sites(root: Node, source: &str, out: &mut Vec<CallSite>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -164,9 +153,8 @@ pub enum TypeInfoKind {
     Annotation,
 }
 
-/// One supertype reference of a type declaration: the simple name as
-/// written, plus the candidate FQNs the declaring file's imports/package
-/// give it (resolution-priority order), for locating it in the workspace.
+/// One supertype reference: the simple name as written, plus candidate
+/// FQNs from the file's imports/package, in resolution-priority order.
 #[derive(Clone, Debug)]
 pub struct SuperRef {
     pub simple: String,
@@ -199,7 +187,7 @@ fn type_info_of(td: &TypeDecl, doc: &OpenDoc) -> Option<TypeInfo> {
         name_range: name_node.start_byte()..name_node.end_byte(),
         decl_range: td.node.start_byte()..td.node.end_byte(),
         supers: td
-            .supers
+            .super_simple_names()
             .iter()
             .map(|s| SuperRef {
                 simple: s.to_string(),
@@ -209,9 +197,8 @@ fn type_info_of(td: &TypeDecl, doc: &OpenDoc) -> Option<TypeInfo> {
     })
 }
 
-/// The in-project type the identifier under the cursor names (its own
-/// declaration or any reference resolvable through the open documents),
-/// with the index of the document declaring it.
+/// The in-project type the identifier under the cursor names, plus the
+/// index of the document declaring it.
 pub fn type_decl_at(
     docs: &[OpenDoc],
     current: usize,
@@ -225,9 +212,9 @@ pub fn type_decl_at(
         .root_node()
         .named_descendant_for_byte_range(byte, byte)
         .filter(|n| matches!(n.kind(), "identifier" | "type_identifier"))?;
-    let name = node_text(node, doc.source);
     let table = TypeTable::build(docs, current);
-    let td = table.get(name)?;
+    let imports = &table.doc_context(current)?.imports;
+    let td = table.resolve_type_name_node(node, doc.source, current, imports)?;
     let decl_doc = docs.get(td.doc)?;
     Some((td.doc, type_info_of(td, decl_doc)?))
 }
@@ -239,13 +226,12 @@ pub fn type_info_in(doc: &OpenDoc, name: &str) -> Option<TypeInfo> {
         tree: doc.tree,
     }];
     let table = TypeTable::build(&docs, 0);
-    let td = table.get(name)?;
+    let td = table.candidates(name).next()?;
     type_info_of(td, doc)
 }
 
-/// The innermost type declaration containing `byte` — wraps an
-/// implementation-scan hit (an implementor's name range) back into a full
-/// [`TypeInfo`].
+/// The innermost type declaration containing `byte`. Wraps an
+/// implementation-scan hit back into a full `TypeInfo`.
 pub fn type_decl_at_byte(doc: &OpenDoc, byte: usize) -> Option<TypeInfo> {
     let mut current = doc
         .tree
@@ -253,7 +239,7 @@ pub fn type_decl_at_byte(doc: &OpenDoc, byte: usize) -> Option<TypeInfo> {
         .named_descendant_for_byte_range(byte, byte)?;
     loop {
         if TypeKind::from_kind(current.kind()).is_some() {
-            let td = TypeDecl::from_node(current, doc.source, 0)?;
+            let td = TypeDecl::from_node(current, doc.source, 0, None)?;
             return type_info_of(&td, doc);
         }
         current = current.parent()?;

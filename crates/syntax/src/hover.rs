@@ -7,21 +7,29 @@ use tree_sitter::{Node, Tree};
 
 use crate::external::{ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
-use crate::model::{named_children, TypeDecl, TypeTable};
-use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
+use crate::model::{named_children, TypeTable};
+use crate::resolve::{self, render_type_ref, Ctx, FactsCache, HierMember, Resolved, ResolvedType};
 use crate::signature::{javadoc, param_count_in_label, param_labels, signature};
 use crate::{node_text, LineIndex, OpenDoc};
 
-/// What to render: an in-project declaration node (signature + Javadoc from the
-/// tree), or an external member's pre-rendered signature (no Javadoc — JDK/jar
-/// bytecode carries none).
+/// What to render: an in-project declaration (signature + Javadoc from
+/// source), or a pre-rendered external signature (bytecode carries no Javadoc).
 enum Target<'t> {
-    /// A declaration node + its source, plus an inherited-Javadoc
-    /// fallback used when the node carries no rendered doc of its own —
-    /// `{@inheritDoc}` and doc-less overrides show the supertype's doc.
+    /// Declaration node + source, plus an inherited-Javadoc fallback used
+    /// for `{@inheritDoc}` or doc-less overrides.
     InProject(Node<'t>, &'t str, Option<String>),
     /// A pre-rendered external signature plus optional Javadoc.
     External(String, Option<String>),
+}
+
+impl Target<'_> {
+    fn with_signature(self, signature: String) -> Self {
+        let doc = match self {
+            Self::InProject(node, source, inherited) => javadoc(node, source).or(inherited),
+            Self::External(_, doc) => doc,
+        };
+        Self::External(signature, doc)
+    }
 }
 
 /// Build a hover for the identifier under the cursor, or `None` if there is none
@@ -37,12 +45,15 @@ pub fn hover(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let name_node = identifier_at(doc.tree, cursor)?;
@@ -95,10 +106,8 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
         return inproject_target(&resolved);
     }
 
-    // Cursor on the type name inside `new Foo(...)` (or `new ArrayList<String>(...)`
-    // — the `type` field may be wrapped in a `generic_type`/`scoped_type_identifier`):
-    // show the best-matching constructor rather than falling through to a plain
-    // type-name reference (which would just show the class declaration).
+    // Cursor on the `new Foo(...)` type name: show the best-matching
+    // constructor instead of falling through to the plain class declaration.
     if let Some(call) = enclosing_object_creation(name_node) {
         return constructor_target(call, ctx);
     }
@@ -117,7 +126,7 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
             // only `{@inheritDoc}`) inherits the supertype's.
             let inherited = (parent.kind() == "method_declaration"
                 && javadoc(parent, ctx.doc.source).is_none())
-            .then(|| inherited_member_doc(parent, ctx.doc.source, ctx, name))
+            .then(|| inherited_member_doc(parent, ctx.current, ctx, name))
             .flatten();
             return Some(Target::InProject(parent, ctx.doc.source, inherited));
         }
@@ -131,15 +140,28 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
                 let resolved = match parent.child_by_field_name("object") {
                     Some(object) => resolve::resolve_receiver_type(object, ctx)?,
                     None => Resolved {
-                        ty: ResolvedType::InProject(resolve::enclosing_typedecl(
-                            name_node,
-                            ctx.doc.source,
-                            ctx.current,
-                        )?),
+                        ty: ResolvedType::InProject {
+                            decl: resolve::enclosing_typedecl(name_node, ctx.table, ctx.current)?,
+                            args: Vec::new(),
+                        },
                         static_only: false,
                     },
                 };
-                return member_target(&resolved, ctx, name);
+                let target = member_target(&resolved, ctx, name)?;
+                return Some(
+                    match crate::call::contextual_method_call_signature(parent, ctx) {
+                        Some(signature) => target.with_signature(signature),
+                        None => target,
+                    },
+                );
+            }
+            "method_reference"
+                if named_children(parent)
+                    .last()
+                    .is_some_and(|node| node.id() == name_node.id()) =>
+            {
+                let signature = crate::call::method_reference_signature(parent, ctx)?;
+                return Some(Target::External(signature, None));
             }
             // Mid-edit `recv.member` (no trailing `;`) parses as a scoped path; if
             // the cursor is on the trailing segment, resolve it as a member of the
@@ -151,15 +173,12 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
                         if let Some(target) = member_target(&resolved, ctx, name) {
                             return Some(target);
                         }
-                        // Not a member of the prefix — fall through: the
-                        // trailing segment may instead be a *nested class*
-                        // of it (`Map.Entry` in an import), which the
-                        // whole-path lookup below resolves via `$`.
+                        // Not a member of the prefix — may instead be a nested
+                        // class (`Map.Entry`); fall through to the whole-path
+                        // lookup below.
                     }
-                    // Treat the whole dotted path as a fully-qualified
-                    // type name (`import java.util.List;`,
-                    // `java.util.List<String> x`, `import java.util.Map.Entry;`),
-                    // nested classes via the `$`-substitution helper.
+                    // Treat the whole dotted path as a fully-qualified type
+                    // name, including nested classes via `$`-substitution.
                     let path = node_text(parent, ctx.doc.source)
                         .split_whitespace()
                         .collect::<String>();
@@ -183,21 +202,21 @@ fn resolve_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'
     ) {
         return Some(Target::InProject(binding.decl_node, binding.source, None));
     }
-    if let Some(td) = ctx.table.get(name) {
+    if let Some(td) =
+        ctx.table
+            .resolve_type_name_node(name_node, ctx.doc.source, ctx.current, ctx.imports)
+    {
         return Some(Target::InProject(td.node, td.source, None));
     }
-    // A type name resolving through imports/`java.lang` to an
-    // external (JDK/dependency/closed-project-file) class — show its
-    // signature and type-level Javadoc instead of nothing.
+    // Falls through to an external (JDK/dependency) class resolved via
+    // imports or `java.lang`.
     let fqn = resolve::resolve_simple_to_fqn(name, ctx)?;
     external_type_target(&fqn, ctx)
 }
 
-/// Hover content for an external type itself: `fqn<TypeParams>` as
-/// the signature line plus the type-level Javadoc (project sources, JDK
-/// `src.zip`, or dependency `-sources.jar`, whichever the symbol source
-/// finds). The declaration keyword (`class` vs `interface`) isn't modeled
-/// at signature level, so none is shown.
+/// Hover for an external type itself: `fqn<TypeParams>` plus its
+/// type-level Javadoc. The `class`/`interface` keyword isn't shown, since
+/// it isn't modeled at signature level.
 fn external_type_target<'t>(fqn: &str, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
     let class = ctx.symbols.class(fqn)?;
     let params = if class.type_params.is_empty() {
@@ -211,22 +230,22 @@ fn external_type_target<'t>(fqn: &str, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> 
     ))
 }
 
-/// Hover target for a binding whose declaration node doesn't render as a
-/// signature on its own — a `var` local (inferred type) or a Java 21 pattern
-/// binding (`case Type name`, record component, `instanceof Type name`). Shows
-/// the resolved type followed by the name (`Widget w`, `ArrayList<String>
-/// list`), fenced, no Javadoc. `None` for anything else (an explicitly typed
-/// local, field, parameter, or non-binding identifier), so the caller falls
-/// through to its normal handling.
+/// Hover for a `var` local or Java 21 pattern binding, whose declaration
+/// has no signature of its own. Renders as the resolved type plus name
+/// (`Widget w`), fenced, no Javadoc; `None` otherwise so the caller falls
+/// through to normal handling.
 fn local_var_target<'t>(name: &str, byte: usize, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
     let ty = resolve::inferred_var_type_display(name, byte, ctx)
+        .or_else(|| resolve::inferred_lambda_parameter_type_display(name, byte, ctx))
         .or_else(|| resolve::pattern_binding_type_display(name, byte, ctx))?;
     Some(Target::External(format!("{ty} {name}"), None))
 }
 
 fn inproject_target<'t>(resolved: &Resolved<'t>) -> Option<Target<'t>> {
     match &resolved.ty {
-        ResolvedType::InProject(td) => Some(Target::InProject(td.node, td.source, None)),
+        ResolvedType::InProject { decl: td, .. } => {
+            Some(Target::InProject(td.node, td.source, None))
+        }
         ResolvedType::External { .. }
         | ResolvedType::Primitive(_)
         | ResolvedType::Void
@@ -240,7 +259,7 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
         HierMember::InProject(m) => {
             let inherited = javadoc(m.node, m.source)
                 .is_none()
-                .then(|| inherited_member_doc(m.node, m.source, ctx, name))
+                .then(|| inherited_member_doc(m.node, m.doc, ctx, name))
                 .flatten();
             Some(Target::InProject(m.node, m.source, inherited))
         }
@@ -248,7 +267,7 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
             // Javadoc only when the receiver itself is external (we have its FQN).
             let doc = match &resolved.ty {
                 ResolvedType::External { fqn, .. } => ctx.symbols.doc(fqn, Some(name)),
-                ResolvedType::InProject(_)
+                ResolvedType::InProject { .. }
                 | ResolvedType::Primitive(_)
                 | ResolvedType::Void
                 | ResolvedType::Null
@@ -259,53 +278,58 @@ fn member_target<'t>(resolved: &Resolved<'t>, ctx: &Ctx<'_, 't>, name: &str) -> 
     }
 }
 
-/// The Javadoc a member would *inherit* — walk the declaring type's
-/// supertype chain, open documents and external symbols alike, for a
-/// same-named member's doc; first hit wins. The external branch delegates
-/// to [`SymbolSource::doc`], which continues the walk within its own world
-/// (`ClasspathSymbols` climbs bytecode supers; the server's combined layer
-/// crosses the project/classpath boundary). Depth-capped: a hostile
-/// hierarchy must not stall a hover.
+/// The Javadoc a member would inherit: walks the declaring type's
+/// supertype chain for a same-named member's doc, first hit wins.
+/// Depth-capped so a hostile hierarchy can't stall a hover.
 fn inherited_member_doc(
     member_node: Node,
-    member_source: &str,
+    member_doc: usize,
     ctx: &Ctx,
     name: &str,
 ) -> Option<String> {
     let type_node = resolve::enclosing_type_node(member_node)?;
-    // Document index 0 is a placeholder — nothing below reads decl sites.
-    let td = TypeDecl::from_node(type_node, member_source, 0)?;
-    let mut queue: Vec<&str> = td.supers.clone();
+    let td = ctx.table.by_node(member_doc, type_node.id())?;
+    let dctx = ctx.for_document(td.doc)?;
+    let mut queue: Vec<ResolvedType> = td
+        .super_nodes
+        .iter()
+        .filter_map(|n| resolve::resolve_type_node(*n, td.source, &dctx))
+        .collect();
     let mut budget = 32usize;
-    while let Some(simple) = queue.pop() {
+    while let Some(resolved) = queue.pop() {
         if budget == 0 {
             return None;
         }
         budget -= 1;
-        if let Some(sd) = ctx.table.get(simple) {
-            if let Some(m) = sd.own_members().into_iter().find(|m| m.name == name) {
-                if let Some(doc) = javadoc(m.node, m.source) {
+        match resolved {
+            ResolvedType::InProject { decl: sd, .. } => {
+                if let Some(m) = sd.own_members().into_iter().find(|m| m.name == name) {
+                    if let Some(doc) = javadoc(m.node, m.source) {
+                        return Some(doc);
+                    }
+                }
+                if let Some(sdctx) = ctx.for_document(sd.doc) {
+                    queue.extend(
+                        sd.super_nodes
+                            .iter()
+                            .filter_map(|n| resolve::resolve_type_node(*n, sd.source, &sdctx)),
+                    );
+                }
+            }
+            ResolvedType::External { fqn, .. } => {
+                if let Some(doc) = ctx.symbols.doc(&fqn, Some(name)) {
                     return Some(doc);
                 }
             }
-            let supers: Vec<&str> = sd.supers.clone();
-            queue.extend(supers);
-        } else if let Some(fqn) = resolve::resolve_simple_to_fqn(simple, ctx) {
-            if let Some(doc) = ctx.symbols.doc(&fqn, Some(name)) {
-                return Some(doc);
-            }
+            _ => {}
         }
     }
     None
 }
 
-/// Walk up from `name_node` through the type-node shapes that can wrap a
-/// `new` type reference (`generic_type` for `new ArrayList<String>()`,
-/// `scoped_type_identifier`/`annotated_type` for a qualified or annotated
-/// one), returning the enclosing `object_creation_expression` if `name_node`
-/// is (part of) its `type` field — `None` for anything else (e.g. an
-/// argument expression inside the call, whose parent chain never reaches one
-/// of these type-node kinds).
+/// Walks up from `name_node` through type-node wrappers (`generic_type`,
+/// `scoped_type_identifier`, `annotated_type`) to the enclosing `new`
+/// expression, if `name_node` is part of its `type` field; `None` otherwise.
 fn enclosing_object_creation(name_node: Node) -> Option<Node> {
     let mut node = name_node;
     loop {
@@ -320,10 +344,9 @@ fn enclosing_object_creation(name_node: Node) -> Option<Node> {
     }
 }
 
-/// Number of arguments actually written at a call site (`new Foo(1, 2)` -> 2)
-/// — the direct argument expressions inside the object-creation's own
-/// `argument_list` (a nested call's arguments live in their own
-/// `argument_list` node, so they're never counted here).
+/// Number of arguments written at a call site (`new Foo(1, 2)` -> 2),
+/// counting only the object-creation's own `argument_list`, not a nested
+/// call's.
 fn call_arg_count(call: Node) -> usize {
     named_children(call)
         .into_iter()
@@ -337,17 +360,11 @@ fn call_arg_count(call: Node) -> usize {
         .unwrap_or(0)
 }
 
-/// Hover for the type name inside `new Foo(...)`: the best-matching
-/// constructor's signature + Javadoc. "Best-matching" is an arity match
-/// against the call's argument count (first declared wins a tie — the same
-/// convention `signature_help`'s active-overload heuristic uses), falling
-/// back to the first declared constructor if none matches. When a chosen
-/// constructor has no Javadoc of its own, falls back to the class-level
-/// Javadoc; when the type declares no explicit constructor at all, shows a
-/// synthesized `Foo()` plus the class-level Javadoc (bytecode always carries
-/// at least the compiler-synthesized no-arg `<init>`, so the external path
-/// only takes this branch for a type with no constructors whatsoever, e.g.
-/// an interface — not valid to `new`, but handled gracefully all the same).
+/// Hover for the type name in `new Foo(...)`: the best-matching
+/// constructor's signature + Javadoc, chosen by argument-count arity
+/// (ties favor the first declared, like `signature_help`'s heuristic).
+/// Falls back to the first constructor, or a synthesized `Foo()` plus
+/// class-level Javadoc when none is declared.
 fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t>> {
     let resolved_ty = resolve::resolve_object_creation_type(call, ctx)?;
     let arg_count = call_arg_count(call);
@@ -357,7 +374,7 @@ fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Array { .. } => None,
-        ResolvedType::InProject(td) => {
+        ResolvedType::InProject { decl: td, .. } => {
             let ctors = td.constructors();
             let (sig, ctor_doc) = if ctors.is_empty() {
                 (format!("{}()", td.name), None)
@@ -369,10 +386,8 @@ fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t
                     .unwrap_or(ctors[0]);
                 (signature(chosen, td.source)?, javadoc(chosen, td.source))
             };
-            // A constructor with no Javadoc of its own falls back to the
-            // class-level Javadoc (also the only doc a synthesized default
-            // constructor can show, since there's no declaration node to
-            // carry one).
+            // No Javadoc of its own falls back to the class-level Javadoc
+            // (also the only doc a synthesized default constructor can show).
             let doc = ctor_doc.or_else(|| javadoc(td.node, td.source));
             Some(Target::External(sig, doc))
         }
@@ -398,11 +413,10 @@ fn constructor_target<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Target<'t
                 .iter()
                 .find(|m| param_count_in_label(&m.signature) == arg_count)
                 .unwrap_or(&ctor_members[0]);
-            let sig = resolve::display_signature(chosen, &args, &class.type_params);
-            // Constructor Javadoc is recovered docsrc-style, by the class's
-            // simple name (a source archive has no `<init>`, only a
-            // constructor declaration named after its class — see
-            // `jvl_classpath::MemberKind::Constructor`); fall back to the
+            let arg_strings: Vec<String> = args.iter().map(render_type_ref).collect();
+            let sig = resolve::display_signature(chosen, &arg_strings, &class.type_params);
+            // External constructor Javadoc is keyed by the class's simple
+            // name (source archives have no `<init>`); falls back to the
             // class-level doc when there's none.
             let doc = ctx
                 .symbols

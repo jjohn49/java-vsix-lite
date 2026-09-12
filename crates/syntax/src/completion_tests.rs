@@ -23,8 +23,10 @@ impl SymbolSource for MockSymbols {
                     is_static: m.is_static,
                     ret_fqn: m.ret_fqn.clone(),
                     ret_display: m.ret_display.clone(),
+                    metadata: None,
                 })
                 .collect(),
+            metadata: None,
         })
     }
 }
@@ -38,6 +40,7 @@ fn ext_method(name: &str, signature: &str) -> ExternalMember {
         is_static: false,
         ret_fqn: None,
         ret_display: None,
+        metadata: None,
     }
 }
 
@@ -51,6 +54,7 @@ fn ext_generic_method(name: &str, erased: &str, template: &str) -> ExternalMembe
         is_static: false,
         ret_fqn: None,
         ret_display: None,
+        metadata: None,
     }
 }
 
@@ -234,7 +238,7 @@ fn trailing_dot_does_not_panic() {
     let _ = complete("", "");
 }
 
-// --- Regression tests for the adversarial review findings ---
+// --- Regression tests ---
 
 fn complete_snip(src: &str, marker: &str, snippets: bool) -> Vec<CompletionItem> {
     let tree = tree(src);
@@ -396,6 +400,7 @@ fn ext_class(supers: &[&str], members: Vec<ExternalMember>) -> ExternalClass {
         supers: supers.iter().map(|s| s.to_string()).collect(),
         type_params: Vec::new(),
         members,
+        metadata: None,
     }
 }
 
@@ -408,6 +413,7 @@ fn ext_generic_class(
         supers: supers.iter().map(|s| s.to_string()).collect(),
         type_params: type_params.iter().map(|s| s.to_string()).collect(),
         members,
+        metadata: None,
     }
 }
 
@@ -505,12 +511,11 @@ fn inproject_member_completion_carries_no_eager_documentation() {
     // The payload names the declaring document by slice index (the
     // server translates it into a URI before the item goes on the wire).
     assert_eq!(data["doc"], 0, "{data:?}");
-    assert_eq!(data["type"], "Box", "{data:?}");
+    assert_eq!(data["binary"], "Box", "{data:?}");
     assert_eq!(data["member"], "width", "{data:?}");
 }
 
-/// The `"doc"` index names the *declaring* document —
-/// for a member declared in another open file, that file's index, not
+/// The `"doc"` index names the *declaring* document, not necessarily
 /// the completion request's current document.
 #[test]
 fn inproject_data_doc_index_names_the_declaring_document() {
@@ -551,10 +556,8 @@ fn external_member_completion_carries_no_documentation_but_has_data_when_receive
 
 #[test]
 fn external_member_reached_through_inproject_receiver_has_no_lazy_data() {
-    // Same limitation hover already accepts (see `hover::member_target`):
-    // an external member inherited through an *in-project* receiver has
-    // no FQN on hand at the point the item is built, so it gets no lazy
-    // doc key at all (rather than a broken one).
+    // Same limitation as `hover::member_target`: no FQN is known yet,
+    // so no lazy doc key is emitted (rather than a broken one).
     let src =
         "import java.util.ArrayList;\nclass MyList extends ArrayList { void m() { this.x; } }\n";
     let symbols = mock(vec![(
@@ -577,7 +580,7 @@ fn resolve_documentation_finds_inproject_member_javadoc() {
         source: src,
         tree: &tree,
     }];
-    let data = serde_json::json!({"kind": "inproject", "type": "Box", "member": "width"});
+    let data = serde_json::json!({"kind": "inproject", "binary": "Box", "member": "width"});
     let doc = resolve_documentation(&docs, &data, &NoSymbols).expect("doc resolved");
     match doc {
         Documentation::MarkupContent(m) => assert_eq!(m.value, "The width."),
@@ -585,11 +588,9 @@ fn resolve_documentation_finds_inproject_member_javadoc() {
     }
 }
 
-/// With two files both declaring a `Box.width`, the
-/// caller narrows `docs` to the originating document — and gets *that*
-/// document's Javadoc, not whichever same-named type an all-docs scan
-/// would have found first. An empty slice (originating document closed
-/// since completion) yields no documentation rather than a guess.
+/// Narrows `docs` to the originating document so a same-named type in
+/// another file isn't picked up by mistake. An empty `docs` slice yields
+/// no documentation rather than a guess.
 #[test]
 fn resolve_documentation_scoped_to_originating_document_only() {
     let src_a = "class Box { /** From A. */ int width; }\n";
@@ -597,7 +598,7 @@ fn resolve_documentation_scoped_to_originating_document_only() {
     let tree_a = tree(src_a);
     let tree_b = tree(src_b);
     let data = serde_json::json!({
-        "kind": "inproject", "type": "Box", "member": "width", "doc": 0,
+        "kind": "inproject", "binary": "Box", "member": "width", "doc": 0,
     });
 
     let from = |src, t| {
@@ -664,7 +665,7 @@ fn resolve_documentation_missing_or_unknown_data_is_none() {
     .is_none());
     assert!(resolve_documentation(
         &docs,
-        &serde_json::json!({"kind": "inproject", "type": "NoSuchType", "member": "width"}),
+        &serde_json::json!({"kind": "inproject", "binary": "NoSuchType", "member": "width"}),
         &NoSymbols
     )
     .is_none());
@@ -673,7 +674,6 @@ fn resolve_documentation_missing_or_unknown_data_is_none() {
 // --- Everyday IntelliSense — chains, statics, var, casts, arrays ---
 
 /// A method whose (erased) return type is an object — enough for a chain
-/// to continue through `ret_fqn`.
 fn ext_method_ret(name: &str, signature: &str, ret_fqn: &str) -> ExternalMember {
     ExternalMember {
         ret_fqn: Some(ret_fqn.to_string()),
@@ -705,6 +705,7 @@ fn ext_static_field_ret(name: &str, signature: &str, ret_fqn: &str) -> ExternalM
         is_static: true,
         ret_fqn: Some(ret_fqn.to_string()),
         ret_display: None,
+        metadata: None,
     }
 }
 
@@ -912,10 +913,8 @@ fn array_receiver_offers_length_and_clone_not_element_members() {
     );
 }
 
-/// A field's *declared* type drives completion — whether or not any
-/// constructor (or initializer) ever assigns it, and whether it's
-/// reached bare, via `this.`, or through a generic container type.
-/// (User-reported concern re: an uninitialized `byName` map field.)
+/// A field's *declared* type drives completion, whether reached bare,
+/// via `this.`, or through a generic container type.
 #[test]
 fn uninitialized_field_completes_from_declared_type() {
     let src = "import java.util.Map;\n\
@@ -924,18 +923,21 @@ fn uninitialized_field_completes_from_declared_type() {
                    void m() { byName.x; }\n\
                    void n() { this.byName.x; }\n\
                    }\n";
-    let symbols = mock(vec![(
-        "java.util.Map",
-        ext_generic_class(
-            &["K", "V"],
-            &[],
-            vec![ext_generic_method(
-                "get",
-                "Object get(Object)",
-                "{1} get({0})",
-            )],
+    let symbols = mock(vec![
+        (
+            "java.util.Map",
+            ext_generic_class(
+                &["K", "V"],
+                &[],
+                vec![ext_generic_method(
+                    "get",
+                    "Object get(Object)",
+                    "{1} get({0})",
+                )],
+            ),
         ),
-    )]);
+        ("java.lang.String", ext_class(&[], Vec::new())),
+    ]);
     let items = complete_ext(src, "{ byName.", &symbols);
     assert!(has(&items, "get"), "bare field: {:?}", labels(&items));
     assert_eq!(detail_of(&items, "get"), Some("String get(String)"));
@@ -1011,8 +1013,10 @@ impl SymbolSource for NameSymbols {
                     is_static: m.is_static,
                     ret_fqn: m.ret_fqn.clone(),
                     ret_display: m.ret_display.clone(),
+                    metadata: None,
                 })
                 .collect(),
+            metadata: None,
         })
     }
 
@@ -1081,11 +1085,8 @@ fn classpath_type_completion_with_auto_import_after_last_import() {
         item.data,
         Some(json!({ "kind": "external_type", "fqn": "java.util.ArrayList" }))
     );
-    // Deliberately always incomplete once a classpath/project query ran
-    // at all — see the doc comment on `scope_items`'s type-name branch:
-    // this forces the client to re-query fresh on every keystroke
-    // rather than client-side-filtering a stale response, which is what
-    // let a real match get buried/dropped in practice.
+    // Always incomplete once a classpath query ran: forces the client to
+    // re-query fresh each keystroke instead of filtering a stale list.
     assert!(result.is_incomplete);
 }
 
@@ -1118,11 +1119,8 @@ fn classpath_types_require_min_prefix() {
         find_type(&result.items, "java.util.ArrayList").is_none(),
         "1-char prefix must not query the classpath"
     );
-    // ...but the result must still be incomplete: the classpath types
-    // were *withheld*, not absent — the very next character brings them
-    // in, and a complete-marked 1-char response would freeze this
-    // classpath-less list for the rest of the word (the field-reported
-    // "typing `person` never shows `Person`" failure).
+    // Still incomplete: withheld types aren't absent ones, and marking
+    // this complete would freeze the classpath-less list mid-word.
     assert!(result.is_incomplete);
 }
 
@@ -1359,17 +1357,20 @@ fn resolve_documentation_finds_external_type_javadoc() {
 fn generic_type_args_substituted_in_member_signatures() {
     let src = "import java.util.ArrayList;\n\
                    class C { void m() { ArrayList<String> xs; xs.x; } }\n";
-    let symbols = mock(vec![(
-        "java.util.ArrayList",
-        ext_generic_class(
-            &["E"],
-            &[],
-            vec![
-                ext_generic_method("add", "boolean add(Object)", "boolean add({0})"),
-                ext_generic_method("get", "Object get(int)", "{0} get(int)"),
-            ],
+    let symbols = mock(vec![
+        (
+            "java.util.ArrayList",
+            ext_generic_class(
+                &["E"],
+                &[],
+                vec![
+                    ext_generic_method("add", "boolean add(Object)", "boolean add({0})"),
+                    ext_generic_method("get", "Object get(int)", "{0} get(int)"),
+                ],
+            ),
         ),
-    )]);
+        ("java.lang.String", ext_class(&[], Vec::new())),
+    ]);
     let items = complete_ext(src, "xs.", &symbols);
     assert_eq!(detail_of(&items, "add"), Some("boolean add(String)"));
     assert_eq!(detail_of(&items, "get"), Some("String get(int)"));

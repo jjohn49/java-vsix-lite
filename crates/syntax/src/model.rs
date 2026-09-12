@@ -1,15 +1,13 @@
-//! Declaration model extracted from parse trees.
-//!
-//! [`TypeTable`] indexes the type declarations across all open documents by
-//! **simple name**; [`TypeDecl`] describes one type and yields its [`Member`]s on
-//! demand. This is the shared substrate the resolver, completion, and hover all
-//! build on. Everything borrows the parse trees (`'t`) and runs synchronously
-//! while the server holds the documents lock — no allocation of source text.
+//! Parse-tree declarations shared by resolution, completion, and hover.
+//! [`TypeTable`] indexes types while [`TypeDecl`] exposes their members.
 
 use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
+use jvl_types::TypeId;
+
+use crate::imports::Imports;
 use crate::{node_text, OpenDoc};
 
 /// Depth cap for inheritance walks — far beyond any real `extends`/`implements`
@@ -29,15 +27,10 @@ pub(crate) fn children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     node.children(&mut cursor).collect()
 }
 
-/// Where a symbol is declared: which open document (an index into the
-/// `&[OpenDoc]` slice given to [`TypeTable::build`]) and byte ranges within that
-/// document — the declaring **name** identifier (what a client should jump the
-/// cursor to / highlight for rename) and the enclosing declaration (whatever
-/// node the owning [`TypeDecl`]/[`Member`]/`Binding` already holds — cheap to
-/// carry alongside since no extra tree walk is needed to produce it).
+/// Where a symbol is declared: which open document, and the byte ranges of its
+/// name identifier (for go-to/rename) and its enclosing declaration.
 ///
-/// Built for symbols that live in an open document; external (JDK/jar) symbols
-/// have no `DeclSite` — callers get `None` for those instead.
+/// External (JDK/jar) symbols have no `DeclSite`; callers get `None` instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeclSite {
     pub doc: usize,
@@ -46,9 +39,8 @@ pub(crate) struct DeclSite {
 }
 
 impl DeclSite {
-    /// Build a `DeclSite` from a name node and the declaration node it belongs
-    /// to (`full`), both required to exist — callers pass `None` up when a name
-    /// node can't be found rather than fabricating a range.
+    /// Build a `DeclSite` from a name node and its enclosing declaration (`full`).
+    /// Callers pass `None` up rather than fabricate a range when no name node exists.
     pub(crate) fn new(doc: usize, name: Node, full: Node) -> DeclSite {
         DeclSite {
             doc,
@@ -129,9 +121,8 @@ pub(crate) struct Member<'t> {
 }
 
 impl<'t> Member<'t> {
-    /// Where this member is declared, or `None` if `node` unexpectedly has no
-    /// `name` field (never true for the node kinds [`Member`] is built from,
-    /// but resolution never panics on a shape it didn't expect).
+    /// Where this member is declared, or `None` if `node` has no `name` field.
+    /// Resolution never panics on an unexpected node shape.
     pub(crate) fn decl_site(&self) -> Option<DeclSite> {
         let name = self.node.child_by_field_name("name")?;
         Some(DeclSite::new(self.doc, name, self.node))
@@ -143,32 +134,47 @@ impl<'t> Member<'t> {
 pub(crate) struct TypeDecl<'t> {
     pub name: &'t str,
     pub kind: TypeKind,
-    /// Simple names of supertypes (`extends` + `implements`/`permits` excluded).
-    pub supers: Vec<&'t str>,
+    /// Raw type nodes of `extends`/`implements` clauses (see [`super_type_nodes`]).
+    /// Never erased to a simple name: same-simple-name supertypes in different
+    /// packages must not collide.
+    pub super_nodes: Vec<Node<'t>>,
     /// The type declaration node.
     pub node: Node<'t>,
     pub source: &'t str,
     /// Index (into the `&[OpenDoc]` slice given to [`TypeTable::build`]) of the
     /// document this type is declared in.
     pub doc: usize,
+    /// Binary name `pkg.Outer$Inner` for top-level and member types; `None`
+    /// for local/anonymous classes (identity = `TypeId::Local`).
+    pub binary_name: Option<String>,
+    #[allow(dead_code)] // reserved for future type comparisons
+    pub type_id: TypeId,
 }
 
 impl<'t> TypeDecl<'t> {
-    /// Build a `TypeDecl` from a type declaration node, or `None` if `node` is
-    /// not a type declaration.
-    pub(crate) fn from_node(node: Node<'t>, source: &'t str, doc: usize) -> Option<TypeDecl<'t>> {
+    /// `package` is the declaring document's own package (`Imports::package`),
+    /// used to compute the binary name.
+    pub(crate) fn from_node(
+        node: Node<'t>,
+        source: &'t str,
+        doc: usize,
+        package: Option<&str>,
+    ) -> Option<TypeDecl<'t>> {
         let kind = TypeKind::from_kind(node.kind())?;
         let name = node
             .child_by_field_name("name")
             .map(|n| node_text(n, source))?;
-        let supers = collect_supers(node, source);
+        let super_nodes = super_type_nodes(node);
+        let (binary_name, type_id) = binary_identity(node, name, source, doc, package);
         Some(TypeDecl {
             name,
             kind,
-            supers,
+            super_nodes,
             node,
             source,
             doc,
+            binary_name,
+            type_id,
         })
     }
 
@@ -213,10 +219,9 @@ impl<'t> TypeDecl<'t> {
         out
     }
 
-    /// This type's directly-declared constructors (never inherited — Java
-    /// constructors aren't members of the [`Member`]/`MemberKind` model since
-    /// completion/hover never need to list them; signature help does, for
-    /// `new Foo(...)` calls).
+    /// This type's directly-declared constructors (never inherited).
+    /// Not part of the [`Member`] model since only signature help needs them,
+    /// for `new Foo(...)` calls.
     pub(crate) fn constructors(&self) -> Vec<Node<'t>> {
         let mut out = Vec::new();
         if let Some(body) = self.body() {
@@ -224,11 +229,87 @@ impl<'t> TypeDecl<'t> {
         }
         out
     }
+
+    /// This record's compact canonical constructor (`Point { ... }`), if declared.
+    /// A distinct node kind from `constructor_declaration`, so not included in
+    /// [`TypeDecl::constructors`].
+    pub(crate) fn compact_constructor(&self) -> Option<Node<'t>> {
+        self.body().and_then(|body| {
+            named_children(body)
+                .into_iter()
+                .find(|c| c.kind() == "compact_constructor_declaration")
+        })
+    }
+
+    /// Erased supertype simple names, for **display only** (hover/hierarchy
+    /// rendering). Semantic consumers must use [`TypeTable::source_supers`]
+    /// instead; a bare simple name collides across packages.
+    pub(crate) fn super_simple_names(&self) -> Vec<&'t str> {
+        self.super_nodes
+            .iter()
+            .filter_map(|n| base_type_name(*n, self.source))
+            .collect()
+    }
 }
 
-/// Walk a type body, pushing each declared constructor (descending into the
-/// `enum_body_declarations` wrapper the same way [`collect_body_members`]
-/// does for methods/fields).
+/// Ancestor-walk `node` to compute its binary identity: a binary name for a
+/// top-level/member type, or `TypeId::Local` for a local/anonymous class, which
+/// has no binary name stable outside the request that parsed it.
+fn binary_identity<'t>(
+    node: Node<'t>,
+    name: &'t str,
+    source: &'t str,
+    doc: usize,
+    package: Option<&str>,
+) -> (Option<String>, TypeId) {
+    let mut names = vec![name];
+    let mut anc = node.parent();
+    while let Some(a) = anc {
+        match a.kind() {
+            "program" => break,
+            "block" | "method_declaration" | "constructor_declaration" | "lambda_expression" => {
+                return (
+                    None,
+                    TypeId::Local {
+                        document: doc,
+                        declaration: node.id(),
+                    },
+                );
+            }
+            "object_creation_expression"
+                if named_children(a)
+                    .into_iter()
+                    .any(|c| c.kind() == "class_body") =>
+            {
+                return (
+                    None,
+                    TypeId::Local {
+                        document: doc,
+                        declaration: node.id(),
+                    },
+                );
+            }
+            _ => {
+                if TypeKind::from_kind(a.kind()).is_some() {
+                    if let Some(n) = a.child_by_field_name("name") {
+                        names.push(node_text(n, source));
+                    }
+                }
+            }
+        }
+        anc = a.parent();
+    }
+    names.reverse();
+    let qualified = names.join("$");
+    let binary = match package {
+        Some(p) if !p.is_empty() => format!("{p}.{qualified}"),
+        _ => qualified,
+    };
+    (Some(binary.clone()), TypeId::Named(binary))
+}
+
+/// Walk a type body, pushing each declared constructor (descends into
+/// `enum_body_declarations` like [`collect_body_members`] does for fields).
 fn collect_constructors<'t>(body: Node<'t>, out: &mut Vec<Node<'t>>) {
     for child in named_children(body) {
         match child.kind() {
@@ -239,22 +320,10 @@ fn collect_constructors<'t>(body: Node<'t>, out: &mut Vec<Node<'t>>) {
     }
 }
 
-/// Extract supertype simple names from `extends`/`implements` clauses.
-fn collect_supers<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
-    super_type_nodes(node)
-        .into_iter()
-        .filter_map(|ty| base_type_name(ty, source))
-        .collect()
-}
-
-/// The raw type NODES of a declaration's `extends`/`implements` clauses —
-/// the same nodes whose base simple names [`collect_supers`] erases into
-/// [`TypeDecl::supers`]. `pub(crate)` for go-to-implementation, whose
-/// per-supertype confirm needs the node itself (not just the erased simple
-/// name) to tell a fully-qualified supertype reference
-/// (`implements com.example.Foo` — confirmed against the target's real FQN,
-/// bypassing imports) apart from an unqualified one (`implements Foo` —
-/// confirmed through the scanned file's import/package context).
+/// The raw type nodes of a declaration's `extends`/`implements` clauses.
+/// `pub(crate)` for go-to-implementation, which needs the node itself (not just
+/// the erased simple name) to tell a fully-qualified supertype reference apart
+/// from an unqualified one.
 pub(crate) fn super_type_nodes<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     let mut out = Vec::new();
     for child in named_children(node) {
@@ -391,36 +460,226 @@ pub(crate) fn base_type_name<'t>(ty: Node<'t>, source: &'t str) -> Option<&'t st
     }
 }
 
-/// Index of every type declaration across the open documents, by simple name.
+/// The base simple name of a type *reference*: same as [`base_type_name`] for a
+/// real type node, or the identifier's own text for a bare type-name reference
+/// like `Foo` in `Foo.method()` (grammar gives `identifier`, not `type_identifier`).
+pub(crate) fn type_ref_simple_name<'t>(node: Node<'t>, source: &'t str) -> Option<&'t str> {
+    if node.kind() == "identifier" {
+        Some(node_text(node, source))
+    } else {
+        base_type_name(node, source)
+    }
+}
+
+/// The import/package context of one open document, aligned by index with
+/// the `&[OpenDoc]` slice [`TypeTable::build`] was called with.
+pub(crate) struct DocContext {
+    pub imports: Imports,
+    pub package: Option<String>,
+}
+
+/// Index of every type declaration across open documents, keyed by qualified
+/// binary identity, never a bare simple name — same-simple-name types in
+/// different packages must never collide.
 pub(crate) struct TypeTable<'t> {
-    by_name: HashMap<&'t str, TypeDecl<'t>>,
+    decls: Vec<TypeDecl<'t>>,
+    /// Binary name -> decl indices. More than one entry means the name is
+    /// declared more than once across the given documents — ambiguous.
+    by_binary: HashMap<String, Vec<usize>>,
+    /// Simple name -> decl indices: every declaration sharing that name, not a
+    /// resolved winner (used for candidate lists: completion, import offers).
+    by_simple: HashMap<&'t str, Vec<usize>>,
+    /// (doc, node.id()) -> decl index — for a caller that already holds the
+    /// declaration node (an enclosing-type lookup, a completion resolve key).
+    by_node: HashMap<(usize, usize), usize>,
+    /// Index-aligned with the `&[OpenDoc]` slice `build` was called with.
+    docs: Vec<DocContext>,
 }
 
 impl<'t> TypeTable<'t> {
-    /// Build the table, scanning `docs[current]` first so current-file types win
-    /// simple-name collisions.
+    /// Build the table, scanning `docs[current]` first so current-file types
+    /// win simple-name candidate ordering (binary-name identity never
+    /// collides regardless of scan order).
     pub(crate) fn build(docs: &[OpenDoc<'t>], current: usize) -> TypeTable<'t> {
-        let mut by_name = HashMap::new();
+        let mut t = TypeTable {
+            decls: Vec::new(),
+            by_binary: HashMap::new(),
+            by_simple: HashMap::new(),
+            by_node: HashMap::new(),
+            docs: Vec::new(),
+        };
+        for doc in docs {
+            let imports = Imports::parse(doc.tree, doc.source);
+            t.docs.push(DocContext {
+                package: imports.package().map(str::to_string),
+                imports,
+            });
+        }
         let order = std::iter::once(current).chain((0..docs.len()).filter(|&i| i != current));
         for i in order {
             let Some(doc) = docs.get(i) else { continue };
-            collect_type_decls(doc.tree.root_node(), doc.source, i, &mut by_name);
+            let package = t.docs[i].package.clone();
+            let mut stack = vec![doc.tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if let Some(decl) = TypeDecl::from_node(node, doc.source, i, package.as_deref()) {
+                    let idx = t.decls.len();
+                    if let Some(b) = &decl.binary_name {
+                        t.by_binary.entry(b.clone()).or_default().push(idx);
+                    }
+                    t.by_simple.entry(decl.name).or_default().push(idx);
+                    t.by_node.insert((i, node.id()), idx);
+                    t.decls.push(decl);
+                }
+                stack.extend(children(node));
+            }
         }
-        TypeTable { by_name }
+        t
     }
 
-    pub(crate) fn get(&self, simple_name: &str) -> Option<&TypeDecl<'t>> {
-        self.by_name.get(simple_name)
+    /// Exact binary-name lookup; `None` when absent OR declared more than
+    /// once across the given documents (ambiguous — never guess).
+    pub(crate) fn get_named(&self, binary: &str) -> Option<&TypeDecl<'t>> {
+        match self.by_binary.get(binary).map(Vec::as_slice) {
+            Some([i]) => Some(&self.decls[*i]),
+            _ => None,
+        }
+    }
+
+    /// Whether `binary` is declared more than once across the given
+    /// documents.
+    #[allow(dead_code)] // reserved for future type comparisons
+    pub(crate) fn is_duplicate(&self, binary: &str) -> bool {
+        self.by_binary.get(binary).is_some_and(|v| v.len() > 1)
+    }
+
+    /// Every declaration sharing simple name `simple`, in scan order
+    /// (current document first) — a candidate list, not a resolved winner.
+    pub(crate) fn candidates<'a>(&'a self, simple: &str) -> impl Iterator<Item = &'a TypeDecl<'t>> {
+        self.by_simple
+            .get(simple)
+            .into_iter()
+            .flatten()
+            .map(move |i| &self.decls[*i])
+    }
+
+    /// The declaration at a specific (document, node) pair — for a caller
+    /// that already holds the declaration node itself.
+    pub(crate) fn by_node(&self, doc: usize, node_id: usize) -> Option<&TypeDecl<'t>> {
+        self.by_node.get(&(doc, node_id)).map(|i| &self.decls[*i])
+    }
+
+    /// The import/package context of document `doc`.
+    pub(crate) fn doc_context(&self, doc: usize) -> Option<&DocContext> {
+        self.docs.get(doc)
     }
 
     /// Every indexed type declaration (used for in-scope type-name completion).
     pub(crate) fn iter(&self) -> impl Iterator<Item = &TypeDecl<'t>> {
-        self.by_name.values()
+        self.decls.iter()
     }
 
-    /// Member named `name` on `decl` or any in-table supertype. Nearest-first, so
-    /// an override wins over the inherited copy; stops at the first match without
-    /// rendering signatures. Cycle- and depth-guarded.
+    /// Java 6.4/7.5 resolution order: (1) lexically enclosing declarations,
+    /// (2) explicit single import, (3) same package, (4) fully-qualified/dotted
+    /// text, (5) on-demand (wildcard) imports + `java.lang`. Ambiguous or absent
+    /// resolves to `None` — never guessed.
+    pub(crate) fn resolve_type_name_node(
+        &self,
+        type_node: Node<'t>,
+        source: &'t str,
+        doc: usize,
+        imports: &Imports,
+    ) -> Option<&TypeDecl<'t>> {
+        let simple = type_ref_simple_name(type_node, source)?;
+        let dotted = crate::resolve::dotted_type_name(type_node, source);
+        self.resolve_type_name_at(type_node, simple, dotted, doc, imports)
+    }
+
+    /// Resolve `simple` at `anchor`'s lexical position.
+    /// This handles nested generic arguments whose name differs from the anchor.
+    pub(crate) fn resolve_type_name_at(
+        &self,
+        anchor: Node<'t>,
+        simple: &str,
+        dotted: Option<String>,
+        doc: usize,
+        imports: &Imports,
+    ) -> Option<&TypeDecl<'t>> {
+        // (1) lexical: walk up from `anchor` through enclosing type declarations.
+        let mut anc = anchor.parent();
+        while let Some(a) = anc {
+            if TypeKind::from_kind(a.kind()).is_some() {
+                if let Some(d) = self.by_node(doc, a.id()) {
+                    if dotted.is_none() && d.name == simple {
+                        return Some(d);
+                    }
+                    if let Some(b) = &d.binary_name {
+                        if let Some(m) = self.get_named(&format!("{b}${simple}")) {
+                            if dotted.is_none() {
+                                return Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+            anc = a.parent();
+        }
+        if let Some(dotted) = dotted {
+            // (4) qualified: `p.q.Outer.Inner` -> try `p.q.Outer$Inner`,
+            // `p.q$Outer$Inner`, … until one is registered. Bypasses imports
+            // entirely.
+            let mut candidate = dotted;
+            for _ in 0..8 {
+                if let Some(d) = self.get_named(&candidate) {
+                    return Some(d);
+                }
+                let dot = candidate.rfind('.')?;
+                candidate.replace_range(dot..dot + 1, "$");
+            }
+            return None;
+        }
+        // (2) explicit import
+        if let Some(path) = imports.single_import(simple) {
+            let binary =
+                crate::resolve::import_path_to_binary(path, |b| self.by_binary.contains_key(b))?;
+            return self.get_named(&binary);
+        }
+        // (3) same package
+        let same_pkg = match imports.package() {
+            Some(p) => format!("{p}.{simple}"),
+            None => simple.to_string(),
+        };
+        if self.by_binary.contains_key(&same_pkg) {
+            return self.get_named(&same_pkg);
+        }
+        // (5) on-demand: every wildcard package + java.lang; more than one
+        // hit is ambiguous.
+        let mut hits = imports
+            .wildcard_packages()
+            .map(|w| format!("{w}.{simple}"))
+            .chain(std::iter::once(format!("java.lang.{simple}")))
+            .filter(|c| self.by_binary.contains_key(c));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        self.get_named(&first)
+    }
+
+    /// Resolve each of `decl`'s [`TypeDecl::super_nodes`] through `decl`'s own
+    /// document's imports/package, never the caller's, so a supertype is never
+    /// mis-resolved by whoever happens to be asking.
+    pub(crate) fn source_supers(&self, decl: &TypeDecl<'t>) -> Vec<&TypeDecl<'t>> {
+        let Some(ctx) = self.doc_context(decl.doc) else {
+            return Vec::new();
+        };
+        decl.super_nodes
+            .iter()
+            .filter_map(|n| self.resolve_type_name_node(*n, decl.source, decl.doc, &ctx.imports))
+            .collect()
+    }
+
+    /// Find the nearest member through resolvable supertypes.
+    /// The walk is cycle- and depth-guarded.
     pub(crate) fn find_member(&self, decl: &TypeDecl<'t>, name: &str) -> Option<Member<'t>> {
         let mut visited = HashSet::new();
         self.find_member_rec(decl, name, &mut visited, 0)
@@ -439,20 +698,16 @@ impl<'t> TypeTable<'t> {
         if let Some(m) = decl.own_members().into_iter().find(|m| m.name == name) {
             return Some(m);
         }
-        for sup in &decl.supers {
-            if let Some(super_decl) = self.get(sup) {
-                if let Some(m) = self.find_member_rec(super_decl, name, visited, depth + 1) {
-                    return Some(m);
-                }
+        for sup in self.source_supers(decl) {
+            if let Some(m) = self.find_member_rec(sup, name, visited, depth + 1) {
+                return Some(m);
             }
         }
         None
     }
 
-    /// All members of `decl` plus inherited members from in-table supertypes.
-    /// When `static_only`, keeps only static members and nested types. Overrides
-    /// (same rendered signature) collapse to the nearest declaration; overloads
-    /// survive.
+    /// Collect own and inherited members, nearest override first.
+    /// `static_only` retains static members and nested types.
     pub(crate) fn all_members(&self, decl: &TypeDecl<'t>, static_only: bool) -> Vec<Member<'t>> {
         let mut out = Vec::new();
         let mut seen_sig = HashSet::new();
@@ -483,27 +738,8 @@ impl<'t> TypeTable<'t> {
                 out.push(m);
             }
         }
-        for sup in &decl.supers {
-            if let Some(super_decl) = self.get(sup) {
-                self.collect_inherited(super_decl, out, seen_sig, visited, depth + 1);
-            }
+        for sup in self.source_supers(decl) {
+            self.collect_inherited(sup, out, seen_sig, visited, depth + 1);
         }
-    }
-}
-
-/// DFS the tree, registering every type declaration (top-level and nested) under
-/// its simple name; first registration wins.
-fn collect_type_decls<'t>(
-    root: Node<'t>,
-    source: &'t str,
-    doc: usize,
-    by_name: &mut HashMap<&'t str, TypeDecl<'t>>,
-) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if let Some(decl) = TypeDecl::from_node(node, source, doc) {
-            by_name.entry(decl.name).or_insert(decl);
-        }
-        stack.extend(children(node));
     }
 }

@@ -13,9 +13,11 @@ use tree_sitter::Node;
 use crate::external::{ExternalMember, ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
 use crate::model::{named_children, Member, MemberKind, TypeDecl, TypeKind, TypeTable};
-use crate::resolve::{self, Binding, BindingKind, Ctx, HierMember, Resolved, ResolvedType};
+use crate::resolve::{
+    self, Binding, BindingKind, Ctx, FactsCache, HierMember, Resolved, ResolvedType,
+};
 use crate::signature::{javadoc, signature};
-use crate::{node_text, LineIndex, OpenDoc};
+use crate::{LineIndex, OpenDoc};
 
 /// Java reserved words + literals offered in scope completion. `pub(crate)`
 /// so `rename.rs` can refuse a rename's new name when it's one of
@@ -105,11 +107,10 @@ const MIN_TYPE_PREFIX: usize = 2;
 /// `is_incomplete` so the client re-queries on further typing.
 const MAX_CLASSPATH_TYPES: usize = 200;
 
-/// Produce completion items for the cursor position. Inside an `import`
-/// declaration this walks packages/types/static members; after a resolvable
-/// `.` it is member completion; otherwise in-scope identifiers + keywords +
-/// classpath type names (with auto-import). `snippets` reflects the client's
-/// `completionItem.snippetSupport` capability.
+/// Produce completion items for the cursor position: import-path completion
+/// inside an `import`, member completion after a resolvable `.`, otherwise
+/// in-scope identifiers, keywords, and classpath types with auto-import.
+/// `snippets` reflects the client's snippet-support capability.
 pub fn completion(
     docs: &[OpenDoc],
     current: usize,
@@ -124,17 +125,19 @@ pub fn completion(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
-    // `import java.ut|` — checked before member access, which would
-    // otherwise treat the path's trailing `.` as a member dot and resolve
-    // nothing.
+    // Checked before member access: otherwise the path's trailing `.`
+    // would be treated as a member dot and resolve nothing.
     if let Some(items) = import_items(doc.source, cursor, &ctx) {
         return CompletionResult::complete(items);
     }
@@ -158,27 +161,31 @@ fn member_items<'t>(
 ) -> Vec<CompletionItem> {
     resolve::collect_members(resolved, ctx)
         .iter()
-        .map(|m| hier_item(m, resolved, snippets))
+        .map(|m| hier_item(m, resolved, ctx, snippets))
         .collect()
 }
 
-fn hier_item(member: &HierMember, resolved: &Resolved, snippets: bool) -> CompletionItem {
+fn hier_item(
+    member: &HierMember,
+    resolved: &Resolved,
+    ctx: &Ctx,
+    snippets: bool,
+) -> CompletionItem {
     match member {
-        HierMember::InProject(m) => inproject_item(m, snippets),
+        HierMember::InProject(m) => inproject_item(m, ctx, snippets),
         HierMember::External(m) => external_item(m, resolved, snippets),
     }
 }
 
-/// No `documentation` here — Javadoc lookup is strictly lazy, deferred
-/// to `completionItem/resolve` (see [`resolve_documentation`]) so a plain
-/// `textDocument/completion` request never pays for it. `data` carries just
-/// enough to re-find the same Javadoc later.
-fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
+/// No `documentation` here: Javadoc lookup is lazy, deferred to
+/// [`resolve_documentation`] so a plain completion request never pays for
+/// it. `data` carries just enough to re-find it later.
+fn inproject_item(member: &Member, ctx: &Ctx, snippets: bool) -> CompletionItem {
     let mut item = CompletionItem {
         label: member.name.to_string(),
         kind: Some(member_kind(member.kind)),
         detail: signature(member.node, member.source),
-        data: inproject_data(member),
+        data: inproject_data(member, ctx.table),
         ..Default::default()
     };
     if member.kind == MemberKind::Method {
@@ -187,27 +194,21 @@ fn inproject_item(member: &Member, snippets: bool) -> CompletionItem {
     item
 }
 
-/// Lazy-resolve key for an in-project member's Javadoc: the *declaring*
-/// type's own simple name (found by walking up from the member's node, not
-/// the resolved receiver's — precise even for an inherited member, and needs
-/// no inheritance walk to re-find at resolve time) plus the member's name,
-/// plus the index (`"doc"`) of the declaring document in the `&[OpenDoc]`
-/// slice this request ran against. The index is meaningless across requests
-/// (document maps have no stable order); the caller — the server, the only
-/// party that knows URIs (this crate is deliberately URI-free) — must
-/// translate it into the originating document's URI before the item goes on
-/// the wire, so `completionItem/resolve` can re-find *that exact document*
-/// rather than scanning all open documents, where a same-simple-name type
-/// declared elsewhere could win the lookup and yield the wrong member's
-/// Javadoc. `None` if the member somehow isn't inside any type declaration
-/// (never true for a `Member` built from `TypeDecl::own_members`, but
-/// resolution never panics on a shape it didn't expect).
-fn inproject_data(member: &Member) -> Option<Value> {
+/// Lazy-resolve key for an in-project member's Javadoc: the declaring
+/// type's own simple name (not the resolved receiver's, so inherited
+/// members still resolve) plus the member name and document index.
+/// The index is only meaningful for this request; the server must
+/// translate it to a URI before the item reaches the client, or a
+/// same-named type in another open file could hijack the lookup.
+fn inproject_data(member: &Member, table: &TypeTable) -> Option<Value> {
     let type_node = resolve::enclosing_type_node(member.node)?;
-    let type_name = node_text(type_node.child_by_field_name("name")?, member.source);
+    let binary = table
+        .by_node(member.doc, type_node.id())?
+        .binary_name
+        .clone()?;
     Some(json!({
         "kind": "inproject",
-        "type": type_name,
+        "binary": binary,
         "member": member.name,
         "doc": member.doc,
     }))
@@ -233,12 +234,10 @@ fn external_item(member: &ExternalMember, resolved: &Resolved, snippets: bool) -
     item
 }
 
-/// Lazy-resolve key for an external member's Javadoc: the *receiver's* FQN —
-/// only available when the receiver itself is external. An external member
-/// reached transitively through an in-project receiver (`class Derived
-/// extends ArrayList`) has no FQN on hand here, so it gets no lazy-resolve
-/// key at all — the same limitation hover already accepts (see
-/// `hover::member_target`'s doc comment), not a new regression.
+/// Lazy-resolve key for an external member's Javadoc: the receiver's FQN,
+/// only available when the receiver itself is external. A member reached
+/// transitively through an in-project receiver gets no key, matching the
+/// same limitation `hover::member_target` accepts.
 fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> {
     match &resolved.ty {
         ResolvedType::External { fqn, .. } => Some(json!({
@@ -246,7 +245,7 @@ fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> 
             "fqn": fqn,
             "member": member.name,
         })),
-        ResolvedType::InProject(_)
+        ResolvedType::InProject { .. }
         | ResolvedType::Primitive(_)
         | ResolvedType::Void
         | ResolvedType::Null
@@ -254,22 +253,8 @@ fn external_data(member: &ExternalMember, resolved: &Resolved) -> Option<Value> 
     }
 }
 
-/// The `completionItem/resolve` counterpart to [`completion`]'s strictly-lazy
-/// `data` payload: given the JSON a completion item's `data` field carried,
-/// find and render that member's Javadoc through the same markdown pipeline
-/// hover uses (`javadoc` + [`markdown`]). `None` on any missing/unrecognized
-/// key, or when the member no longer resolves (e.g. edited away since the
-/// completion request) — never a panic.
-///
-/// For an `"inproject"` key, `docs` must contain **only the originating
-/// document** (the one the item's `"doc"` index — translated by the server
-/// into a URI — named at completion time). Passing every open document
-/// instead would re-introduce the wrong-doc collision the index/URI exists
-/// to prevent: with two open files declaring same-named types and members,
-/// the simple-name `TypeTable` lookup could silently return the *other*
-/// file's member and attach the wrong Javadoc. When the originating document
-/// is no longer open, pass an empty slice — this resolves to `None` (no
-/// documentation) rather than guessing.
+/// Resolve completion Javadoc from its lazy data key through the hover pipeline.
+/// In-project keys must receive only their originating document, or none if closed.
 pub fn resolve_documentation(
     docs: &[OpenDoc],
     data: &Value,
@@ -279,9 +264,9 @@ pub fn resolve_documentation(
     let member = data.get("member").and_then(Value::as_str);
     let text = match kind {
         "inproject" => {
-            let type_name = data.get("type")?.as_str()?;
+            let binary = data.get("binary")?.as_str()?;
             let table = TypeTable::build(docs, 0);
-            let td = table.get(type_name)?;
+            let td = table.get_named(binary)?;
             let m = table.find_member(td, member?)?;
             javadoc(m.node, m.source)
         }
@@ -310,10 +295,9 @@ fn method_has_params(method: Node) -> bool {
         .unwrap_or(false)
 }
 
-/// Decide a method's insert text. With snippet support: `name()` (zero-arg) or a
-/// `name($1)` tab-stop snippet. Without it: `name()` or `name(` (the editor
-/// leaves the cursor after the paren). `$` is escaped because it is legal in Java
-/// identifiers and is snippet-special.
+/// Decide a method's insert text: with snippet support, `name()` or a
+/// `name($1)` tab-stop; without it, `name()` or `name(`. `$` is escaped
+/// since it's legal in Java identifiers but snippet-special.
 fn apply_method_insert(item: &mut CompletionItem, has_params: bool, snippets: bool) {
     if !has_params {
         item.insert_text = Some(format!("{}()", item.label));
@@ -362,14 +346,17 @@ fn scope_items<'t>(
     // The enclosing type's members (fields + methods + nested types), own and
     // inherited (including from external supertypes), callable unqualified.
     let node = resolve::node_at(doc.tree, cursor);
-    if let Some(td) = resolve::enclosing_typedecl(node, doc.source, ctx.current) {
+    if let Some(td) = resolve::enclosing_typedecl(node, ctx.table, ctx.current) {
         let resolved = Resolved {
-            ty: ResolvedType::InProject(td),
+            ty: ResolvedType::InProject {
+                decl: td,
+                args: Vec::new(),
+            },
             static_only: false,
         };
         for member in resolve::collect_members(&resolved, ctx) {
             push(
-                bucketed(hier_item(&member, &resolved, snippets), 1),
+                bucketed(hier_item(&member, &resolved, ctx, snippets), 1),
                 &mut items,
             );
         }
@@ -380,36 +367,15 @@ fn scope_items<'t>(
         push(bucketed(type_item(decl), 2), &mut items);
     }
 
-    // Classpath/project type names matching the typed prefix, with
-    // auto-import. Open-document types shadow same-named candidates (they
-    // were pushed above; the candidate is skipped entirely so a stale
-    // classpath twin can't appear alongside).
-    //
-    // Every scope-completion result is `is_incomplete` — a deliberate
-    // signal to the client, not the literal LSP-spec meaning. VS Code
-    // treats an `isIncomplete: false` list as "stable, filter it yourself
-    // as I keep typing" and stops re-querying, and the scope candidate set
-    // genuinely changes with the typed prefix in BOTH regimes:
-    //
-    // - below `MIN_TYPE_PREFIX`, classpath/project types are deliberately
-    //   withheld — the word's very first (1-char) request marked complete
-    //   would freeze that classpath-less list for the whole word, which is
-    //   exactly the field-reported failure ("typing `person` only shows
-    //   the variable; forcing a fresh request via delete-and-retype shows
-    //   `Person` and the other classes too");
-    // - at or past it, the candidate list is a prefix-filtered (and
-    //   possibly capped) slice that a longer prefix re-ranks and refills.
-    //
-    // Member and import-path completion stay complete: their item sets
-    // only ever narrow under further typing, so client-side filtering is
-    // correct there.
+    // Add matching project/classpath types, excluding names shadowed by open files.
+    // Keep this list incomplete so clients re-query as the typed prefix changes.
     let is_incomplete = true;
     let prefix = typed_prefix(doc.source, cursor);
     if prefix.len() >= MIN_TYPE_PREFIX {
         let (candidates, _truncated) = ctx.symbols.types_with_prefix(prefix, MAX_CLASSPATH_TYPES);
         let insertion = ImportInsertion::compute(doc, index);
         for c in &candidates {
-            if ctx.table.get(&c.simple).is_some() {
+            if ctx.table.candidates(&c.simple).next().is_some() {
                 continue; // an open document declares this simple name
             }
             match import_status(c, ctx.imports) {

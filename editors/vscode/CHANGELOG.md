@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **Hover on a method call shows the call-site signature.** Generic members
+  render with the receiver's type arguments and any method type arguments
+  inferred from the invocation applied (`Shelter<Dog>.first()` → `Dog
+  first()`, `Objects.requireNonNull(xs)` → `List<String> requireNonNull(
+  List<String>)`), and an overloaded generic call shows the overload that
+  was selected. Javadoc is unchanged. Calls where nothing can be substituted
+  or a type variable stays unbound keep the declaration rendering.
+
+### Fixed
+- **Go to Type Definition follows substituted types.** On a generic call or
+  field (`Shelter<Dog>.first()`, `s.item` with `T item`, a member inherited
+  through `Kennel extends Shelter<Dog>`), a `var` local, or a JDK generic
+  call (`xs.get(0)` on `List<String>`), the jump lands on the resolved type
+  (`Dog`, `String`) instead of reporting no definition for `T`/`var`.
+  Member chains through generic in-project fields (`s.item.bark()`) now
+  resolve for hover and navigation as well.
+- **Nested record-pattern bindings resolve.** Destructuring inside an
+  `instanceof` pattern only bound top-level `Type name` components, so
+  `if (o instanceof Line(Point(int x, int y), Point b))` left `x`, `y` and
+  `b` unresolved and reported spurious "cannot find symbol" errors on every
+  use in the guarded branch. Bindings are now collected at any nesting
+  depth.
+
 ## 0.1.8 — 2026-08-30
 
 ### Added
@@ -44,6 +70,13 @@
 - The status bar item now shows live Java error/warning counts with an
   error/warning background color, and its tooltip reports the server state,
   diagnostic counts, and the JDK in effect.
+
+### Fixed
+- Hover and semantic resolution now preserve inferred generic method results
+  through chained calls and `var` locals. Lambda parameters no longer degrade
+  to `?` after factories such as `Stream.of`, `List.of`, `Map.of`, or
+  `List.copyOf`; bounded wildcard and generic-supertype arguments retain their
+  concrete types.
 
 ## 0.1.7 — 2026-08-25
 

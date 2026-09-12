@@ -241,6 +241,7 @@ name = "jvl-classpath"
 version = "0.1.8"
 dependencies = [
  "cafebabe",
+ "jvl-types",
  "miniz_oxide",
  "roxmltree",
 ]
@@ -275,11 +276,16 @@ dependencies = [
 name = "jvl-syntax"
 version = "0.1.8"
 dependencies = [
+ "jvl-types",
  "ls-types",
  "serde_json",
  "tree-sitter",
  "tree-sitter-java",
 ]
+
+[[package]]
+name = "jvl-types"
+version = "0.1.8"
 
 [[package]]
 name = "lazy_static"

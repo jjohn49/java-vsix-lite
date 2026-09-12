@@ -1,17 +1,5 @@
-//! LSP signature help: at a call site, list the overloads of the invoked
-//! method/constructor and highlight the parameter the cursor is in. Reuses
-//! hover/completion's substrate (bindings, [`TypeTable`], the external
-//! [`SymbolSource`] seam, and `resolve::collect_members`'s hierarchy walk) —
-//! the only new machinery here is finding the *nearest enclosing*
-//! `argument_list` and counting its direct `,` tokens to place the cursor
-//! among the parameters.
-//!
-//! Active-signature heuristic (documented, not "correct" overload
-//! resolution — matching argument *types* is out of scope; see the task
-//! report): the first overload whose arity exceeds the active parameter
-//! index, else the first overload. Cheap and right far more often than not,
-//! since arity alone disambiguates the common case (different overloads take
-//! different numbers of arguments).
+//! Lists call overloads and highlights the active parameter.
+//! The first overload accepting that parameter index becomes active.
 
 use ls_types::{
     Documentation, ParameterInformation, ParameterLabel, Position, SignatureHelp,
@@ -22,7 +10,7 @@ use tree_sitter::{Node, Tree};
 use crate::external::{ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
 use crate::model::{MemberKind, TypeTable};
-use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
+use crate::resolve::{self, render_type_ref, Ctx, FactsCache, HierMember, Resolved, ResolvedType};
 use crate::signature;
 use crate::{node_text, LineIndex, OpenDoc};
 
@@ -40,12 +28,15 @@ pub fn signature_help(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let arg_list = enclosing_argument_list(doc.tree, cursor)?;
@@ -79,9 +70,8 @@ fn arity(sig: &SignatureInformation) -> u32 {
     sig.parameters.as_ref().map_or(0, |p| p.len() as u32)
 }
 
-/// The nearest `argument_list` enclosing `cursor` — an ancestor walk up from
-/// the smallest node there, so a nested call (`outer(inner(x, |), y)`) finds
-/// `inner`'s argument list, not `outer`'s.
+/// Find the innermost argument list containing the cursor.
+/// Direct ancestor traversal handles nested calls.
 fn enclosing_argument_list(tree: &Tree, cursor: usize) -> Option<Node<'_>> {
     let mut node = Some(resolve::node_at(tree, cursor));
     while let Some(n) = node {
@@ -93,10 +83,9 @@ fn enclosing_argument_list(tree: &Tree, cursor: usize) -> Option<Node<'_>> {
     None
 }
 
-/// Count of `,` tokens that are *direct children* of `arg_list` and start
-/// before `cursor`. Direct children only — a comma inside a nested call's own
-/// argument list, a string literal, or a comment isn't a child of *this*
-/// `argument_list` node, so it's never miscounted; no text scanning involved.
+/// Count of `,` tokens that are direct children of `arg_list` before
+/// `cursor`. Direct children only, so commas inside nested calls, string
+/// literals, or comments are never miscounted.
 fn comma_count_before(arg_list: Node, cursor: usize) -> u32 {
     let mut walker = arg_list.walk();
     arg_list
@@ -105,25 +94,20 @@ fn comma_count_before(arg_list: Node, cursor: usize) -> u32 {
         .count() as u32
 }
 
-/// Overloads of a method call: `recv.method(...)` resolves the receiver's
-/// type the same way hover does (`resolve_receiver_type`); an unqualified
-/// `method(...)` resolves against the enclosing type. Every member sharing
-/// the call's name and a `Method` kind is an overload candidate —
-/// `resolve::collect_members` already walks the full in-project/external
-/// hierarchy and dedups by rendered signature, so this just filters its
-/// output by name instead of taking the first match (unlike hover's
-/// `find_member_hier`, signature help wants *every* overload, not one).
+/// Overloads of a method call: resolves the receiver type (or the
+/// enclosing type if unqualified) the same way hover does, then returns
+/// every member matching the call's name and `Method` kind. Unlike hover,
+/// which takes the first match, signature help needs every overload.
 fn method_overloads<'t>(call: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Vec<SignatureInformation>> {
     let name_node = call.child_by_field_name("name")?;
     let name = node_text(name_node, ctx.doc.source);
     let resolved = match call.child_by_field_name("object") {
         Some(object) => resolve::resolve_receiver_type(object, ctx)?,
         None => Resolved {
-            ty: ResolvedType::InProject(resolve::enclosing_typedecl(
-                call,
-                ctx.doc.source,
-                ctx.current,
-            )?),
+            ty: ResolvedType::InProject {
+                decl: resolve::enclosing_typedecl(call, ctx.table, ctx.current)?,
+                args: Vec::new(),
+            },
             static_only: false,
         },
     };
@@ -157,14 +141,9 @@ fn member_signature(member: &HierMember) -> Option<SignatureInformation> {
 }
 
 /// Overloads of a `new Type(...)` call: the created type's declared
-/// constructors, in-project or external — resolving the `type` field the
-/// same way any other receiver-type reference does
-/// (`resolve::resolve_object_creation_type`), so a fully-qualified,
-/// generic (`new ArrayList<String>(...)`), or imported-external type-name
-/// all agree with hover and completion on what `new Foo` refers to.
-/// Constructors are members of the classpath model too
-/// (`ExternalMemberKind::Constructor`), not just an in-project feature,
-/// so `new ArrayList<>(|)` lists the JDK's real overloads.
+/// constructors, in-project or external. External constructors are
+/// classpath members too, so `new ArrayList<>(...)` lists the JDK's real
+/// overloads.
 fn constructor_overloads<'t>(
     call: Node<'t>,
     ctx: &Ctx<'_, 't>,
@@ -175,7 +154,7 @@ fn constructor_overloads<'t>(
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Array { .. } => None,
-        ResolvedType::InProject(td) => {
+        ResolvedType::InProject { decl: td, .. } => {
             let signatures = td
                 .constructors()
                 .into_iter()
@@ -202,14 +181,13 @@ fn constructor_overloads<'t>(
                 .into_iter()
                 .filter(|m| m.kind == ExternalMemberKind::Constructor)
                 .map(|m| {
-                    let label = resolve::display_signature(&m, &args, &type_params);
+                    let arg_strings: Vec<String> = args.iter().map(render_type_ref).collect();
+                    let label = resolve::display_signature(&m, &arg_strings, &type_params);
                     let offsets = external_param_offsets(&label);
-                    // Constructor Javadoc is recovered docsrc-style, by the
-                    // class's simple name (see
-                    // `jvl_classpath::MemberKind::Constructor`) — the same
-                    // first-match-wins lookup hover's external-constructor
-                    // path uses, so all declared overloads share whichever
-                    // constructor's Javadoc the source archive finds first.
+                    // Constructor Javadoc is looked up by the class's simple
+                    // name, first-match-wins (same as hover), so every
+                    // overload shares whichever constructor's doc the
+                    // source archive finds first.
                     let doc = ctx.symbols.doc(&fqn, Some(&simple));
                     build_signature(label, offsets, doc)
                 })
@@ -219,12 +197,10 @@ fn constructor_overloads<'t>(
     }
 }
 
-/// Assemble a `SignatureInformation` from a rendered label, the parameters'
-/// **byte** offsets within it, and optional Javadoc. LSP 3.17 specifies
-/// signature-label offsets in UTF-16 code units — always, independent of the
-/// negotiated `positionEncoding`, which governs `Position`s only — so the
-/// byte offsets both producers compute are converted here, at the single
-/// point where they cross onto the wire type.
+/// Assemble a `SignatureInformation` from a rendered label, byte offsets,
+/// and optional Javadoc. LSP signature-label offsets are always UTF-16
+/// code units regardless of the negotiated `positionEncoding`, so byte
+/// offsets are converted here.
 fn build_signature(
     label: String,
     offsets: Vec<[u32; 2]>,
@@ -250,22 +226,18 @@ fn build_signature(
     }
 }
 
-/// UTF-16 code units preceding byte offset `byte` in `s` (a single-line
-/// label, so no line/column bookkeeping — unlike `LineIndex`, which converts
-/// whole-document `Position`s). `byte` always falls on a char boundary here
-/// (both producers derive offsets from substring extents).
+/// UTF-16 code units preceding byte offset `byte` in `s`. `s` is a
+/// single-line label, so no line/column bookkeeping is needed; `byte`
+/// always falls on a char boundary.
 fn utf16_offset(s: &str, byte: u32) -> u32 {
     s.get(..byte as usize)
         .map_or(byte, |prefix| prefix.encode_utf16().count() as u32)
 }
 
-/// Parameter label **byte** offsets (converted to UTF-16 code units in
-/// [`build_signature`]) parsed out of a rendered external-member signature
-/// string — no parse-tree node backs an external member, only the display
-/// string `SymbolSource` returned, so offsets are recovered by splitting the
-/// parenthesized parameter list on top-level commas (depth tracked over
-/// `()[]<>` so a generic argument's own comma, e.g. `Map<String, Integer> m`,
-/// doesn't split).
+/// Parameter label byte offsets parsed out of a rendered external-member
+/// signature string, since no parse-tree node backs an external member.
+/// Splits the parameter list on top-level commas only, tracking `()[]<>`
+/// depth so a generic argument's own comma doesn't split it.
 fn external_param_offsets(label: &str) -> Vec<[u32; 2]> {
     let Some((open, close)) = signature::param_list_span(label) else {
         return Vec::new();
@@ -292,9 +264,9 @@ fn external_param_offsets(label: &str) -> Vec<[u32; 2]> {
     spans
 }
 
-/// Trim leading/trailing whitespace from `inner[start..end]`, returning the
-/// trimmed extent's absolute byte offsets within the outer label (`base` is
-/// `inner`'s own byte offset in that label).
+/// Trim whitespace from `inner[start..end]`, returning the trimmed
+/// extent's absolute byte offsets in the outer label (`base` is `inner`'s
+/// own offset in that label).
 fn param_span(inner: &str, start: usize, end: usize, base: usize) -> [u32; 2] {
     let seg = &inner[start..end];
     let lead = seg.len() - seg.trim_start().len();
@@ -332,8 +304,10 @@ mod tests {
                         is_static: false,
                         ret_fqn: None,
                         ret_display: None,
+                        metadata: None,
                     })
                     .collect(),
+                metadata: None,
             })
         }
     }
@@ -442,6 +416,7 @@ mod tests {
                             is_static: false,
                             ret_fqn: None,
                             ret_display: None,
+                            metadata: None,
                         },
                         ExternalMember {
                             name: "Widget".to_string(),
@@ -451,8 +426,10 @@ mod tests {
                             is_static: false,
                             ret_fqn: None,
                             ret_display: None,
+                            metadata: None,
                         },
                     ],
+                    metadata: None,
                 })
             }
             fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
@@ -495,10 +472,10 @@ mod tests {
         assert_eq!(help.active_parameter, Some(0));
     }
 
-    /// LSP 3.17 specifies signature-label offsets in UTF-16 code units
-    /// (regardless of the negotiated position encoding, which governs
-    /// `Position`s only). `π` is 2 bytes in UTF-8 but 1 UTF-16 code unit, so
-    /// the second parameter's offsets must land 1 short of its byte offsets.
+    /// LSP signature-label offsets are always UTF-16 code units,
+    /// regardless of position encoding. `π` is 2 UTF-8 bytes but 1 UTF-16
+    /// unit, so the second parameter's offset must land 1 short of its
+    /// byte offset.
     #[test]
     fn param_offsets_are_utf16_code_units() {
         let src = "class C {\n\

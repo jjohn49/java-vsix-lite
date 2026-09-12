@@ -1,22 +1,17 @@
-//! Workspace `.java` files the user hasn't opened, as a [`SymbolSource`]
-//! layer — the fix for "I imported `Person`, it's not open, and I get no
-//! completion for it." Resolves an FQN to a file via [`WorkspaceIndex`],
-//! reads it through `Backend::parsed_project_file`'s existing mtime cache
-//! (no new IO path), and hands the text to `jvl_syntax::class_from_source`.
-//!
-//! [`CombinedSymbols`] composes this ahead of the classpath: a project type
-//! wins over a same-named dependency type, matching how the open-document
-//! `TypeTable` already wins over both (see the call sites in `main.rs`).
+//! Symbols from unopened workspace `.java` files, loaded through
+//! [`WorkspaceIndex`] and the project-file cache. Project types shadow dependencies.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use jvl_syntax::tree_sitter::{Node, Tree};
 use jvl_syntax::{ExternalClass, SymbolSource, TypeCandidate};
 
+use crate::backend::{Backend, Document};
 use crate::workspace_index::WorkspaceIndex;
-use crate::Backend;
 
-/// Split a binary FQN (`demo.Outer$Inner`) into the pieces a
-/// [`WorkspaceIndex`] lookup and [`jvl_syntax::class_from_source`] each want:
-/// the declaring file's package + outer simple name (index lookup key), and
-/// the dotted type-path `class_from_source` walks (`Outer.Inner`).
+/// Splits a binary FQN (`demo.Outer$Inner`) into the declaring file's
+/// package + outer simple name, and the dotted type-path (`Outer.Inner`).
 fn split_project_fqn(fqn: &str) -> Option<(String, String, String)> {
     let (binary_outer, nested) = match fqn.split_once('$') {
         Some((outer, rest)) => (outer, Some(rest)),
@@ -36,24 +31,88 @@ fn split_project_fqn(fqn: &str) -> Option<(String, String, String)> {
     Some((package, outer_simple, type_path))
 }
 
-pub(crate) struct ProjectSymbols<'a>(pub(crate) &'a Backend);
+/// The dotted path text of a `package_declaration` node. Strips the
+/// `package` keyword and `;` textually: this grammar gives the node no
+/// named field for its identifier.
+fn package_declaration_path(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let raw = node.utf8_text(bytes).ok()?;
+    let rest = raw.trim_start().strip_prefix("package")?;
+    Some(rest.trim().trim_end_matches(';').trim().to_string())
+}
 
-impl ProjectSymbols<'_> {
-    fn index(&self) -> &WorkspaceIndex {
-        self.0.workspace_index()
+/// Every top-level type's binary name (`pkg.Outer`) in a parsed document,
+/// used as the open-buffer overlay's lookup key. Only walks the root's
+/// direct children; nested types are reached later via
+/// `split_project_fqn`'s dotted type-path.
+fn top_level_binary_names(text: &str, tree: &Tree) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut package = String::new();
+    let mut names = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for child in tree.root_node().named_children(&mut cursor) {
+        match child.kind() {
+            "package_declaration" => {
+                if let Some(p) = package_declaration_path(child, bytes) {
+                    package = p;
+                }
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => {
+                if let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                {
+                    names.push(fqn_of(&package, name));
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Workspace `.java` files as a [`SymbolSource`] layer, snapshotted once
+/// per request. An open buffer's `overlay` entry shadows its on-disk file;
+/// `memo` caches each FQN so repeated lookups in one request parse once.
+pub(crate) struct ProjectSymbols<'a> {
+    backend: &'a Backend,
+    overlay: HashMap<String, (&'a str, &'a Tree)>,
+    memo: RefCell<HashMap<String, Option<ExternalClass>>>,
+}
+
+impl<'a> ProjectSymbols<'a> {
+    pub(crate) fn new(backend: &'a Backend, docs: &'a HashMap<String, Document>) -> Self {
+        let mut overlay = HashMap::new();
+        for doc in docs.values() {
+            for binary in top_level_binary_names(&doc.text, &doc.tree) {
+                overlay.insert(binary, (doc.text.as_str(), &doc.tree));
+            }
+        }
+        ProjectSymbols {
+            backend,
+            overlay,
+            memo: RefCell::new(HashMap::new()),
+        }
     }
 
-    /// Whether `fqn` resolves to something real, on the classpath or in the
-    /// workspace — the existence check `class_from_source`'s `pick_fqn`
-    /// uses to choose among a name's import candidates without reading (or
-    /// even locating) the candidate's own file.
+    fn index(&self) -> &WorkspaceIndex {
+        self.backend.workspace_index()
+    }
+
+    /// Whether `fqn` resolves to something real, without reading its file.
+    /// Used by `pick_fqn` to choose among import candidates.
     fn exists(&self, fqn: &str) -> bool {
-        if self.0.classpath().class(fqn).is_some() {
+        if self.backend.classpath().class(fqn).is_some() {
             return true;
         }
         match split_project_fqn(fqn) {
             Some((package, outer_simple, _)) => {
-                self.index().find_type(&package, &outer_simple).is_some()
+                let outer_binary = fqn_of(&package, &outer_simple);
+                self.overlay.contains_key(&outer_binary)
+                    || self.index().find_type(&package, &outer_simple).is_some()
             }
             None => false,
         }
@@ -66,11 +125,29 @@ impl ProjectSymbols<'_> {
 
 impl SymbolSource for ProjectSymbols<'_> {
     fn class(&self, fqn: &str) -> Option<ExternalClass> {
-        let (package, outer_simple, type_path) = split_project_fqn(fqn)?;
-        let path = self.index().find_type(&package, &outer_simple)?;
-        let (text, _tree) = self.0.parsed_project_file(&path)?;
-        let pick = |candidates: &[String]| self.pick_fqn(candidates);
-        jvl_syntax::class_from_source(&text, &type_path, &pick)
+        if let Some(hit) = self.memo.borrow().get(fqn) {
+            return hit.clone();
+        }
+        let result = (|| {
+            let (package, outer_simple, type_path) = split_project_fqn(fqn)?;
+            let outer_binary = fqn_of(&package, &outer_simple);
+            let pick = |candidates: &[String]| self.pick_fqn(candidates);
+            if let Some(&(text, tree)) = self.overlay.get(&outer_binary) {
+                let doc = jvl_syntax::OpenDoc { source: text, tree };
+                return jvl_syntax::class_from_doc(&doc, &type_path, &pick);
+            }
+            let path = self.index().find_type(&package, &outer_simple)?;
+            let (text, tree) = self.backend.parsed_project_file(&path)?;
+            let doc = jvl_syntax::OpenDoc {
+                source: text.as_str(),
+                tree: &tree,
+            };
+            jvl_syntax::class_from_doc(&doc, &type_path, &pick)
+        })();
+        self.memo
+            .borrow_mut()
+            .insert(fqn.to_string(), result.clone());
+        result
     }
 
     fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeCandidate>, bool) {
@@ -102,16 +179,12 @@ impl SymbolSource for ProjectSymbols<'_> {
         )
     }
 
-    /// Type or member Javadoc, read straight from the declaring file's own
-    /// source — a project file has no separate archive to consult, the way
-    /// a dependency's `-sources.jar` does; the file *is* the source.
-    /// Single-file only (no supertype walk on a member miss, unlike
-    /// [`crate::ClasspathSymbols::doc`]) — an accepted, documented gap
-    /// rather than a silent one.
+    /// Javadoc from one declaring source file, without walking supertypes.
+    /// Open buffers are handled by the earlier overlay layer.
     fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
         let (package, outer_simple, type_path) = split_project_fqn(fqn)?;
         let path = self.index().find_type(&package, &outer_simple)?;
-        let (text, _tree) = self.0.parsed_project_file(&path)?;
+        let (text, _tree) = self.backend.parsed_project_file(&path)?;
         let inner_simple = type_path.rsplit('.').next().unwrap_or(&type_path);
         jvl_syntax::javadoc_in_source(&text, inner_simple, member)
     }
@@ -126,8 +199,8 @@ fn fqn_of(package: &str, simple: &str) -> String {
 }
 
 /// Composes a project-source layer ahead of a classpath layer: a workspace
-/// type wins over a same-named dependency type, and every lookup falls
-/// through to the classpath when the project doesn't have it.
+/// type wins over a same-named dependency type; lookups otherwise fall
+/// through to the classpath.
 pub(crate) struct CombinedSymbols<P, C>(pub(crate) P, pub(crate) C);
 
 impl<P: SymbolSource, C: SymbolSource> SymbolSource for CombinedSymbols<P, C> {
@@ -143,12 +216,11 @@ impl<P: SymbolSource, C: SymbolSource> SymbolSource for CombinedSymbols<P, C> {
         }
     }
 
-    /// Member docs inherit across the project/classpath boundary — a
-    /// project class overriding a JDK/dependency method (or vice versa)
-    /// shows the supertype's Javadoc when its own layer has none. Each
-    /// layer's own `doc` may walk supers *within* its world
-    /// (`ClasspathSymbols` does); this walk is what carries the lookup
-    /// *between* worlds. Bounded + cycle-guarded.
+    /// Member docs inherit across the project/classpath boundary: an
+    /// overriding class shows the supertype's Javadoc when its own layer
+    /// has none. Each layer's `doc` already walks supers within its own
+    /// world; this carries the lookup between worlds, bounded and
+    /// cycle-guarded.
     fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
         if let Some(direct) = self.0.doc(fqn, member).or_else(|| self.1.doc(fqn, member)) {
             return Some(direct);
@@ -220,6 +292,7 @@ mod tests {
                     supers: supers.iter().map(|s| s.to_string()).collect(),
                     type_params: Vec::new(),
                     members: Vec::new(),
+                    metadata: None,
                 })
         }
         fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {

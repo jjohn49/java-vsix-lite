@@ -1,0 +1,9 @@
+{
+  "name": "jvl-compare-driver",
+  "displayName": "jvl compare driver",
+  "publisher": "jvl-internal",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.84.0" },
+  "main": "./extension.js",
+  "activationEvents": []
+}

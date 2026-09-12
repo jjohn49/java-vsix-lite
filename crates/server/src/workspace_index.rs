@@ -1,52 +1,17 @@
-//! Workspace symbols via a lazy, bounded index of top-level Java types.
-//!
-//! The index is built the first time a `workspace/symbol` request arrives —
-//! never at startup (open-files-first: zero cost until asked for) — and is
-//! kept intentionally shallow:
-//!
-//! - **Discovery** walks only the workspace's source roots (the conventional
-//!   `src/main/java`/`src/test/java`, plus any root inferred from an open
-//!   document's package declaration — see `Backend::source_roots` in
-//!   `main.rs`, reused as-is), using the shared traversal in `fs_scan`
-//!   (`fs_scan::walk_java_files`) — the same walk `references`'s workspace
-//!   prefilter uses, just with a different per-file callback. `target/`,
-//!   `build/`, `.git`, and any hidden (dot-prefixed) directory are skipped.
-//! - **Per file**, the *filename* gives the public type's simple name — by
-//!   Java convention a `.java` file's name matches the type it declares — so
-//!   there is no parse at all. Only the first [`HEADER_BYTES`] of the file
-//!   are read, to plain-line-scan a `package` declaration and best-effort
-//!   sniff the declaration keyword (`class`/`interface`/`enum`/`record`/
-//!   `@interface`) immediately preceding that name.
-//! - **Caps**: at most [`DEFAULT_CAP`] entries; the walk stops early and the
-//!   index is marked [`WorkspaceIndex::truncated`] rather than growing
-//!   without bound.
-//! - **Invalidation** is coarse and cheap: each source root's own (top-level)
-//!   mtime is recorded, and a later `ensure_built` call only re-walks
-//!   everything if some root's mtime no longer matches (a `stat`, not a
-//!   walk). A monotonic generation counter marks each rebuild.
-//! - **Safety**: every path is canonicalized and checked against the
-//!   workspace boundary before being followed or indexed, so a symlink that
-//!   escapes the workspace root is skipped rather than read — see
-//!   `fs_scan::walk_java_files` for the shared symlink-escape and
-//!   symlink-cycle protection this and `references` both rely on.
-//!
-//! Open documents are *not* looked up here — `jvl_syntax::document_symbols`
-//! is always more precise (a real parse) and must shadow whatever the index
-//! says about that same file; see the `symbol` handler in `main.rs`.
+//! Lazy, bounded index of top-level types in unopened workspace files.
+//! It scans filenames and small headers, skips unsafe paths, and lets open documents shadow disk.
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use tower_lsp_server::ls_types::SymbolKind;
 
-/// Hard cap on the number of entries the index will hold. Walking stops as
-/// soon as this many files have been indexed; the index is marked
-/// [`WorkspaceIndex::truncated`] so a caller can tell the user once rather
-/// than silently dropping results in a very large workspace.
+/// Hard cap on index entries; once reached, walking stops and
+/// [`WorkspaceIndex::truncated`] is set so callers can warn the user.
 pub(crate) const DEFAULT_CAP: usize = 5_000;
 
 /// Bytes read from the head of each candidate `.java` file — enough for a
@@ -75,6 +40,14 @@ struct Inner {
     built: bool,
     truncated: bool,
     generation: u64,
+    /// Set by `invalidate()` to force the next `ensure_built` to rebuild
+    /// regardless of `root_mtimes`, since editing a file in place doesn't
+    /// always change its directory's mtime.
+    dirty: bool,
+    /// Bumped by every `invalidate()` call; a rebuild clears `dirty` only
+    /// if this counter didn't change during the walk, so a racing
+    /// invalidation is never lost.
+    dirty_epoch: u64,
 }
 
 /// Lazy, bounded workspace symbol index — see the module docs.
@@ -97,9 +70,7 @@ impl WorkspaceIndex {
         }
     }
 
-    /// Whether the last build stopped early because [`Self::cap`] was
-    /// reached (`self.cap`, i.e. `DEFAULT_CAP` unless constructed via
-    /// [`Self::with_cap`]).
+    /// Whether the last build stopped early because the cap was reached.
     pub(crate) fn truncated(&self) -> bool {
         self.inner
             .lock()
@@ -116,6 +87,15 @@ impl WorkspaceIndex {
             .generation
     }
 
+    /// Force the next [`Self::ensure_built`] call to rebuild regardless of
+    /// root mtimes, since editing a file in place doesn't always change
+    /// its containing directory's mtime.
+    pub(crate) fn invalidate(&self) {
+        let mut inner = self.inner.lock().expect("workspace index poisoned");
+        inner.dirty = true;
+        inner.dirty_epoch += 1;
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.inner
             .lock()
@@ -124,33 +104,27 @@ impl WorkspaceIndex {
             .len()
     }
 
-    /// Build the index if it has never been built, or rebuild it if any
-    /// root's top-level mtime has changed since the last build. A no-op
-    /// (just a handful of `stat`s) on the common case: every query after the
-    /// first, with nothing added/removed directly under a source root.
-    ///
-    /// `boundary`, when given, is the directory paths must stay under
-    /// (canonicalized once here) — anything that canonicalizes outside it,
-    /// including a symlink pointing outside it, is skipped rather than
-    /// followed or read.
-    ///
-    /// Cancellable in practice via tower-lsp's own request-cancellation
-    /// (dropping this future mid-walk): the walk yields to the runtime
-    /// periodically (see [`crate::fs_scan::walk_java_files`]) instead of
-    /// running one uninterrupted synchronous burst, so a dropped future
-    /// actually stops promptly.
+    /// Build lazily or rebuild after invalidation/root changes.
+    /// The bounded, cancellable walk rejects paths outside `boundary`.
     pub(crate) async fn ensure_built(&self, roots: &[PathBuf], boundary: Option<&Path>) {
-        let should_rebuild = {
+        let (should_rebuild, epoch_before) = {
             let inner = self.inner.lock().expect("workspace index poisoned");
-            needs_rebuild(&inner, roots)
+            (needs_rebuild(&inner, roots), inner.dirty_epoch)
         };
         if !should_rebuild {
             return;
         }
 
-        let boundary_canon = boundary.and_then(|b| fs::canonicalize(b).ok());
+        let boundary_canon = match boundary {
+            Some(boundary) => match fs::canonicalize(boundary) {
+                Ok(boundary) => Some(boundary),
+                Err(_) => return,
+            },
+            None => None,
+        };
         let mut entries = Vec::new();
         let mut truncated = false;
+        let mut incomplete = false;
         let mut root_mtimes = HashMap::new();
         for root in roots {
             root_mtimes.insert(root.clone(), root_mtime(root));
@@ -159,19 +133,24 @@ impl WorkspaceIndex {
                 continue; // still record every root's mtime, just stop scanning
             }
             let cap = self.cap;
-            let stopped_early =
-                crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
-                    if entries.len() >= cap {
-                        return false;
-                    }
-                    if let Some(entry) = index_file(path) {
-                        entries.push(entry);
-                    }
-                    true
-                })
-                .await;
-            if stopped_early {
+            let walk = crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
+                if entries.len() >= cap {
+                    return false;
+                }
+                match index_file(path) {
+                    Ok(Some(entry)) => entries.push(entry),
+                    Ok(None) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => incomplete = true,
+                }
+                true
+            })
+            .await;
+            if walk.stopped_early {
                 truncated = true;
+            }
+            if walk.io_errors {
+                incomplete = true;
             }
         }
 
@@ -181,6 +160,8 @@ impl WorkspaceIndex {
         inner.truncated = truncated;
         inner.built = true;
         inner.generation += 1;
+        // Retry after a racing invalidation or incomplete IO.
+        inner.dirty = inner.dirty_epoch != epoch_before || incomplete;
     }
 
     /// Entries whose simple name [`matches_query`] (case-insensitive
@@ -195,12 +176,9 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    /// Every indexed path for an exact simple name — the "simple name ->
-    /// paths" lookup a future add-import feature (and, if it doesn't already
-    /// have one, go-to-definition's unopened-file ladder step) can reuse
-    /// rather than re-walking the workspace itself. `project_symbols`
-    /// needed package-exact lookup instead (see `find_type`), so this
-    /// still has no production caller — only this module's own tests.
+    /// Every indexed path for an exact simple name. Currently used only by
+    /// this module's tests; `find_type` covers the package-exact lookup
+    /// production code needs.
     #[allow(dead_code)]
     pub(crate) fn paths_for_simple_name(&self, name: &str) -> Vec<PathBuf> {
         let inner = self.inner.lock().expect("workspace index poisoned");
@@ -212,24 +190,25 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    /// The file declaring the exact `(package, simple_name)` pair —
-    /// `project_symbols`'s FQN-to-file lookup for closed-file completion.
-    /// The first match wins (two same-named top-level types in the same
-    /// package is invalid Java; ambiguity here just means "one of them").
+    /// The file declaring the exact `(package, simple_name)` pair. Returns
+    /// `None` if more than one file matches — never guess which one the
+    /// caller meant.
     pub(crate) fn find_type(&self, package: &str, simple_name: &str) -> Option<PathBuf> {
         let inner = self.inner.lock().expect("workspace index poisoned");
-        inner
+        let mut matches = inner
             .entries
             .iter()
-            .find(|e| e.package == package && e.simple_name == simple_name)
-            .map(|e| e.path.clone())
+            .filter(|e| e.package == package && e.simple_name == simple_name);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first.path.clone())
     }
 
     /// Entries whose simple name starts with `prefix` (case-insensitive),
-    /// shortest-name-first, capped at `limit`; the bool reports whether the
-    /// cap cut candidates off. The classpath-index counterpart to
-    /// `jvl_classpath::Classpath::types_with_prefix`, so project types
-    /// complete the same way dependency types do.
+    /// shortest-name-first, capped at `limit`; the bool reports whether
+    /// the cap cut candidates off.
     pub(crate) fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<SymbolEntry>, bool) {
         if prefix.is_empty() || limit == 0 {
             return (Vec::new(), false);
@@ -252,11 +231,8 @@ impl WorkspaceIndex {
     }
 
     /// Immediate child packages and top-level types of a dotted package
-    /// (`""` = roots) — the project-source counterpart to
-    /// `jvl_classpath::Classpath::package_children`, for import-path
-    /// completion across project files. Nested types aren't tracked by this
-    /// index (it only records the filename-matching top-level type per
-    /// file), so only top-level types are ever returned here.
+    /// (`""` = roots). Nested types aren't tracked by this index, so only
+    /// top-level types are ever returned.
     pub(crate) fn package_children(&self, package: &str) -> (Vec<String>, Vec<SymbolEntry>) {
         let inner = self.inner.lock().expect("workspace index poisoned");
         let mut subpackages: Vec<String> = Vec::new();
@@ -286,15 +262,14 @@ impl WorkspaceIndex {
     }
 }
 
-/// A source root's own mtime (not recursive — just the directory entry
-/// itself), or `None` if it doesn't exist / can't be stat'd (a root that
-/// isn't there yet, e.g. `src/test/java` in a source-only project).
+/// A source root's own (non-recursive) mtime, or `None` if it doesn't
+/// exist yet (e.g. `src/test/java` in a source-only project).
 fn root_mtime(root: &Path) -> Option<SystemTime> {
     fs::metadata(root).and_then(|m| m.modified()).ok()
 }
 
 fn needs_rebuild(inner: &Inner, roots: &[PathBuf]) -> bool {
-    if !inner.built {
+    if !inner.built || inner.dirty {
         return true;
     }
     if inner.root_mtimes.len() != roots.len() {
@@ -305,33 +280,30 @@ fn needs_rebuild(inner: &Inner, roots: &[PathBuf]) -> bool {
         .any(|root| inner.root_mtimes.get(root).copied() != Some(root_mtime(root)))
 }
 
-/// Index a single `.java` file: simple name from the filename (no parse),
-/// package + kind from at most [`HEADER_BYTES`] of its content.
-fn index_file(path: &Path) -> Option<SymbolEntry> {
-    let simple_name = path.file_stem()?.to_str()?.to_string();
+/// Index a `.java` filename and its package/type keyword from a small header.
+fn index_file(path: &Path) -> io::Result<Option<SymbolEntry>> {
+    let Some(simple_name) = path.file_stem().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
     if simple_name.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut file = fs::File::open(path).ok()?;
+    let mut file = fs::File::open(path)?;
     let mut buf = vec![0u8; HEADER_BYTES];
-    let read = file.read(&mut buf).ok()?;
+    let read = file.read(&mut buf)?;
     buf.truncate(read);
     let header = String::from_utf8_lossy(&buf);
 
-    let package = extract_package(&header).unwrap_or_default();
-    let kind = detect_kind(&header, &simple_name);
-    Some(SymbolEntry {
-        simple_name,
-        package,
+    Ok(Some(SymbolEntry {
+        simple_name: simple_name.to_string(),
+        package: extract_package(&header).unwrap_or_default(),
         path: path.to_path_buf(),
-        kind,
-    })
+        kind: detect_kind(&header, simple_name),
+    }))
 }
 
-/// Plain line scan for a `package a.b.c;` declaration — no parsing, just
-/// enough to strip the keyword, trim, and cut at the `;`. `None` if no such
-/// line appears in `header` (either there truly isn't one, or — for a huge
-/// leading comment — it fell past the header budget).
+/// Plain line scan for a `package a.b.c;` declaration. Returns `None` if
+/// no such line appears in `header` (missing, or past the header budget).
 fn extract_package(header: &str) -> Option<String> {
     for line in header.lines() {
         let trimmed = line.trim_start();
@@ -355,10 +327,7 @@ fn extract_package(header: &str) -> Option<String> {
 }
 
 /// `(keyword, resulting SymbolKind)` pairs scanned for in the header,
-/// mirroring `jvl_syntax::document_symbols`' own declaration -> kind mapping
-/// (`class_declaration`/`record_declaration` -> `CLASS`,
-/// `interface_declaration`/`annotation_type_declaration` -> `INTERFACE`,
-/// `enum_declaration` -> `ENUM`).
+/// mirroring `jvl_syntax::document_symbols`'s declaration -> kind mapping.
 const KIND_KEYWORDS: [(&str, SymbolKind); 5] = [
     ("class", SymbolKind::CLASS),
     ("interface", SymbolKind::INTERFACE),
@@ -367,11 +336,8 @@ const KIND_KEYWORDS: [(&str, SymbolKind); 5] = [
     ("@interface", SymbolKind::INTERFACE),
 ];
 
-/// Best-effort declaration kind: the earliest `keyword simple_name` match in
-/// the header (e.g. `"class Foo"`, `"public interface Foo"` — the match
-/// starts at `interface`, modifiers before it don't matter), defaulting to
-/// `CLASS` if nothing matches (e.g. the package line fell past the header
-/// budget and took the declaration keyword with it).
+/// Best-effort declaration kind: the earliest `keyword simple_name` match
+/// in the header, defaulting to `CLASS` if nothing matches.
 fn detect_kind(header: &str, simple_name: &str) -> SymbolKind {
     let mut best: Option<(usize, SymbolKind)> = None;
     for (keyword, kind) in KIND_KEYWORDS {
@@ -386,20 +352,8 @@ fn detect_kind(header: &str, simple_name: &str) -> SymbolKind {
     best.map(|(_, kind)| kind).unwrap_or(SymbolKind::CLASS)
 }
 
-/// `workspace/symbol` query-matching rule: `candidate` matches `query` if
-/// either
-///
-/// 1. it contains `query` as a case-insensitive substring, or
-/// 2. it **camel-hump prefix matches**: split both strings into "humps" — a
-///    new hump starts at index 0 and at every uppercase letter — then each of
-///    `query`'s humps must be a case-insensitive prefix of *some* hump of
-///    `candidate`, consumed left-to-right without reordering or reuse. E.g.
-///    `"FoBa"` matches `"FooBar"` (`"Fo"` prefixes `"Foo"`, `"Ba"` prefixes
-///    `"Bar"`), as does the shorter `"FB"`; `"BaFo"` does not (wrong order).
-///
-/// An empty `query` matches everything (defensive default; the LSP spec
-/// requires clients send a non-empty query, but nothing stops one from
-/// sending `""`).
+/// Case-insensitive substring or camel-hump match (`FoBa` matches `FooBar`).
+/// Empty queries match every candidate.
 pub(crate) fn matches_query(query: &str, candidate: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -634,9 +588,8 @@ mod tests {
         let root = temp_dir("symlink-sibling");
         write(&root, "real/Foo.java", "class Foo {}\n");
 
-        // A symlink inside the root pointing at another in-boundary
-        // directory: without de-duplication by canonical path, every file
-        // under `real` would be indexed a second time via `alias`.
+        // Without de-duplication by canonical path, `alias` would cause
+        // every file under `real` to be indexed twice.
         std::os::unix::fs::symlink(root.join("real"), root.join("alias"))
             .expect("create in-boundary sibling symlink");
 
@@ -660,11 +613,9 @@ mod tests {
         let root = temp_dir("symlink-cycle");
         write(&root, "src/Foo.java", "class Foo {}\n");
 
-        // A symlink under `src` pointing back at an ancestor (`root`)
-        // creates a cycle: without visited-dir tracking the walk would
-        // re-descend into `src` (and back into the cycle) until the cap
-        // stopped it, filling the index with duplicates and reporting
-        // spurious truncation for what is really a tiny workspace.
+        // Without visited-dir tracking, this symlink cycle would make the
+        // walk re-descend forever, duplicating entries until the cap
+        // falsely reported truncation.
         std::os::unix::fs::symlink(&root, root.join("src/back-to-root"))
             .expect("create ancestor symlink cycle");
 
@@ -707,6 +658,81 @@ mod tests {
         assert_eq!(index.len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `invalidate()` forces a rebuild without an mtime change: a nested
+    /// file the mtime check alone wouldn't notice is picked up
+    /// immediately.
+    #[tokio::test]
+    async fn invalidate_forces_rebuild_without_mtime_change() {
+        let root = temp_dir("explicit-invalidation");
+        let src = root.join("src/main/java");
+        // Only `p/q`'s mtime changes when `New.java` is added, never
+        // `src`'s (the root the mtime check actually watches).
+        std::fs::create_dir_all(src.join("p/q")).expect("create nested dirs");
+
+        let index = WorkspaceIndex::new();
+        built(&index, std::slice::from_ref(&src), &root).await;
+        let first_generation = index.generation();
+        assert_eq!(index.len(), 0);
+
+        std::fs::write(src.join("p/q/New.java"), "package p.q;\nclass New {}\n")
+            .expect("write nested file");
+
+        built(&index, std::slice::from_ref(&src), &root).await;
+        assert_eq!(
+            index.generation(),
+            first_generation,
+            "no invalidation yet: a nested addition must not trigger a rebuild on its own"
+        );
+        assert_eq!(index.len(), 0, "the new nested file must not be found yet");
+
+        index.invalidate();
+        built(&index, std::slice::from_ref(&src), &root).await;
+        assert!(
+            index.generation() > first_generation,
+            "invalidate() must force a rebuild"
+        );
+        assert_eq!(
+            index.len(),
+            1,
+            "the nested file is found only after invalidate()"
+        );
+        assert!(index.find_type("p.q", "New").is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_file_keeps_index_dirty_until_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("retry-read-error");
+        let src = root.join("src");
+        write(&root, "src/Good.java", "class Good {}\n");
+        let blocked = write(&root, "src/Blocked.java", "class Blocked {}\n");
+        let original = fs::metadata(&blocked).expect("metadata").permissions();
+        let mut denied = original.clone();
+        denied.set_mode(0o0);
+        fs::set_permissions(&blocked, denied).expect("remove read permission");
+
+        let index = WorkspaceIndex::new();
+        built(&index, std::slice::from_ref(&src), &root).await;
+        let first_generation = index.generation();
+        assert_eq!(index.len(), 1);
+        assert!(
+            index.inner.lock().expect("workspace index poisoned").dirty,
+            "a read error must leave the index dirty"
+        );
+
+        fs::set_permissions(&blocked, original).expect("restore read permission");
+        built(&index, std::slice::from_ref(&src), &root).await;
+        assert!(index.generation() > first_generation);
+        assert_eq!(index.matching("Blocked").len(), 1);
+        assert!(!index.inner.lock().expect("workspace index poisoned").dirty);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -770,8 +796,8 @@ mod tests {
         assert_eq!(hits.len(), 1, "case-insensitive");
 
         let (hits, truncated) = index.types_with_prefix("S", 1);
-        // "StringUtils" matches; capped at 1 with more available is still
-        // correctly reported even though there's exactly one S-match here.
+        // Only one S-match exists, so capping at 1 must not report
+        // truncation.
         assert_eq!(hits.len(), 1);
         assert!(!truncated);
 

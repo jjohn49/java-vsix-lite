@@ -1,9 +1,7 @@
-//! Code actions — the "Organize Imports" source action and add-import
-//! quick fixes for unresolved type names.
-//!
-//! Both are pure text-edit producers over the open document; the server wraps
-//! each [`ActionSketch`] in an LSP `CodeAction` carrying the document's URI
-//! (this crate never sees URIs, matching the rest of the analysis API).
+//! Code actions: the "Organize Imports" source action and add-import quick
+//! fixes for unresolved type names. Both produce pure text edits over the
+//! open document; the server wraps each edit in an LSP `CodeAction`, adding
+//! the document's URI that this crate never sees.
 
 use std::collections::HashSet;
 
@@ -13,7 +11,7 @@ use crate::completion::ImportInsertion;
 use crate::external::SymbolSource;
 use crate::imports::Imports;
 use crate::model::{named_children, TypeTable};
-use crate::resolve::{self, Ctx};
+use crate::resolve::{self, Ctx, FactsCache};
 use crate::{node_text, LineIndex, OpenDoc};
 
 /// LSP `CodeActionKind` strings this module produces. The server advertises
@@ -56,12 +54,15 @@ pub fn code_actions(
     };
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let mut out = add_import_actions(&ctx, index, range.start);
@@ -98,20 +99,8 @@ impl ImportDecl {
     }
 }
 
-/// The single edit that rewrites the import block into organized form —
-/// unused single imports dropped, duplicates removed, sorted (static block
-/// first, then non-static, each ASCII order) — or `None` when the block is
-/// already organized (or can't be rewritten safely).
-///
-/// Deliberately conservative in two ways:
-/// - "used" means the imported name occurs *anywhere* in the file outside the
-///   import block — including comments, Javadoc `{@link}`s, and strings — so
-///   a doc-only reference never loses its import (slight under-removal, never
-///   over-removal). Wildcard imports are always kept: whether any of their
-///   types are used is unknowable without full resolution.
-/// - if anything other than whitespace sits *between* import declarations
-///   (a comment, say), no edit is offered at all rather than one that would
-///   silently delete it.
+/// Build one safe import-block rewrite: remove unused singles and duplicates,
+/// keep wildcards, and sort statics first. Any non-whitespace between imports aborts.
 fn organize_imports_edit(doc: &OpenDoc, index: &LineIndex) -> Option<TextEdit> {
     let mut decls: Vec<ImportDecl> = Vec::new();
     for child in named_children(doc.tree.root_node()) {
@@ -250,10 +239,9 @@ pub(crate) fn contains_word(hay: &str, word: &str) -> bool {
 
 // --- Add-import quick fix ---
 
-/// "Import 'a.b.C'" fixes for the type-cased identifier at `pos`, when the
-/// name doesn't already resolve (open documents, imports, same package,
-/// wildcards, `java.lang`) and the symbol index knows types with exactly that
-/// simple name.
+/// "Import 'a.b.C'" fixes for the type-cased identifier at `pos`, offered
+/// only when the name doesn't already resolve and the symbol index has a
+/// type with that exact simple name.
 fn add_import_actions(ctx: &Ctx, index: &LineIndex, pos: Position) -> Vec<ActionSketch> {
     let offset = index.offset(pos);
     let Some(node) = identifier_at(ctx.doc, offset) else {
@@ -263,9 +251,8 @@ fn add_import_actions(ctx: &Ctx, index: &LineIndex, pos: Position) -> Vec<Action
     if !crate::looks_like_type_name(word) {
         return Vec::new();
     }
-    // Not inside an import/package declaration, and only the *head* of a
-    // qualified name (in `util.List` the `List` segment is package-relative,
-    // not a simple name an import could bind).
+    // Skip inside import/package declarations, and skip non-head segments of
+    // a qualified name (e.g. `List` in `util.List` can't bind to an import).
     let mut anc = node;
     while let Some(parent) = anc.parent() {
         if matches!(parent.kind(), "import_declaration" | "package_declaration") {
@@ -282,11 +269,9 @@ fn add_import_actions(ctx: &Ctx, index: &LineIndex, pos: Position) -> Vec<Action
             return Vec::new();
         }
     }
-    // Already resolvable → nothing to fix. A same-named single import that
-    // *doesn't* resolve means the import itself is broken (missing
-    // dependency); adding a second `import` of the same simple name would be
-    // invalid Java, so offer nothing there either.
-    if ctx.table.get(word).is_some()
+    // Already resolvable: nothing to fix. A broken single import of the same
+    // name can't be duplicated (invalid Java), so offer nothing there either.
+    if ctx.table.candidates(word).next().is_some()
         || ctx.imports.single_import(word).is_some()
         || resolve::resolve_simple_to_fqn(word, ctx).is_some()
     {
@@ -343,6 +328,7 @@ mod tests {
                     supers: Vec::new(),
                     type_params: Vec::new(),
                     members: Vec::new(),
+                    metadata: None,
                 })
         }
         fn types_with_prefix(&self, prefix: &str, limit: usize) -> (Vec<TypeCandidate>, bool) {

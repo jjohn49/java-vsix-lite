@@ -1,14 +1,7 @@
-//! Minimal parser for JVM generic signatures (JVMS §4.7.9.1).
-//!
-//! It renders types to readable Java, replacing references to the **class's**
-//! formal type parameters with `{0}`, `{1}`, … placeholders, so a caller can
-//! substitute the actual type arguments from a use site (`ArrayList<String>`).
-//! Method-level type parameters and unresolved variables render by name.
-//!
-//! Signature text comes from untrusted `.class` bytes, so every entry point
-//! returns `Option`/`Vec` and never panics: malformed or truncated input
-//! yields `None`/empty rather than a crash, and nested-generic recursion is
-//! depth-capped (see [`MAX_SIG_DEPTH`]) against adversarial class files.
+//! Bounded parser for untrusted JVM generic signatures (JVMS §4.7.9.1).
+//! Malformed input returns `None`/empty; display templates use `{i}` for class parameters.
+
+use crate::{PrimitiveType, TypeId, TypeParameter, TypeRef, TypeVariableId};
 
 /// Recursion cap on nested generic types (`List<List<List<...>>>`, array
 /// nesting, etc.) — bounds stack depth against adversarial `.class` bytes.
@@ -16,24 +9,21 @@ const MAX_SIG_DEPTH: usize = 32;
 
 /// Names of a class signature's formal type parameters, e.g. `["E"]` for
 /// `<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;…`.
-pub(crate) fn class_type_params(sig: &str) -> Vec<String> {
+pub fn class_type_params(sig: &str) -> Vec<String> {
     SigParser::new(sig.as_bytes(), &[]).type_params()
 }
 
-/// A method's own formal type parameters (rendered by name, e.g. `["T"]` for
-/// `<T:Ljava/lang/Object;>…`), its `(return, [param, …])` rendered with `{i}`
-/// placeholders for the class's type parameters. `None` on any parse failure
-/// (caller falls back to the erased descriptor rendering).
-pub(crate) fn method_template(
+/// The method's own type parameters (by name), plus its
+/// `(return, [param, …])` with `{i}` placeholders for the class's type
+/// parameters. `None` on any parse failure.
+pub fn method_template(
     sig: &str,
     class_params: &[String],
 ) -> Option<(Vec<String>, String, Vec<String>)> {
     let mut p = SigParser::new(sig.as_bytes(), class_params);
-    // The method's own formal type parameters render by name, not substituted;
-    // they also SHADOW same-named class type params (legal Java: `class Box<T>
-    // { <T> T foo(T x) }`) — inside this method's signature, `T` means the
-    // method's `T` and must render by name, never as the class's `{i}`
-    // placeholder.
+    // The method's own type parameters render by name, not substituted, and
+    // SHADOW same-named class type parameters (e.g. `class Box<T> { <T> T
+    // foo(T x) }`), so `T` here always means the method's own.
     let method_type_params = p.type_params();
     p.shadow = method_type_params.clone();
     p.expect(b'(')?;
@@ -52,25 +42,13 @@ pub(crate) fn method_template(
 }
 
 /// A field's type rendered with `{i}` placeholders.
-pub(crate) fn field_template(sig: &str, class_params: &[String]) -> Option<String> {
+pub fn field_template(sig: &str, class_params: &[String]) -> Option<String> {
     SigParser::new(sig.as_bytes(), class_params).type_render()
 }
 
-/// The type arguments applied to each entry of a class's `ClassSignature`
-/// (superclass, then superinterfaces, in that order) — index-aligned with
-/// `ClassInfo::supers`, which is built independently from the raw class file's
-/// `super_class`/`interfaces` (always present, Signature-attribute or not).
-///
-/// Each entry's arguments use `{i}` placeholders for `class_params` (the
-/// class's own formal type parameters) where the argument is one of the
-/// class's own type variables — e.g. for `class MyList<T> extends
-/// AbstractList<T>`, the first entry is `["{0}"]`. A non-generic supertype
-/// (or one whose arguments render to nothing) is `[]`.
-///
-/// On any parse failure, returns whatever entries parsed cleanly before the
-/// failure (never panics); the caller should treat a length mismatch against
-/// `supers` as "no extra info" rather than risk misaligning entries.
-pub(crate) fn super_type_args(sig: &str, class_params: &[String]) -> Vec<Vec<String>> {
+/// Parse index-aligned generic arguments for superclass and interfaces.
+/// Malformed tails return the clean prefix; callers reject length mismatches.
+pub fn super_type_args(sig: &str, class_params: &[String]) -> Vec<Vec<String>> {
     let mut p = SigParser::new(sig.as_bytes(), class_params);
     p.skip_type_params();
     let mut out = Vec::new();
@@ -89,18 +67,84 @@ pub(crate) fn super_type_args(sig: &str, class_params: &[String]) -> Vec<Vec<Str
     out
 }
 
+/// `<T:...>` list → structured parameters owned by `owner`.
+pub fn parse_type_params(sig: &str, owner: &str) -> Vec<TypeParameter> {
+    let mut p = SigParser::new(sig.as_bytes(), &[]);
+    p.type_params_structured(owner)
+        .into_iter()
+        .map(|(_, tp)| tp)
+        .collect()
+}
+
+/// Class signature → (own params, structured supertypes: superclass then interfaces).
+pub fn parse_class_signature(sig: &str, owner: &str) -> Option<(Vec<TypeParameter>, Vec<TypeRef>)> {
+    let mut p = SigParser::new(sig.as_bytes(), &[]);
+    let params = p.type_params_structured(owner);
+    p.scope = vec![params.clone()];
+    let mut supers = Vec::new();
+    let mut guard = 0;
+    while p.peek() == Some(b'L') {
+        guard += 1;
+        if guard > 64 {
+            return None;
+        }
+        supers.push(p.type_parse()?);
+    }
+    Some((params.into_iter().map(|(_, tp)| tp).collect(), supers))
+}
+
+/// Method signature → (method params, return, parameter types).
+/// `class_params` pairs each class type parameter with the name it was
+/// declared under, since a `TE;` in this signature carries only a name,
+/// never an index.
+pub fn parse_method_signature(
+    sig: &str,
+    class_params: &[(String, TypeParameter)],
+    owner: &str,
+) -> Option<(Vec<TypeParameter>, TypeRef, Vec<TypeRef>)> {
+    let mut p = SigParser::new(sig.as_bytes(), &[]);
+    let mparams = p.type_params_structured(owner);
+    p.scope = vec![class_params.to_vec(), mparams.clone()];
+    p.expect(b'(')?;
+    let mut params = Vec::new();
+    while p.peek()? != b')' {
+        params.push(p.type_parse()?);
+    }
+    p.expect(b')')?;
+    let ret = if p.peek()? == b'V' {
+        p.bump();
+        TypeRef::Void
+    } else {
+        p.type_parse()?
+    };
+    Some((mparams.into_iter().map(|(_, tp)| tp).collect(), ret, params))
+}
+
+/// A field's structured type. See [`parse_method_signature`] for why
+/// `class_params` must carry names, not just identity.
+pub fn parse_field_signature(
+    sig: &str,
+    class_params: &[(String, TypeParameter)],
+) -> Option<TypeRef> {
+    let mut p = SigParser::new(sig.as_bytes(), &[]);
+    p.scope = vec![class_params.to_vec()];
+    p.type_parse()
+}
+
 struct SigParser<'a> {
     s: &'a [u8],
     pos: usize,
     params: &'a [String],
-    /// Type-parameter names that SHADOW `params` (a method's own formal type
-    /// parameters while rendering that method's signature): a variable
-    /// reference matching one of these renders by name, never as a class
+    /// Type-parameter names that SHADOW `params` (the method's own type
+    /// parameters): a matching variable renders by name, never as a class
     /// `{i}` placeholder.
     shadow: Vec<String>,
     /// Current nested-type recursion depth (bumped/unwound around
     /// [`SigParser::type_render`]) — see [`MAX_SIG_DEPTH`].
     depth: usize,
+    /// Nested type-parameter scopes used by structured parsing, innermost last.
+    /// Display parsing uses `params` and `shadow` instead.
+    scope: Vec<Vec<(String, TypeParameter)>>,
 }
 
 impl<'a> SigParser<'a> {
@@ -111,6 +155,7 @@ impl<'a> SigParser<'a> {
             params,
             shadow: Vec::new(),
             depth: 0,
+            scope: Vec::new(),
         }
     }
 
@@ -216,10 +261,9 @@ impl<'a> SigParser<'a> {
         }
     }
 
-    /// Parse one `ClassTypeSignature` (the `L…;` already consumed by the
-    /// caller): its simple display name and type-argument list. For a nested
-    /// `Outer<T>.Inner<X>` chain, the name/args reflect the innermost segment
-    /// (matching this parser's pre-existing nested-type rendering).
+    /// Parse one `ClassTypeSignature` (`L…;` already consumed by the caller)
+    /// into its simple display name and type-argument list. For a nested
+    /// `Outer<T>.Inner<X>` chain, only the innermost segment is kept.
     fn class_type_parts(&mut self) -> Option<(String, Vec<String>)> {
         let name = self.read_class_name();
         let mut simple_name = simple(&name);
@@ -282,6 +326,138 @@ impl<'a> SigParser<'a> {
             Some(i) => format!("{{{i}}}"),
             None => name.to_string(),
         }
+    }
+
+    /// `<T:...>` list → structured parameters (name, `TypeParameter`) owned
+    /// by `owner`. A bound may reference an earlier parameter in the same
+    /// list, so each parameter is visible to bounds parsed after it.
+    fn type_params_structured(&mut self, owner: &str) -> Vec<(String, TypeParameter)> {
+        let mut out = Vec::new();
+        if self.peek() != Some(b'<') {
+            return out;
+        }
+        self.bump();
+        let mut guard = 0;
+        while let Some(c) = self.peek() {
+            guard += 1;
+            if c == b'>' || guard > 64 {
+                self.bump();
+                break;
+            }
+            let name = self.read_until(b":");
+            let id = TypeVariableId {
+                owner: owner.to_string(),
+                index: out.len(),
+            };
+            // Bounds may refer to earlier params of this same list: push a
+            // provisional scope entry so `TE;` inside a bound resolves.
+            self.scope.push(out.clone());
+            let mut bounds = Vec::new();
+            while self.peek() == Some(b':') {
+                self.bump();
+                if !matches!(self.peek(), Some(b':') | Some(b'>') | None) {
+                    bounds.push(self.type_parse().unwrap_or(TypeRef::Unknown));
+                }
+            }
+            self.scope.pop();
+            out.push((name, TypeParameter { id, bounds }));
+        }
+        out
+    }
+
+    /// Resolve a type-variable name against in-scope parameter lists;
+    /// innermost (e.g. method params) wins over an outer class's same name.
+    fn lookup_var(&self, name: &str) -> TypeRef {
+        for params in self.scope.iter().rev() {
+            if let Some((_, tp)) = params.iter().find(|(n, _)| n == name) {
+                return TypeRef::Variable(tp.id.clone());
+            }
+        }
+        TypeRef::Unknown
+    }
+
+    /// Depth-capped structured twin of [`SigParser::type_render`].
+    fn type_parse(&mut self) -> Option<TypeRef> {
+        self.depth += 1;
+        let r = if self.depth > MAX_SIG_DEPTH {
+            None
+        } else {
+            self.type_parse_inner()
+        };
+        self.depth -= 1;
+        r
+    }
+
+    fn type_parse_inner(&mut self) -> Option<TypeRef> {
+        Some(match self.bump()? {
+            b'B' => TypeRef::Primitive(PrimitiveType::Byte),
+            b'C' => TypeRef::Primitive(PrimitiveType::Char),
+            b'D' => TypeRef::Primitive(PrimitiveType::Double),
+            b'F' => TypeRef::Primitive(PrimitiveType::Float),
+            b'I' => TypeRef::Primitive(PrimitiveType::Int),
+            b'J' => TypeRef::Primitive(PrimitiveType::Long),
+            b'S' => TypeRef::Primitive(PrimitiveType::Short),
+            b'Z' => TypeRef::Primitive(PrimitiveType::Boolean),
+            b'[' => TypeRef::Array(Box::new(self.type_parse()?)),
+            b'T' => {
+                let name = self.read_until(b";");
+                self.expect(b';')?;
+                self.lookup_var(&name)
+            }
+            b'L' => {
+                let mut binary = self.read_until(b"<;.").replace('/', ".");
+                let mut args = self.type_args_structured()?;
+                // Nested `Outer<..>.Inner<..>` → `Outer$Inner`.
+                while self.peek() == Some(b'.') {
+                    self.bump();
+                    binary.push('$');
+                    binary.push_str(&self.read_until(b"<;."));
+                    args = self.type_args_structured()?;
+                }
+                self.expect(b';')?;
+                TypeRef::Named {
+                    id: TypeId::Named(binary),
+                    args,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn type_args_structured(&mut self) -> Option<Vec<TypeRef>> {
+        if self.peek() != Some(b'<') {
+            return Some(Vec::new());
+        }
+        self.expect(b'<')?;
+        let mut args = Vec::new();
+        while self.peek()? != b'>' {
+            args.push(match self.peek()? {
+                b'*' => {
+                    self.bump();
+                    TypeRef::Wildcard {
+                        upper: None,
+                        lower: None,
+                    }
+                }
+                b'+' => {
+                    self.bump();
+                    TypeRef::Wildcard {
+                        upper: Some(Box::new(self.type_parse()?)),
+                        lower: None,
+                    }
+                }
+                b'-' => {
+                    self.bump();
+                    TypeRef::Wildcard {
+                        upper: None,
+                        lower: Some(Box::new(self.type_parse()?)),
+                    }
+                }
+                _ => self.type_parse()?,
+            });
+        }
+        self.expect(b'>')?;
+        Some(args)
     }
 }
 
@@ -401,9 +577,8 @@ mod tests {
 
     #[test]
     fn method_type_param_shadows_class_type_param() {
-        // class Box<T> { <T> T foo(T x) } — legal Java: the method's own T
-        // shadows the class's T, so inside foo's signature `T` must render by
-        // name, never as the class's {0} placeholder.
+        // class Box<T> { <T> T foo(T x) } — the method's own T shadows the
+        // class's T; T must render by name, not as {0}.
         let tp = vec!["T".to_string()];
         assert_eq!(
             method_template("<T:Ljava/lang/Object;>(TT;)TT;", &tp),
@@ -552,6 +727,149 @@ mod tests {
         assert_eq!(
             field_template(&nested, &[]).as_deref(),
             Some("List<List<List<List<List<Integer>>>>>")
+        );
+    }
+
+    // --- structured parsing (`parse_type_params`/`parse_class_signature`/
+    // `parse_method_signature`/`parse_field_signature`) ---
+
+    #[test]
+    fn parse_method_signature_resolves_class_type_variable() {
+        let e = TypeParameter {
+            id: TypeVariableId {
+                owner: "java.util.List".to_string(),
+                index: 0,
+            },
+            bounds: vec![],
+        };
+        let (mparams, ret, params) = parse_method_signature(
+            "(TE;)Ljava/util/List<TE;>;",
+            &[("E".to_string(), e.clone())],
+            "java.util.List",
+        )
+        .expect("parses");
+        assert!(mparams.is_empty());
+        assert_eq!(params, vec![TypeRef::Variable(e.id.clone())]);
+        assert_eq!(
+            ret,
+            TypeRef::Named {
+                id: TypeId::Named("java.util.List".to_string()),
+                args: vec![TypeRef::Variable(e.id)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_method_signature_method_type_param_shadows_class_type_param() {
+        // class Box<T> { <T> T foo(T x) } — the method's own T must win.
+        let class_t = TypeParameter {
+            id: TypeVariableId {
+                owner: "demo.Box".to_string(),
+                index: 0,
+            },
+            bounds: vec![],
+        };
+        let (mparams, ret, params) = parse_method_signature(
+            "<T:Ljava/lang/Object;>(TT;)TT;",
+            &[("T".to_string(), class_t)],
+            "demo.Box#foo()",
+        )
+        .expect("parses");
+        assert_eq!(mparams.len(), 1);
+        let method_var = mparams[0].id.clone();
+        assert_eq!(params, vec![TypeRef::Variable(method_var.clone())]);
+        assert_eq!(ret, TypeRef::Variable(method_var));
+    }
+
+    #[test]
+    fn parse_field_signature_handles_nested_and_dollar_forms() {
+        let k = TypeParameter {
+            id: TypeVariableId {
+                owner: "test.Owner".to_string(),
+                index: 0,
+            },
+            bounds: vec![],
+        };
+        let v = TypeParameter {
+            id: TypeVariableId {
+                owner: "test.Owner".to_string(),
+                index: 1,
+            },
+            bounds: vec![],
+        };
+        let params = vec![("K".to_string(), k.clone()), ("V".to_string(), v.clone())];
+        let dollar =
+            parse_field_signature("Ljava/util/Map$Entry<TK;TV;>;", &params).expect("parses");
+        let dotted = parse_field_signature("Ljava/util/Map<TK;TV;>.Entry<TK;TV;>;", &params)
+            .expect("parses");
+        for ty in [&dollar, &dotted] {
+            match ty {
+                TypeRef::Named { id, args } => {
+                    assert_eq!(id, &TypeId::Named("java.util.Map$Entry".to_string()));
+                    assert_eq!(
+                        args,
+                        &vec![
+                            TypeRef::Variable(k.id.clone()),
+                            TypeRef::Variable(v.id.clone())
+                        ]
+                    );
+                }
+                other => panic!("expected Named, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_field_signature_truncated_returns_none() {
+        assert_eq!(parse_field_signature("Ljava/util/List<TE;", &[]), None);
+    }
+
+    #[test]
+    fn parse_field_signature_hits_depth_cap() {
+        // 40 nested arrays: past MAX_SIG_DEPTH (32).
+        let deep = format!("{}I", "[".repeat(40));
+        assert_eq!(parse_field_signature(&deep, &[]), None);
+    }
+
+    #[test]
+    fn parse_type_params_names_are_display_only() {
+        let params = parse_type_params(
+            "<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;",
+            "demo.MyList",
+        );
+        assert_eq!(
+            params,
+            vec![TypeParameter {
+                id: TypeVariableId {
+                    owner: "demo.MyList".to_string(),
+                    index: 0
+                },
+                bounds: vec![TypeRef::named("java.lang.Object")],
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_class_signature_structured_supertypes() {
+        let (params, supers) = parse_class_signature(
+            "<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;",
+            "demo.MyList",
+        )
+        .expect("parses");
+        assert_eq!(params.len(), 1);
+        let e = params[0].id.clone();
+        assert_eq!(
+            supers,
+            vec![
+                TypeRef::Named {
+                    id: TypeId::Named("java.util.AbstractList".to_string()),
+                    args: vec![TypeRef::Variable(e.clone())]
+                },
+                TypeRef::Named {
+                    id: TypeId::Named("java.util.List".to_string()),
+                    args: vec![TypeRef::Variable(e)]
+                },
+            ]
         );
     }
 }

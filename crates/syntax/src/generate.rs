@@ -47,10 +47,9 @@ pub(crate) fn refactor_actions(
 
 // --- Extract variable / constant ---
 
-/// Expression node kinds worth extracting into a local. Deliberately omits
-/// bare identifiers (extracting `x` into `var y = x` helps no one) and
-/// lambdas/switches (their extraction has context rules this pass doesn't
-/// model).
+/// Expression kinds worth extracting into a local. Omits bare identifiers
+/// and lambdas/switches, whose extraction needs context this pass doesn't
+/// model.
 const EXTRACTABLE: &[&str] = &[
     "binary_expression",
     "method_invocation",
@@ -116,10 +115,9 @@ fn selected_node<'t>(doc: &OpenDoc<'t>, start: usize, end: usize) -> Option<Node
         .filter(|n| n.start_byte() == start && n.end_byte() == end)
 }
 
-/// The statement containing `node` — the ancestor whose parent is a
-/// method/constructor body block — plus that statement's line indentation.
-/// `None` when the statement doesn't start its own line (extraction would
-/// mangle `if (x) stmt;` one-liners) or the node isn't inside a body.
+/// The statement containing `node` (child of a method/constructor body
+/// block), with its line indentation, or `None` if the statement doesn't
+/// start its own line or isn't inside a body.
 fn enclosing_statement<'t>(doc: &OpenDoc<'t>, node: Node<'t>) -> Option<(Node<'t>, String)> {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -143,9 +141,8 @@ fn line_indent(source: &str, at: usize) -> Option<String> {
         .then(|| prefix.to_string())
 }
 
-/// A name for the extracted local: method name with a `get`/`is` prefix
-/// peeled (`getName()` → `name`), a lowercased type name for `new Foo()`,
-/// else `value` — made unique against the enclosing method's text.
+/// A name for the extracted local: peeled getter prefix, lowercased type
+/// name for `new Foo()`, or `value` — made unique in the enclosing method.
 fn variable_name(node: Node, source: &str) -> String {
     let base = match node.kind() {
         "method_invocation" => node
@@ -211,9 +208,8 @@ fn extract_variable(
         return None;
     }
     let (statement, indent) = enclosing_statement(doc, node)?;
-    // The selection must sit inside the statement (not *be* it via some
-    // wrapper) and inside a method-ish body — both guaranteed by
-    // `enclosing_statement` walking from the node itself.
+    // The selection sits inside the statement and inside a method-ish
+    // body — both guaranteed by `enclosing_statement`.
     let scope = enclosing_body_text(doc, node)?;
     let name = unique_in(variable_name(node, doc.source), scope);
 
@@ -293,7 +289,7 @@ fn extract_constant(
     let lit_text = node_text(node, doc.source);
     let ty = literal_type(node.kind(), lit_text)?;
     let class = enclosing_class(node)?;
-    let td = TypeDecl::from_node(class, doc.source, 0)?;
+    let td = TypeDecl::from_node(class, doc.source, 0, None)?;
     let (insert_at, member_indent, wrap) = member_insertion_at_top(doc, &td)?;
     let name = unique_in(
         constant_name(node, doc.source),
@@ -373,10 +369,9 @@ fn selected_statements<'t>(doc: &OpenDoc<'t>, start: usize, end: usize) -> Optio
                 .all(|child| child.start_byte() >= start && child.end_byte() <= end);
         return exact.then_some(statements);
     }
-    // Single statement selected exactly: `descendant_for_byte_range`'s end
-    // is exclusive, so `cover` may be an inner expression (the trailing `;`
-    // is unnamed) — climb to the block-child statement and require the exact
-    // span.
+    // Single statement: `cover` may be an inner expression since the
+    // trailing `;` is unnamed — climb to the block-child statement and
+    // require an exact span.
     let mut statement = cover;
     loop {
         let parent = statement.parent()?;
@@ -490,11 +485,9 @@ fn push_binding<'t>(decl: Node<'t>, source: &'t str, out: &mut Vec<VisibleLocal<
     }
 }
 
-/// Every local/parameter binding visible at `sel_start` inside `callable`:
-/// the callable's formal parameters, declarations in enclosing blocks before
-/// the selection, and variables bound by enclosing `for`/enhanced-`for`/
-/// `catch`/try-resource constructs. Outermost-first, so a nearer binding of
-/// the same name wins on lookup-by-last.
+/// Every local/parameter binding visible at `sel_start` in `callable`:
+/// parameters, enclosing declarations, and for/catch/try-resource bindings,
+/// outermost-first so a nearer same-name binding wins on lookup-by-last.
 fn visible_locals<'t>(
     callable: Node<'t>,
     sel_block: Node<'t>,
@@ -1050,7 +1043,7 @@ fn generate_actions(doc: &OpenDoc, index: &LineIndex, at: usize) -> Vec<ActionSk
     else {
         return Vec::new();
     };
-    let Some(td) = TypeDecl::from_node(node, doc.source, 0) else {
+    let Some(td) = TypeDecl::from_node(node, doc.source, 0, None) else {
         return Vec::new();
     };
     if td.kind != TypeKind::Class {
@@ -1457,8 +1450,8 @@ mod tests {
 
     #[test]
     fn extract_method_single_output_becomes_return_value() {
-        // Verification step 4's exact-text check: two statements, one
-        // output local, parameters in first-use order.
+        // Extracts two statements; the output local becomes the return
+        // value, with parameters ordered by first use.
         let src = "class C {\n\
                    \u{20}   int m(int base) {\n\
                    \u{20}       int doubled = base * 2;\n\

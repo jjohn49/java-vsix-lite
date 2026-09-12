@@ -1,18 +1,5 @@
-//! Syntax-level analysis for the pure-Rust default tier.
-//!
-//! Wraps `tree-sitter-java` for error-tolerant, incremental parsing and turns
-//! the resulting tree into LSP artifacts: syntax diagnostics, document symbols,
-//! folding/selection ranges, and semantic tokens (each over a single document),
-//! plus hover and completion, which additionally resolve types declared in other
-//! open documents (see [`OpenDoc`]). No workspace or JAR/JDK indexing.
-//!
-//! ## Position encoding
-//!
-//! tree-sitter reports **byte** offsets; LSP reports `(line, character)` where
-//! `character` is counted in UTF-16 code units by default, or per the
-//! negotiated `positionEncoding` (LSP 3.17+). [`LineIndex`] converts between the
-//! two for whichever encoding was negotiated, so non-ASCII source (identifiers,
-//! string literals, comments) maps to correct ranges.
+//! IO-free Java syntax analysis over tree-sitter parse trees.
+//! [`LineIndex`] converts byte offsets to negotiated LSP positions.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +15,7 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 /// dependency on a specific tree-sitter version.
 pub use tree_sitter;
 
+mod call;
 mod codeaction;
 mod completion;
 mod definition;
@@ -50,13 +38,15 @@ mod signature;
 mod signature_help;
 mod srcclass;
 mod structural;
+mod typeref;
 
 pub use codeaction::{code_actions, ActionSketch, KIND_ORGANIZE_IMPORTS, KIND_QUICKFIX};
 pub use completion::{completion, resolve_documentation, CompletionResult};
 pub use definition::{definition, locate_type_in_source, type_definition, Definition};
 pub use diagnostics::{
     semantic_diagnostics, CANNOT_FIND_SYMBOL_CODE, INCOMPATIBLE_ASSIGNMENT_CODE,
-    INCOMPATIBLE_RETURN_CODE, UNREACHABLE_CODE,
+    INCOMPATIBLE_RETURN_CODE, INVALID_INSTANTIATION_CODE, INVALID_INVOCATION_CODE,
+    UNREACHABLE_CODE,
 };
 pub use docsrc::{javadoc_in_source, locate_in_source};
 pub use external::{
@@ -72,13 +62,17 @@ pub use implementation::{
     implementation_target, implementations_in_doc, ImplementationHit, ImplementationTarget,
 };
 pub use junit::{discover_tests, TestClass, TestKind, TestMethod};
+pub use jvl_types::{
+    Access, ClassKind, ClassMetadata, MemberMetadata, PrimitiveType, TypeId, TypeParameter,
+    TypeRef, TypeVariableId,
+};
 pub use references::{reference_target, references_in_doc, ReferenceHits, ReferenceTarget, Tier};
 pub use rename::{
     collides_with_existing, is_public_top_level_type, is_valid_new_name, prepare_rename,
     PrepareRename,
 };
 pub use signature_help::signature_help;
-pub use srcclass::class_from_source;
+pub use srcclass::{class_from_doc, declaration_fingerprint};
 pub use structural::structural_diagnostics;
 
 /// A snapshot of one open document the analysis can read: its source text and
@@ -448,11 +442,9 @@ pub struct AppliedEdit {
 }
 
 /// Apply a single ranged content change to `text`, producing the new text and
-/// the matching tree-sitter [`InputEdit`].
-///
-/// tree-sitter [`Point`] columns are **byte** offsets within a line (encoding
-/// independent), so positions are converted through the byte domain. An
-/// inverted or out-of-range range is clamped rather than panicking.
+/// the matching tree-sitter [`InputEdit`]. `Point` columns are byte offsets
+/// within a line; an inverted or out-of-range range is clamped rather than
+/// panicking.
 pub fn apply_content_change(
     text: &str,
     encoding: PositionEncoding,
@@ -547,11 +539,9 @@ fn selection_range_at(tree: &Tree, index: &LineIndex, position: Position) -> Sel
 // [`semantic_token_types`], which the server passes to the client as the legend.
 const TT_TYPE: u32 = 0;
 const TT_METHOD: u32 = 1;
-/// Deliberately no longer emitted — kept in the legend so the other
-/// indices stay stable. Parameters are classified [`TT_VARIABLE`] instead:
-/// several popular themes style the `parameter` semantic token greyed/italic,
-/// which users read as "unused", and the parameter/variable distinction isn't
-/// worth that confusion (user directive).
+/// Deliberately unused: parameters are classified as [`TT_VARIABLE`] instead,
+/// since many themes grey/italic the `parameter` token as if unused. Kept in
+/// the legend so the other indices stay stable.
 #[allow(dead_code)]
 const TT_PARAMETER: u32 = 2;
 const TT_PROPERTY: u32 = 3;
@@ -560,11 +550,9 @@ const TT_ENUM_MEMBER: u32 = 5;
 const TT_DECORATOR: u32 = 6;
 const TT_NAMESPACE: u32 = 7;
 
-/// The semantic-token legend, in index order. Deliberately a focused set: the
-/// cases the built-in TextMate grammar cannot reliably tell apart (type vs
-/// method vs parameter vs field vs package). Keywords/strings/numbers/comments
-/// are left to TextMate, so semantic highlighting *enhances* rather than
-/// replaces it.
+/// The semantic-token legend, in index order: cases the built-in TextMate
+/// grammar can't reliably tell apart (type vs method vs parameter vs field
+/// vs package). Everything else is left to TextMate.
 pub fn semantic_token_types() -> Vec<SemanticTokenType> {
     vec![
         SemanticTokenType::TYPE,
@@ -610,10 +598,9 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
                 emit_named(node, "name", TT_VARIABLE, index, &mut raw)
             }
             "enhanced_for_statement" => emit_named(node, "name", TT_VARIABLE, index, &mut raw),
-            // Java 21 pattern bindings (`case Type name`, record deconstruction
-            // components) — the binding identifier classifies as a variable so
-            // it (and, via `declared_roles`, its uses in the guard/body) get
-            // lit instead of falling to TextMate's default (white) foreground.
+            // Java 21 pattern bindings (`case Type name`, record deconstruction)
+            // light up as variables at declaration and, via `declared_roles`,
+            // at each later use.
             "type_pattern" | "record_pattern_component" => {
                 if let Some(id) = pattern_binding_identifier(node) {
                     emit(id, TT_VARIABLE, index, &mut raw);
@@ -652,12 +639,9 @@ pub fn semantic_tokens(tree: &Tree, source: &str, index: &LineIndex) -> Vec<Sema
                 if let Some(&token_type) = roles.get(text) {
                     emit(node, token_type, index, &mut raw);
                 } else if looks_like_type_name(text) {
-                    // An undeclared, type-cased name (`Math` in
-                    // `Math.abs()`, `Person` in an expression) is a type
-                    // reference by Java convention — without this it
-                    // falls to TextMate's variable color (user report:
-                    // "Math turns light blue"). SCREAMING_CASE constants
-                    // don't match (no lowercase char) and stay untouched.
+                    // An undeclared type-cased name (`Math`, `Person`) is treated
+                    // as a type reference; SCREAMING_CASE constants (no lowercase
+                    // char) stay unclassified.
                     emit(node, TT_TYPE, index, &mut raw);
                 }
             }
@@ -762,12 +746,10 @@ fn is_classified_elsewhere(node: Node) -> bool {
     }
 }
 
-/// Emit tokens for the dotted segments of a `package`/`import` path. A
-/// `package` header's segments are namespaces. An `import`'s segments are
-/// ALL type tokens (user directive: the whole imported path colors
-/// like the class, not just its final segment) — except a static import's
-/// final lowercase segment, which is the imported *member* and gets a
-/// method token.
+/// Emit tokens for the dotted segments of a `package`/`import` path: package
+/// segments are namespaces; import segments are all type tokens (the whole
+/// path colors like the class) except a static import's lowercase member
+/// segment, which gets a method token.
 fn emit_namespace_path(
     node: Node,
     is_import: bool,
@@ -839,12 +821,9 @@ fn emit_named(
 }
 
 /// The binding-name identifier of a Java 21 pattern node (`type_pattern`'s
-/// `String s`, a `record_pattern_component`'s `int x`): its lone child of kind
-/// `identifier`. Neither node exposes a `name` field, and the *type* part is a
-/// `type_identifier`/`generic_type`/`integral_type`/… — never a bare
-/// `identifier` — so the sole `identifier` child is always the binding.
-/// `None` for a component that nests another pattern instead of binding a name
-/// (`case Line(Point(var a, var b), ...)`).
+/// `String s`, a `record_pattern_component`'s `int x`): its lone `identifier`
+/// child, since the type part is never a bare identifier. `None` if the
+/// component nests another pattern instead of binding a name.
 fn pattern_binding_identifier(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     let found = node
@@ -1237,9 +1216,8 @@ mod tests {
         out
     }
 
-    /// Java 21 pattern bindings (`case Type name`, record deconstruction) get a
-    /// variable token at their declaration *and* every use in the guard/body —
-    /// otherwise they fall to TextMate's default (white) foreground.
+    /// Pattern bindings (`case Type name`, record deconstruction) get a
+    /// variable token at their declaration and every later use.
     #[test]
     fn semantic_tokens_light_up_pattern_bindings() {
         let src = "class C {\n\
@@ -1307,9 +1285,8 @@ mod tests {
         );
     }
 
-    /// An undeclared type-cased receiver (`Math.abs()`) is a type
-    /// token, never left for TextMate's variable color; SCREAMING_CASE and
-    /// unknown lowercase names stay unclassified.
+    /// An undeclared type-cased receiver (`Math.abs()`) is a type token;
+    /// SCREAMING_CASE and unknown lowercase names stay unclassified.
     #[test]
     fn semantic_tokens_static_receiver_is_a_type() {
         let src = "class A { void m() { Math.abs(1); use(MAX_LIMIT); } }\n";
@@ -1331,10 +1308,8 @@ mod tests {
         );
     }
 
-    /// Every segment of an import path is a type token (user
-    /// directive: the whole path colors like the class); a static import's
-    /// lowercase member segment is a method token; package headers keep
-    /// namespace tokens.
+    /// Every segment of an import path is a type token, except a static
+    /// import's lowercase member segment, which is a method token.
     #[test]
     fn semantic_tokens_import_paths_are_type_colored() {
         let src = "import java.util.List;\nimport static java.lang.Math.abs;\n";
@@ -1368,3 +1343,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "corpus_tests.rs"]
+mod corpus_tests;

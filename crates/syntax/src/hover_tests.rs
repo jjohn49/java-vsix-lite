@@ -11,6 +11,14 @@ struct OneClass {
 
 impl SymbolSource for OneClass {
     fn class(&self, fqn: &str) -> Option<ExternalClass> {
+        if fqn == "java.lang.String" && fqn != self.fqn {
+            return Some(ExternalClass {
+                supers: Vec::new(),
+                type_params: Vec::new(),
+                members: Vec::new(),
+                metadata: None,
+            });
+        }
         (fqn == self.fqn).then(|| ExternalClass {
             supers: Vec::new(),
             type_params: Vec::new(),
@@ -25,8 +33,10 @@ impl SymbolSource for OneClass {
                     is_static: m.is_static,
                     ret_fqn: m.ret_fqn.clone(),
                     ret_display: m.ret_display.clone(),
+                    metadata: None,
                 })
                 .collect(),
+            metadata: None,
         })
     }
 }
@@ -102,9 +112,8 @@ fn hover_renders_javadoc_tags_as_markdown() {
     assert!(!text.contains("@param"), "raw tag leaked: {text}");
 }
 
-/// An override with no doc of its own — or only `{@inheritDoc}` —
-/// inherits the supertype's Javadoc, at both the call site and the
-/// declaration name.
+/// An override with no doc of its own (or only `{@inheritDoc}`) inherits
+/// the supertype's Javadoc, at both the call site and the declaration.
 #[test]
 fn hover_inherits_javadoc_from_in_project_supertype() {
     let src = "class Base { /** Runs the base behavior. */ void go() {} }\n\
@@ -132,9 +141,8 @@ fn hover_inherits_javadoc_from_in_project_supertype() {
     assert!(!text.contains("Base doc."), "{text}");
 }
 
-/// Hover on an *external* type — in the import line, as a bare
-/// usage, and as a nested class — shows its signature (FQN + type
-/// params) plus the type-level Javadoc.
+/// Hover on an external type (import line, bare usage, nested class) shows
+/// its signature and type-level Javadoc.
 #[test]
 fn hover_on_imported_external_type_shows_signature_and_javadoc() {
     struct Types;
@@ -145,11 +153,13 @@ fn hover_on_imported_external_type_shows_signature_and_javadoc() {
                     supers: Vec::new(),
                     type_params: vec!["E".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "java.util.Map" | "java.util.Map$Entry" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: Vec::new(),
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -197,9 +207,8 @@ fn hover_on_imported_external_type_shows_signature_and_javadoc() {
     assert!(hover_with(src, "Thing;").is_none());
 }
 
-/// The inherited-doc walk crosses into the external world — an
-/// undocumented override of a JDK/dependency method asks the symbol
-/// source for the supertype member's doc.
+/// Inherited-doc lookup also crosses into external types: an undocumented
+/// override asks the symbol source for the supertype member's doc.
 #[test]
 fn hover_inherits_javadoc_from_external_supertype() {
     struct DocSource;
@@ -216,7 +225,9 @@ fn hover_inherits_javadoc_from_external_supertype() {
                     is_static: false,
                     ret_fqn: None,
                     ret_display: None,
+                    metadata: None,
                 }],
+                metadata: None,
             })
         }
         fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
@@ -285,6 +296,74 @@ fn hover_cross_file_member() {
     };
     assert!(m.value.contains("int tick()"), "{}", m.value);
     assert!(m.value.contains("ticks"), "{}", m.value);
+}
+
+/// A call on a parameterized receiver renders the selected overload with the
+/// receiver's class arguments applied, not the declaration's type variable.
+#[test]
+fn hover_on_call_substitutes_receiver_type_arguments() {
+    let src = "class Dog {}\n\
+               class Shelter<T> { /** first one */ T first() { return null; } }\n\
+               class C { void m() { Shelter<Dog> s; s.first(); } }\n";
+    let text = hover_text(src, "first();").expect("hover");
+    assert!(text.contains("Dog first()"), "{text}");
+    assert!(!text.contains("T first()"), "{text}");
+    assert!(text.contains("first one"), "javadoc kept: {text}");
+}
+
+/// Method type variables inferred from the argument are applied to both the
+/// parameter list and the result; source parameter names are preserved.
+#[test]
+fn hover_on_call_substitutes_inferred_method_type_arguments() {
+    let src = "class Dog {}\n\
+               class Util { static <E> E pick(E value, int index) { return value; } }\n\
+               class C { void m() { Util.pick(new Dog(), 0); } }\n";
+    let text = hover_text(src, "pick(new").expect("hover");
+    assert!(
+        text.contains("static Dog pick(Dog value, int index)"),
+        "{text}"
+    );
+}
+
+/// An overloaded call renders the overload that was actually selected.
+#[test]
+fn hover_on_call_renders_selected_overload() {
+    let src = "class Dog {}\n\
+               class Box<T> { T get(int i) { return null; } T get(Dog key) { return null; } }\n\
+               class C { void m() { Box<Dog> b; b.get(new Dog()); } }\n";
+    let text = hover_text(src, "get(new").expect("hover");
+    assert!(text.contains("Dog get(Dog key)"), "{text}");
+    assert!(!text.contains("int i"), "{text}");
+}
+
+/// When a method type variable can't be inferred from the call, the
+/// declaration rendering (with its variable name) is kept rather than `?`.
+#[test]
+fn hover_on_call_with_uninferable_variable_keeps_declaration() {
+    let src = "class Util { static <E> E make() { return null; } }\n\
+               class C { void m() { Util.make(); } }\n";
+    let text = hover_text(src, "make();").expect("hover");
+    assert!(text.contains("E make()"), "{text}");
+}
+
+/// Hover on the declaration name itself is unchanged by contextual rendering.
+#[test]
+fn hover_on_generic_declaration_keeps_type_variable() {
+    let src = "class Shelter<T> { T first() { return null; } }\n";
+    let text = hover_text(src, "first()").expect("hover");
+    assert!(text.contains("T first()"), "{text}");
+}
+
+/// A chain through a generic in-project field resolves via the receiver's
+/// type argument (`Shelter<Dog>.item` is a `Dog`), so the next member hovers.
+#[test]
+fn hover_chains_through_generic_in_project_field() {
+    let src = "class Dog { /** woof */ void bark() {} }\n\
+               class Shelter<T> { T item; }\n\
+               class C { void m() { Shelter<Dog> s; s.item.bark(); } }\n";
+    let text = hover_text(src, "bark();").expect("hover");
+    assert!(text.contains("void bark()"), "{text}");
+    assert!(text.contains("woof"), "{text}");
 }
 
 #[test]
@@ -375,6 +454,7 @@ fn hover_on_external_new_expression_shows_constructor_signature_and_doc() {
                 is_static: false,
                 ret_fqn: None,
                 ret_display: None,
+                metadata: None,
             },
             ExternalMember {
                 name: "Widget".to_string(),
@@ -384,6 +464,7 @@ fn hover_on_external_new_expression_shows_constructor_signature_and_doc() {
                 is_static: false,
                 ret_fqn: None,
                 ret_display: None,
+                metadata: None,
             },
         ],
     };
@@ -411,6 +492,7 @@ fn hover_on_external_new_expression_without_constructors_shows_default_and_class
                 supers: Vec::new(),
                 type_params: Vec::new(),
                 members: Vec::new(),
+                metadata: None,
             })
         }
         fn doc(&self, fqn: &str, member: Option<&str>) -> Option<String> {
@@ -445,6 +527,7 @@ fn hover_on_external_member() {
             is_static: false,
             ret_fqn: None,
             ret_display: None,
+            metadata: None,
         }],
     };
     let tree = tree(src);
@@ -478,9 +561,8 @@ fn hover_text_with(src: &str, marker: &str, symbols: &dyn SymbolSource) -> Optio
     }
 }
 
-/// A `var` local infers its type from the initializer — hovering the
-/// declaration name shows the inferred in-project type, not the literal
-/// `var` keyword.
+/// A `var` local infers its type from the initializer, so hovering it shows
+/// the inferred type, not the literal `var` keyword.
 #[test]
 fn hover_on_var_declaration_shows_inferred_in_project_type() {
     let src = "class Widget {}\n\
@@ -557,4 +639,116 @@ fn hover_on_explicitly_typed_local_is_unchanged() {
                    class C { void m() { Widget w = new Widget(); } }\n";
     let text = hover_text(src, "w = new").expect("hover");
     assert!(text.contains("Widget w"), "{text}");
+}
+
+#[test]
+fn hover_infers_bounded_generic_lambda_parameter() {
+    let src = "interface Filter<T> { boolean test(T value); }\n\
+               abstract class Animal { abstract String name(); }\n\
+               class Shelter<T extends Animal> {\n\
+               void use(Filter<T> filter) {}\n\
+               void find() { use(a -> a.name().isEmpty()); }\n\
+               }\n";
+    let declaration = hover_text(src, "a ->").expect("lambda declaration hover");
+    assert!(declaration.contains("T a"), "{declaration}");
+    let usage = hover_text(src, "a.name").expect("lambda usage hover");
+    assert!(usage.contains("T a"), "{usage}");
+    let member = hover_text(src, "name().is").expect("lambda member hover");
+    assert!(member.contains("String name()"), "{member}");
+}
+
+/// Static generic factories infer their method type variables from argument
+/// types before the returned parameterized receiver is used as a lambda
+/// target. Otherwise `Seq.of(new Animal()).each(a -> …)` degrades to `? a`.
+#[test]
+fn hover_infers_lambda_parameter_through_generic_factory_result() {
+    let src = "interface Action<T> { void accept(T value); }\n\
+               class Animal { String name() { return \"\"; } }\n\
+               class Seq<T> {\n\
+               static <E> Seq<E> of(E value) { return null; }\n\
+               void each(Action<? super T> action) {}\n\
+               }\n\
+               class C { void m() {\n\
+               var animals = Seq.of(new Animal());\n\
+               animals.each(a -> a.name());\n\
+               } }\n";
+    let factory_result = hover_text(src, "animals =").expect("inferred local hover");
+    assert!(
+        factory_result.contains("Seq<Animal> animals"),
+        "{factory_result}"
+    );
+    let parameter = hover_text(src, "a ->").expect("lambda parameter hover");
+    assert!(parameter.contains("Animal a"), "{parameter}");
+}
+
+/// Inference follows the actual argument's generic supertype, rather than
+/// requiring the formal and actual raw names to match exactly.
+#[test]
+fn hover_infers_generic_factory_argument_through_supertype() {
+    let src = "interface Action<T> { void accept(T value); }\n\
+               interface Collection<T> {}\n\
+               class Bag<T> implements Collection<T> {}\n\
+               class Animal { String name() { return \"\"; } }\n\
+               class Seq<T> {\n\
+               static <E> Seq<E> copyOf(Collection<? extends E> values) { return null; }\n\
+               void each(Action<? super T> action) {}\n\
+               }\n\
+               class C { void m() {\n\
+               var animals = Seq.copyOf(new Bag<Animal>());\n\
+               animals.each(a -> a.name());\n\
+               } }\n";
+    let factory_result = hover_text(src, "animals =").expect("inferred local hover");
+    assert!(
+        factory_result.contains("Seq<Animal> animals"),
+        "{factory_result}"
+    );
+    let parameter = hover_text(src, "a ->").expect("lambda parameter hover");
+    assert!(parameter.contains("Animal a"), "{parameter}");
+}
+
+#[test]
+fn hover_resolves_unbound_method_reference_from_variable_target() {
+    let src = "interface Mapper<T, R> { R apply(T value); }\n\
+               abstract class Animal { abstract String name(); }\n\
+               class C { Mapper<Animal, String> mapper = Animal::name; }\n";
+    let text = hover_text(src, "name;").expect("method reference hover");
+    assert!(text.contains("String name()"), "{text}");
+}
+
+#[test]
+fn hover_resolves_bound_and_static_method_references() {
+    let bound = "interface Supplier<T> { T get(); }\n\
+                 class Animal { String name() { return \"\"; } }\n\
+                 class C { Supplier<String> bind(Animal animal) {\n\
+                 return animal::name; } }\n";
+    let text = hover_text(bound, "name;").expect("bound method reference hover");
+    assert!(text.contains("String name()"), "{text}");
+
+    let static_ref = "interface Mapper<T, R> { R apply(T value); }\n\
+                      class C { static String show(int value) { return \"\"; }\n\
+                      Mapper<Integer, String> mapper = C::show; }\n";
+    let text = hover_text(static_ref, "show;").expect("static method reference hover");
+    assert!(text.contains("String show(int)"), "{text}");
+}
+
+/// `X::new` resolves to the selected constructor: hovering the qualifier
+/// shows its signature. Works for a nested class too, whose binary name
+/// (`Outer$Animal`) no file-level import candidate can name.
+#[test]
+fn hover_resolves_constructor_method_reference() {
+    let flat = "package p;\n\
+                interface Factory { Animal make(String name); }\n\
+                class Animal { Animal(String name) {} }\n\
+                class C { Factory f = Animal::new; }\n";
+    let text = hover_text(flat, "Animal::").expect("constructor reference hover");
+    assert!(text.contains("Animal("), "{text}");
+
+    let nested = "package p;\n\
+                  class Outer {\n\
+                  interface Factory { Animal make(String name); }\n\
+                  static class Animal { Animal(String name) {} }\n\
+                  Factory f = Animal::new;\n\
+                  }\n";
+    let text = hover_text(nested, "Animal::").expect("nested constructor reference hover");
+    assert!(text.contains("Animal("), "{text}");
 }

@@ -1,13 +1,5 @@
-//! Signature-level symbols for imported types (JDK + declared dependencies).
-//!
-//! Reads `.class` bytecode out of jmod/jar archives with `cafebabe` to expose,
-//! for a fully-qualified type name, its members and supertypes — **without
-//! running a JVM or any project code**. All archive and bytecode IO is isolated
-//! here; the analysis crate (`jvl-syntax`) stays pure and talks to this through a
-//! trait.
-//!
-//! Lookups are `&self` and cached (archives are immutable), so the server can
-//! share one [`Classpath`] across requests without blocking document parsing.
+//! Cached signature-level symbols from JDK and dependency bytecode.
+//! Reads jmod/jar metadata without running a JVM or project code.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 mod class_info;
-mod generics;
+use jvl_types::jvm_signature as generics;
 mod gradle;
 mod index;
 mod jdk;
@@ -26,9 +18,8 @@ mod zip;
 
 pub use index::TypeEntry;
 use index::TypeIndex;
-/// Re-exported so the server's `javac` locator can fall back to
-/// the same filesystem-probing JDK discovery the classpath layer uses — a
-/// GUI-launched editor has no `$JAVA_HOME`, but the JDK is still findable.
+/// Re-exported so the server's `javac` locator can reuse this crate's
+/// filesystem-probing JDK discovery (a GUI-launched editor has no `$JAVA_HOME`).
 pub use jdk::{best_jdk, jdk_feature_version};
 use zip::ZipArchive;
 
@@ -42,16 +33,15 @@ pub struct ClassInfo {
     /// Formal type-parameter names, e.g. `["E"]` for `ArrayList<E>`.
     pub type_params: Vec<String>,
     pub members: Vec<Member>,
-    /// Type arguments applied to each entry of `supers` (index-aligned:
-    /// superclass, then interfaces, in that order), from the class's own
-    /// `Signature` attribute — e.g. for `class MyList extends
-    /// AbstractList<String>`, `super_type_args[0]` is `["String"]`. An
-    /// argument that is one of *this* class's own type parameters renders as
-    /// a `{i}` placeholder (as in [`Member::template`]), so a caller can
-    /// substitute inherited-member templates through the hierarchy from a
-    /// use-site instantiation. Empty for a non-generic supertype entry, or
-    /// when there's no `Signature` attribute / it fails to parse.
+    /// Type arguments applied to each entry of `supers`, index-aligned
+    /// (superclass then interfaces), from the class's own `Signature`
+    /// attribute. A type parameter of this class renders as a `{i}`
+    /// placeholder so inherited-member templates can be substituted through
+    /// the hierarchy.
     pub super_type_args: Vec<Vec<String>>,
+    /// Structured class metadata (kind, access, hierarchy, type parameters);
+    /// `None` only for test fixtures that don't populate it.
+    pub metadata: Option<jvl_types::ClassMetadata>,
 }
 
 /// One member of a class: a method or field.
@@ -66,27 +56,30 @@ pub struct Member {
     /// e.g. `boolean add({0})`. `None` when the member uses no type variables.
     pub template: Option<String>,
     pub is_static: bool,
-    /// Dotted FQN of the **erased** method return type / field declared
-    /// type, from the descriptor (`Ljava/util/stream/Stream;` →
-    /// `java.util.stream.Stream`) — what a `recv.member().` chain resolves
-    /// through. `None` for primitives, `void`, arrays, and constructors.
+    /// Dotted FQN of the erased return/field type, from the descriptor
+    /// (`Ljava/util/stream/Stream;` → `java.util.stream.Stream`).
+    /// `None` for primitives, `void`, arrays, and constructors.
     pub ret_fqn: Option<String>,
-    /// The method return / field type alone, preferring the generic `{i}`
-    /// template form when a `Signature` attribute supplies one and otherwise
-    /// rendered directly from the descriptor (`String`, `int`, `void`,
-    /// `Object[]`). `None` only for constructors.
+    /// Return/field type as displayed, preferring the generic `{i}` template
+    /// form over the raw descriptor when available. `None` only for
+    /// constructors.
     pub ret_display: Option<String>,
+    /// `true` for a private/package-private member: excluded from completion
+    /// but kept so accessibility checks can still reason about it. Fields
+    /// are still filtered out entirely when non-visible.
+    pub hidden: bool,
+    /// Structured member metadata (declaring class, access, parameter/result
+    /// types, type parameters) — `None` only in tests that don't care about it.
+    pub metadata: Option<jvl_types::MemberMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberKind {
     Method,
     Field,
-    /// An `<init>` method, surfaced as `ClassName(paramTypes)` (see
-    /// `class_info::parse`'s `<init>` handling). `Member::name` is the
-    /// declaring class's simple name — also the docsrc lookup key for
-    /// recovering its Javadoc from a source archive (which has no notion of
-    /// `<init>`, only a constructor declaration named after its class).
+    /// An `<init>` method, surfaced as `ClassName(paramTypes)`.
+    /// `Member::name` is the declaring class's simple name, used as the
+    /// lookup key for its Javadoc in a source archive.
     Constructor,
 }
 
@@ -120,19 +113,15 @@ pub struct Classpath {
     /// local cache, or a resolution bound was hit) — e.g. for surfacing
     /// "IntelliSense partial: N unresolved deps" to the user.
     degraded: Vec<String>,
-    /// Every dependency jar path added via [`Classpath::add_jar`], in
-    /// the order added — a record of what was already resolved, not a new
-    /// resolution path. This is the only external caller of this crate that
-    /// needs real filesystem paths rather than bytecode lookups: the one-shot
-    /// `javac` check command builds its `-cp` argument from these (JDK jmods
-    /// are deliberately excluded — javac's own installation already supplies
-    /// its bootclasspath, and jmods aren't valid `-cp` entries anyway).
+    /// Every dependency jar path added via [`Classpath::add_jar`], in the
+    /// order added. Used to build the one-shot `javac` check's `-cp`
+    /// argument; JDK jmods are excluded since javac supplies its own
+    /// bootclasspath.
     entries: Vec<PathBuf>,
-    /// Lazily-built type-name index over every archive's central
-    /// directory (see [`index`]) — powers classpath type-name completion,
-    /// auto-import, and import-path completion. Built at most once per
-    /// `Classpath`; a rebuild swaps in a whole new `Classpath`, so the index
-    /// can never go stale relative to its archives.
+    /// Lazily-built type-name index over every archive's central directory;
+    /// powers type-name completion, auto-import, and import-path completion.
+    /// Built once per `Classpath` — a rebuild swaps in a whole new
+    /// `Classpath`, so the index never goes stale.
     name_index: OnceLock<TypeIndex>,
 }
 
@@ -178,12 +167,10 @@ impl Classpath {
     }
 
     /// The JDK classpath plus a project's dependency jars, resolved
-    /// **transitively** and statically (Maven `pom.xml` + `~/.m2/repository`
-    /// parent/BOM/exclusion/scope semantics; Gradle build files +
-    /// `libs.versions.toml` scraped, then walked through `~/.gradle/caches`'
-    /// cached POMs) from `root`. No build tool is executed, nothing is ever
-    /// fetched from the network; resolution is bounded (depth/node caps) and
-    /// degrades gracefully — see [`Classpath::degraded`].
+    /// transitively and statically from Maven/Gradle build files and local
+    /// caches. No build tool runs and nothing is fetched from the network;
+    /// resolution is bounded and degrades gracefully (see
+    /// [`Classpath::degraded`]).
     pub fn from_jdk_and_project(root: Option<&Path>) -> Classpath {
         let mut cp = Classpath::from_jdk();
         if let (Some(root), Some(home)) = (root, home_dir()) {
@@ -194,9 +181,8 @@ impl Classpath {
             cp.source_roots.extend(maven.source_roots);
             cp.degraded.extend(maven.degraded);
 
-            // Gradle's cache honors `$GRADLE_USER_HOME` (commonly relocated
-            // outside `$HOME` in CI and governed environments like Foundry),
-            // falling back to `~/.gradle`.
+            // Gradle's cache honors `$GRADLE_USER_HOME`, falling back to
+            // `~/.gradle`.
             let gradle_caches = gradle_user_home()
                 .unwrap_or_else(|| home.join(".gradle"))
                 .join("caches");
@@ -210,9 +196,9 @@ impl Classpath {
         cp
     }
 
-    /// Extra source roots surfaced by multi-module Maven resolution (sibling
-    /// modules' `src/main/java` directories), beyond the project root itself.
-    /// Empty unless `root` was a multi-module Maven reactor.
+    /// Extra source roots from multi-module Maven resolution (sibling
+    /// modules' `src/main/java`), empty unless `root` is a multi-module
+    /// reactor.
     pub fn source_roots(&self) -> &[PathBuf] {
         &self.source_roots
     }
@@ -232,12 +218,9 @@ impl Classpath {
     }
 
     /// [`degraded`](Self::degraded) entries parsed into structured
-    /// coordinates, for the `jvl/missingDependencies` request that backs the
-    /// consent-gated dependency download command. Unparseable entries
-    /// (project-structure problems like an unreadable parent/module pom, or
-    /// a resolver-bound message) are silently dropped — they don't name a
-    /// single fetchable coordinate, so there's nothing actionable to offer.
-    /// See [`parse_degraded_entry`] for exactly which shapes survive.
+    /// coordinates, for the `jvl/missingDependencies` request. Unparseable
+    /// entries are dropped silently; see [`parse_degraded_entry`] for which
+    /// shapes survive.
     pub fn missing_dependencies(&self) -> Vec<DegradedCoordinate> {
         self.degraded
             .iter()
@@ -267,9 +250,8 @@ impl Classpath {
         self.archives.is_empty()
     }
 
-    /// Members + supertypes of a fully-qualified type, or `None` if not on the
-    /// classpath. Binary names (nested types use `$`, e.g. `java.util.Map$Entry`)
-    /// are expected. Cached, including negative results.
+    /// Cached members and supertypes for a binary FQN (`Map$Entry` for nested
+    /// types), or `None` when absent.
     pub fn class(&self, fqn: &str) -> Option<Arc<ClassInfo>> {
         if let Some(hit) = self.cache.read().expect("classpath cache").get(fqn) {
             return hit.clone();
@@ -303,9 +285,8 @@ impl Classpath {
     fn name_index(&self) -> &TypeIndex {
         self.name_index.get_or_init(|| {
             TypeIndex::build(self.archives.iter().flat_map(|archive| {
-                // A jmod's entries live under `classes/` — also the marker
-                // that this archive is JDK-sourced (dependency jars have no
-                // prefix), which scopes the internal-namespace filter.
+                // `classes/` prefix marks a JDK jmod (dependency jars have
+                // none); scopes the internal-namespace filter.
                 let from_jdk = !archive.prefix.is_empty();
                 archive.zip.names().filter_map(move |name| {
                     name.strip_prefix(archive.prefix)
@@ -396,14 +377,8 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// The Java release the project declares it targets, as a feature number
-/// (`21`, `17`, `8` for `1.8`). Read statically from the build files — a
-/// Maven `pom.xml` (`maven.compiler.release` / `maven.compiler.source` /
-/// `java.version`, effective across the parent chain) or, best-effort, a
-/// Gradle `build.gradle(.kts)` (toolchain `languageVersion`,
-/// `JavaVersion.VERSION_*`, or a numeric `sourceCompatibility`). `None` when
-/// undeclared or unreadable — callers then fall back to the JDK's own level.
-/// The build is never executed.
+/// Declared Java feature version from Maven or Gradle files, without running
+/// the build. Returns `None` when missing or unreadable.
 pub fn project_java_release(root: &Path) -> Option<u32> {
     if root.join("pom.xml").is_file() {
         let m2 = home_dir()?.join(".m2/repository");
@@ -419,21 +394,12 @@ pub fn project_java_release(root: &Path) -> Option<u32> {
 /// tree deeper than this is pathological for module discovery.
 const OUTPUT_DIR_WALK_MAX_DEPTH: usize = 8;
 
-/// Bound on directories visited by [`module_output_dirs`] — keeps a
-/// pathological tree from turning candidate discovery into unbounded work
-/// (the same defensive posture as the rest of this crate).
+/// Bound on directories visited by [`module_output_dirs`], keeping a
+/// pathological tree from turning candidate discovery into unbounded work.
 const OUTPUT_DIR_WALK_MAX_DIRS: usize = 4096;
 
-/// Conventional build-output directory *candidates* for every Maven/Gradle
-/// module under `root`: `<module>/target/classes` for a `pom.xml` module,
-/// `<module>/build/classes/java/main` + `<module>/build/resources/main` for a
-/// `build.gradle(.kts)` module. Candidates are returned **without existence
-/// filtering** — the caller decides what "none exist" means (the debugger
-/// treats it as "project not built yet"). A bounded directory walk: hidden
-/// dirs, `target`/`build`/`node_modules`, and symlinks are skipped; depth is
-/// capped at [`OUTPUT_DIR_WALK_MAX_DEPTH`] and visited directories at
-/// [`OUTPUT_DIR_WALK_MAX_DIRS`]. No build execution, no file reads beyond
-/// directory listing.
+/// Bounded Maven/Gradle build-output candidates under `root`, returned
+/// without existence filtering. Skips hidden/build directories and symlinks.
 pub fn module_output_dirs(root: &Path) -> Vec<PathBuf> {
     walk_module_dirs(root, |module, out| {
         if module.join("pom.xml").is_file() {
@@ -446,12 +412,9 @@ pub fn module_output_dirs(root: &Path) -> Vec<PathBuf> {
     })
 }
 
-/// Test-scope counterpart of [`module_output_dirs`]: the conventional
-/// *test* build-output candidates (`<module>/target/test-classes`,
-/// `<module>/build/classes/java/test`, `<module>/build/resources/test`),
-/// returned without existence filtering under the same bounded walk. Used by
-/// the debugger's test-aware launch to put compiled test classes on the
-/// classpath.
+/// Test-scope counterpart of [`module_output_dirs`]: test build-output
+/// candidates (`target/test-classes`, `build/classes/java/test`, etc.),
+/// returned without existence filtering under the same bounded walk.
 pub fn module_test_output_dirs(root: &Path) -> Vec<PathBuf> {
     walk_module_dirs(root, |module, out| {
         if module.join("pom.xml").is_file() {
@@ -506,10 +469,8 @@ fn walk_module_dirs(
     out
 }
 
-/// The Gradle user home — `$GRADLE_USER_HOME` when set to a non-empty path
-/// (Gradle's own override, standard in CI and governed environments where the
-/// cache lives outside `$HOME`), else `~/.gradle`. `None` only when neither is
-/// available.
+/// The Gradle user home: `$GRADLE_USER_HOME` when set to a non-empty path,
+/// else `~/.gradle`. `None` only when neither is available.
 fn gradle_user_home() -> Option<PathBuf> {
     match std::env::var_os("GRADLE_USER_HOME") {
         Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
@@ -526,13 +487,10 @@ pub struct DegradedCoordinate {
     /// `None` only when the version itself couldn't be resolved (always
     /// paired with `reason` in that case — see [`parse_degraded_entry`]).
     pub version: Option<String>,
-    /// `None` means this is a plain "missing from the local cache" record —
-    /// exactly the fetchable case `jvl/missingDependencies` wants: a real
-    /// `g:a:v` that resolution simply couldn't find a pom/jar for. `Some`
-    /// means resolution deliberately declined to pursue it further (an
-    /// unresolvable/dynamic version, an unsupported classifier, a
-    /// depth/node bound) — surfaced so the UI can explain the gap, but never
-    /// auto-downloaded.
+    /// `None` means a real `g:a:v` simply missing from the local cache
+    /// (fetchable). `Some` means resolution deliberately declined to pursue
+    /// it further (unsupported classifier, dynamic version, depth bound) —
+    /// surfaced to explain the gap, but never auto-downloaded.
     pub reason: Option<String>,
 }
 
@@ -544,30 +502,18 @@ impl DegradedCoordinate {
     }
 }
 
-/// A record's coordinate segment is safe to surface if it's non-empty and
-/// contains no whitespace (real Maven coordinate segments never do; this
-/// also happens to reject the free-text messages — "resolution truncated:
-/// node limit (2000) exceeded", "x: parent g:ghost:7.0 unreadable" — that
-/// aren't about a single coordinate at all).
+/// A coordinate segment is safe to surface if it's non-empty and has no
+/// whitespace; this also rejects free-text resolver messages that aren't
+/// about a single coordinate.
 fn is_plain_segment(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(char::is_whitespace)
 }
 
 /// Parse one [`Classpath::degraded`] string into a [`DegradedCoordinate`],
-/// or `None` if it doesn't name a single coordinate at all (a project-
-/// structure problem, or a resolver-bound message — see `resolve.rs` and
-/// `gradle.rs` for every format this must handle). Every format currently
-/// produced:
-///
-/// - `"g:a:v"` — missing pom/jar in the cache: fetchable, no reason.
-/// - `"g:a:v (classifier X unsupported)"` / `"g:a:v (max depth exceeded)"` /
-///   `"g:a:v (dynamic version unsupported)"` — a real coordinate resolution
-///   deliberately didn't pursue: not fetchable, reason explains why.
-/// - `"g:a (unresolved version)"` — no version could be determined at all:
-///   not fetchable (nothing to download), reason explains why.
-/// - anything else (`"module modA (pom unreadable)"`, `"x: parent
-///   g:ghost:7.0 unreadable"`, `"resolution truncated: ..."`) — not about a
-///   single coordinate: `None`.
+/// or `None` if it doesn't name a single coordinate (a project-structure
+/// problem or a resolver-bound message, not a `g:a:v`). A trailing
+/// `(reason)` marks a coordinate resolution deliberately declined to
+/// pursue further.
 pub fn parse_degraded_entry(entry: &str) -> Option<DegradedCoordinate> {
     let (base, reason) = match entry.strip_suffix(')') {
         Some(without_close) => {
@@ -589,9 +535,8 @@ pub fn parse_degraded_entry(entry: &str) -> Option<DegradedCoordinate> {
                 reason,
             })
         }
-        // A bare (no-reason) 2-segment base never occurs in practice, but
-        // requiring `reason.is_some()` here keeps that case from being
-        // misread as some kind of coordinate rather than free text.
+        // A bare 2-segment base never occurs in practice; requiring
+        // `reason.is_some()` avoids misreading it as a coordinate.
         [g, a] if reason.is_some() && is_plain_segment(g) && is_plain_segment(a) => {
             Some(DegradedCoordinate {
                 group: (*g).to_string(),
@@ -680,11 +625,9 @@ mod tests {
         );
     }
 
-    /// Real-JDK proof that chains have what they need — `stream()`
-    /// (declared on `java.util.Collection`; `List` reaches it through the
-    /// supers walk) carries its erased return FQN (+ generic display),
-    /// `String.trim()` its FQN alone (no `Signature` attribute on a
-    /// non-generic method), and `System.out` its field type FQN.
+    /// `stream()` carries its erased return FQN plus generic display,
+    /// `trim()` carries FQN alone (no `Signature` attribute), and
+    /// `System.out` carries its field type FQN.
     #[test]
     fn member_result_types_from_real_jdk() {
         let Some(cp) = jdk() else { return };
@@ -719,9 +662,8 @@ mod tests {
         assert!(cp.package_children("").0.is_empty());
     }
 
-    /// The name index over a real JDK — type-name prefix search finds
-    /// `ArrayList`, package walking sees `java.util`'s children, and
-    /// JDK-internal namespaces never surface.
+    /// Type-name prefix search finds `ArrayList`, package walking sees
+    /// `java.util`'s children, and JDK-internal namespaces never surface.
     #[test]
     fn name_index_from_real_jdk() {
         let Some(cp) = jdk() else { return };
@@ -792,9 +734,8 @@ mod tests {
         out
     }
 
-    /// Dependency jars get full name-index IntelliSense
-    /// — including `com.sun.*` namespaces that the JDK-scoped filter would
-    /// hide if they came from a jmod.
+    /// Dependency jars get full name-index IntelliSense, including
+    /// `com.sun.*` namespaces the JDK-scoped filter would otherwise hide.
     #[test]
     fn dependency_jar_types_are_indexed() {
         let dir = std::env::temp_dir().join(format!("jvl-index-test-{}", std::process::id()));
@@ -828,9 +769,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Real JDK bytecode surfaces `<init>` methods as `Constructor`
-    /// members named after the class, with both a no-arg and a
-    /// parameterized overload present.
+    /// Real JDK bytecode surfaces `<init>` methods as `Constructor` members
+    /// named after the class, with a no-arg and parameterized overload present.
     #[test]
     fn arraylist_exposes_constructors() {
         let Some(cp) = jdk() else { return };
@@ -955,7 +895,8 @@ mod generic_tests {
         let t = |n: &str| {
             al.members
                 .iter()
-                .find(|m| m.name == n)
+                // Skip hidden (private/package) overloads sharing this name.
+                .find(|m| m.name == n && !m.hidden)
                 .and_then(|m| m.template.clone())
         };
         assert_eq!(
@@ -987,11 +928,8 @@ mod generic_tests {
         assert_eq!(put.as_deref(), Some("{1} put({0}, {1})"));
     }
 
-    /// `ArrayList<E>`'s Signature attribute parameterizes its supertypes
-    /// (`AbstractList<E>`, `List<E>`) with ArrayList's own type parameter, and
-    /// leaves its non-generic ones (`RandomAccess`, `Cloneable`,
-    /// `Serializable`) with no extra info — `super_type_args` is index-aligned
-    /// with `supers` (superclass, then interfaces, in declaration order).
+    /// `ArrayList<E>`'s generic supertypes (`AbstractList<E>`, `List<E>`) get
+    /// `{0}` type args; non-generic ones (`RandomAccess`, `Cloneable`) get none.
     #[test]
     fn arraylist_super_type_args_map_e_across_hierarchy() {
         let cp = Classpath::from_jdk();
@@ -1024,11 +962,8 @@ mod generic_tests {
         }
     }
 
-    /// End-to-end proof that `Member::template` + `ClassInfo::type_params`
-    /// carry enough structured information for a caller to substitute a real
-    /// use-site instantiation — mirroring (without depending on) the
-    /// `{i}`-placeholder substitution `crates/syntax`'s hover/completion path
-    /// performs today.
+    /// Proves `Member::template` + `ClassInfo::type_params` carry enough
+    /// structured info to substitute a real use-site instantiation.
     #[test]
     fn template_substitution_end_to_end_list_of_string() {
         let cp = Classpath::from_jdk();
@@ -1050,10 +985,8 @@ mod generic_tests {
         assert_eq!(rendered, "String get(int)");
     }
 
-    /// Minimal `{i}` → argument substitution, standing in for the real
-    /// substitution logic living in `crates/syntax::resolve` (out of scope for
-    /// this crate) — exists only to prove the classpath crate's templates are
-    /// sufficient to perform it.
+    /// Minimal `{i}` → argument substitution, standing in for the real logic
+    /// in `crates/syntax::resolve`, just to prove the templates suffice.
     fn substitute_placeholders(template: &str, args: &[String]) -> String {
         let mut out = template.to_string();
         for (i, arg) in args.iter().enumerate() {
@@ -1062,9 +995,7 @@ mod generic_tests {
         out
     }
 
-    // `parse_degraded_entry` must handle every shape `resolve.rs` and
-    // `gradle.rs` actually produce (see their `degraded.push(...)` call
-    // sites) — one case per distinct format string in this codebase today.
+    // One test per distinct format `resolve.rs`/`gradle.rs` produce.
 
     #[test]
     fn parses_bare_missing_coordinate_as_fetchable() {

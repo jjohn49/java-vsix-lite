@@ -1,24 +1,5 @@
-//! java-vsix-lite language server entry point.
-//!
-//! This is the single LSP server the editor talks to (see the implementation
-//! plan's "Process topology"). The TypeScript extension shell launches this
-//! binary over stdio and stays thin; all analysis lives here and in the
-//! `jvl-*` crates.
-//!
-//! Open Java files are parsed incrementally with tree-sitter and get syntax
-//! diagnostics, document symbols, folding/selection ranges, and semantic
-//! tokens. Hover, completion, navigation, and diagnostics also draw on
-//! closed project source files (via the lazy workspace index and
-//! `project_symbols`) and on JDK/dependency types (via the `jvl-classpath`
-//! crate) — not just what's currently open in the editor. An optional
-//! `javac`-backed check adds real compiler diagnostics, running
-//! automatically on project load and after every save in trusted
-//! workspaces (see `javac`'s module doc comment), plus on demand via a
-//! manual command.
-//!
-//! Invariant: **stdout is reserved for the wire protocol** — LSP by default,
-//! DAP when launched as `jvl-server dap` (the debug adapter subcommand; see
-//! `jvl-debug`). All logging goes to stderr via `tracing`.
+//! java-vsix-lite LSP/DAP server entry point backed by native Java analysis.
+//! Stdout is protocol-only; all logging goes to stderr.
 
 #![forbid(unsafe_code)]
 
@@ -59,19 +40,13 @@ use tower_lsp_server::ls_types::request::{
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{LanguageServer, LspService, Server};
 
-/// The server-internal `executeCommand` id the extension's trust-gated
-/// `java-vsix-lite.downloadDependencies` command forwards to, to trigger an
-/// immediate (non-debounced) classpath rebuild after installing consented-to
-/// dependencies. Deliberately namespaced `jvl.*` and NOT the same id as any
-/// extension-contributed command — see `CHECK_PROJECT_COMMAND`'s doc comment
-/// (in `javac.rs`) for why a collision would break client startup; the
-/// `server_commands_do_not_collide_with_extension_commands` lifecycle test
-/// guards this for every server command, this one included.
+/// Command id for triggering an immediate classpath rebuild after the
+/// extension installs consented-to dependencies. Namespaced `jvl.*` so it
+/// never collides with an extension-contributed command id.
 const REBUILD_CLASSPATH_COMMAND: &str = "jvl.classpath.rebuild";
 
 /// The workspace root as a filesystem path, from the first workspace folder
-/// (falling back to the deprecated `rootUri`). Uses the URI type's own
-/// percent-decoding file-path conversion rather than hand-parsing.
+/// (falling back to the deprecated `rootUri`).
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     let uri = params
         .workspace_folders
@@ -105,12 +80,9 @@ fn derive_project_root(uri: &Uri) -> Option<PathBuf> {
     None
 }
 
-/// Infer a document's source root from its own file path and its `package`
-/// declaration: if the path's parent directories match the package's dotted
-/// segments (walking outward from the file), the root is whatever remains
-/// above them (`root/a/b/C.java` + `package a.b;` ⇒ `root`). `None` for a
-/// non-`file:` URI, a document with no package declaration, or one whose path
-/// doesn't actually match its package (nothing to infer).
+/// Infers a document's source root by stripping its package's dotted segments
+/// off the file path (`root/a/b/C.java` + `package a.b;` ⇒ `root`). `None` if
+/// the URI isn't `file:`, there's no package, or the path doesn't match it.
 pub(crate) fn infer_source_root(uri: &str, tree: &Tree, source: &str) -> Option<PathBuf> {
     let uri: Uri = uri.parse().ok()?;
     let path = uri.to_file_path()?.into_owned();
@@ -145,34 +117,24 @@ fn extract_package(tree: &Tree, source: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-/// An open document's URI (its `HashMap` key) as a filesystem path, or
-/// `None` for a non-`file:` URI (e.g. an in-memory/untitled document) — such
-/// documents simply can't shadow anything in the on-disk workspace index.
+/// An open document's URI (its `HashMap` key) as a filesystem path, or `None`
+/// for a non-`file:` URI (e.g. an in-memory/untitled document).
 fn open_doc_path(uri: &str) -> Option<PathBuf> {
     let uri: Uri = uri.parse().ok()?;
     Some(uri.to_file_path()?.into_owned())
 }
 
-/// The document's own file name (e.g.
-/// `"MavenDemo2.java"`), or `None` for a non-`file:` URI (untitled/in-memory
-/// document) or one whose path doesn't end in `.java`. Derived purely from
-/// the URI — no filesystem access, no workspace/project root needed, so a
-/// lone file with no workspace still gets this check.
+/// Java filename from a `file:` URI, independent of workspace state.
 fn filename_from_uri(uri: &str) -> Option<String> {
     let path = open_doc_path(uri)?;
     let name = path.file_name()?.to_str()?.to_string();
     name.ends_with(".java").then_some(name)
 }
 
-/// Decode the `jvl.checkProject.run` scope from its `executeCommand`
-/// arguments (see [`javac::JavacCheckScope`]).
-///
-/// Backward compatible: no arguments, a `null`/empty first argument, or an
-/// object without a `scope` all mean the whole project (the historical
-/// behavior, and what the manual command sends explicitly as
-/// `{"scope":"project"}`). A `{"scope":"modules","documentUris":[...]}` request
-/// must carry a non-empty string array; a malformed or empty `modules` request
-/// is an `Err` — the caller rejects it rather than compiling the whole project.
+/// Decodes the `jvl.checkProject.run` scope from `executeCommand` arguments.
+/// Missing/empty/no-`scope` arguments default to the whole project; a `modules`
+/// scope must carry a non-empty URI array, or this returns `Err` rather than
+/// silently falling back to compiling everything.
 fn parse_check_scope(
     arguments: &[serde_json::Value],
 ) -> std::result::Result<javac::JavacCheckScope, String> {
@@ -219,11 +181,9 @@ fn fqn_from_jvl_src_uri(uri: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The `unresolvedMemberDiagnostics` flag from `initializationOptions`.
-/// Default-on: the member rule inside `semantic_diagnostics` is conservative
-/// and stays silent whenever resolution is incomplete, so this flag exists
-/// only for a user who wants to opt back out of that rule, not to gate the
-/// always-enabled return checks.
+/// The `unresolvedMemberDiagnostics` flag from `initializationOptions`, default
+/// on. The rule stays silent whenever resolution is incomplete, so this only
+/// lets a user opt back out of it.
 fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
     params
         .initialization_options
@@ -233,12 +193,9 @@ fn unresolved_member_diagnostics_opt(params: &InitializeParams) -> bool {
         .unwrap_or(true)
 }
 
-/// The `unusedDiagnostics` flag from `initializationOptions`. Default-on,
-/// mirroring `unresolvedMemberDiagnostics`: the unused-code rule inside
-/// `semantic_diagnostics` is name-occurrence based and conservative
-/// (shadowing can only cause silence), so this flag exists only for a user
-/// who wants to opt back out of the warnings, not to gate the always-enabled
-/// return/initializer/unreachable checks.
+/// The `unusedDiagnostics` flag from `initializationOptions`, default on. The
+/// rule is name-occurrence based and conservative (shadowing can only cause
+/// silence), so this only lets a user opt back out.
 fn unused_diagnostics_opt(params: &InitializeParams) -> bool {
     params
         .initialization_options
@@ -248,11 +205,9 @@ fn unused_diagnostics_opt(params: &InitializeParams) -> bool {
         .unwrap_or(true)
 }
 
-/// The `classpathDebounceMs` field from `initializationOptions` — the wait
-/// after the last matching build-file change before the classpath
-/// rebuild runs. Defaults to 2000ms; tests override it to a few
-/// milliseconds so the watched-build-file E2E round trip doesn't have to
-/// sleep multiple seconds.
+/// The `classpathDebounceMs` field from `initializationOptions`: how long to
+/// wait after the last matching build-file change before rebuilding. Defaults
+/// to 2000ms.
 fn classpath_debounce_ms_opt(params: &InitializeParams) -> u64 {
     params
         .initialization_options
@@ -288,13 +243,13 @@ fn javac_timeout_secs_opt(params: &InitializeParams) -> u64 {
     javac::clamp_timeout_secs(raw)
 }
 
-/// Whether the client declared dynamic-registration support for
-/// `workspace/didChangeWatchedFiles` — if not, the build-file watch is
-/// simply never registered (graceful fallback; the LSP spec gives servers
-/// no static-capability alternative for this one).
-/// Whether the client can dynamically register type hierarchy — the
-/// only way to enable it, since `ls-types` 0.0.6 has no static
-/// `typeHierarchyProvider` capability field (see `type_hierarchy_dynamic`).
+/// Whether the client supports dynamic registration for
+/// `workspace/didChangeWatchedFiles`; if not, the build-file watch is never
+/// registered.
+///
+/// Whether the client can dynamically register type hierarchy — the only way
+/// to enable it, since `ls-types` 0.0.6 has no static `typeHierarchyProvider`
+/// capability field.
 fn supports_type_hierarchy_registration(params: &InitializeParams) -> bool {
     params
         .capabilities
@@ -315,13 +270,9 @@ fn supports_watched_files_registration(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `uri` names one of the watched build files: `pom.xml`,
-/// `build.gradle`, `build.gradle.kts`, or `gradle/libs.versions.toml`
-/// (matched by filename, and — for the last, since the filename alone isn't
-/// distinctive — its parent directory too). Checked server-side on receipt
-/// as well as registered client-side, so a client that (like a test driving
-/// the notification directly) sends an unrelated event never triggers a
-/// rebuild.
+/// Whether `uri` names a watched build file: `pom.xml`, `build.gradle`,
+/// `build.gradle.kts`, or `gradle/libs.versions.toml`. Checked server-side too,
+/// not just via client registration, so an unrelated event can't trigger a rebuild.
 fn is_classpath_build_file(uri: &Uri) -> bool {
     let Some(path) = uri.to_file_path() else {
         return false;
@@ -339,6 +290,78 @@ fn is_classpath_build_file(uri: &Uri) -> bool {
         }
         _ => false,
     }
+}
+
+impl Backend {
+    /// Apply safe closed-file watch events to caches and the workspace index.
+    /// Recheck all open documents when an accepted declaration may affect them.
+    async fn on_java_source_events(&self, events: Vec<FileEvent>) {
+        let Some(project_root) = self.project_root() else {
+            return;
+        };
+        let Ok(canonical_root) = std::fs::canonicalize(&project_root) else {
+            return;
+        };
+
+        let mut accepted = false;
+        for event in events {
+            let Some(path) = event.uri.to_file_path().map(|p| p.into_owned()) else {
+                continue;
+            };
+            if !path.extension().is_some_and(|e| e == "java") {
+                continue;
+            }
+            let deleted = event.typ == FileChangeType::DELETED;
+            if !accepted_java_source_path(&path, &project_root, &canonical_root, deleted) {
+                continue;
+            }
+            if self.documents.lock().await.contains_key(event.uri.as_str()) {
+                continue; // an open buffer wins over its on-disk copy
+            }
+            self.evict_project_file(&path);
+            self.workspace_index().invalidate();
+            accepted = true;
+        }
+
+        if accepted {
+            self.semantic_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.provider_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.refresh_open_diagnostics(diagnostics::StaleJavac::AllOpen)
+                .await;
+        }
+    }
+}
+
+/// Accept a watched Java path only inside the workspace and outside skipped
+/// directories. Deleted paths validate through their nearest existing ancestor.
+fn accepted_java_source_path(
+    path: &Path,
+    project_root: &Path,
+    canonical_root: &Path,
+    deleted: bool,
+) -> bool {
+    // Use the literal path relative to the literal project root so a symlink
+    // can't hide an excluded component; falling back to the whole path when
+    // unrooted only makes this more conservative, never less.
+    let rel = path.strip_prefix(project_root).unwrap_or(path);
+    if rel.components().any(|c| match c.as_os_str().to_str() {
+        Some(s) => fs_scan::is_excluded_component(s),
+        None => true,
+    }) {
+        return false;
+    }
+
+    let probe: PathBuf = if deleted {
+        match path.ancestors().find(|a| a.exists()) {
+            Some(a) => a.to_path_buf(),
+            None => return false,
+        }
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&probe).is_ok_and(|canon| canon.starts_with(canonical_root))
 }
 
 /// Whether the client supports snippet (`$1` tab-stop) completion inserts.
@@ -421,8 +444,16 @@ impl LanguageServer for Backend {
                 // INCREMENTAL: ranged edits are applied to the cached tree via
                 // tree-sitter `InputEdit`, so reparsing is proportional to the
                 // edit, not the file size.
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        // `didSave` triggers `evict_project_file`, since a save can
+                        // race the project file cache's `(mtime, len)` key. No
+                        // `includeText` needed; `didChange` already keeps text in sync.
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -431,7 +462,6 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
-                // Go-to-implementation.
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 // `prepareRename` support advertised so the client
@@ -441,11 +471,9 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
-                // Add-import quick fixes + "Organize Imports" (VS Code's
-                // shift+alt+O and `source.organizeImports` on save both work
-                // through this), plus extract variable/constant/method,
-                // inline variable, and source-generate actions (accessors,
-                // constructor, equals/hashCode, toString).
+                // Quick fixes (add-import), "Organize Imports", extract
+                // variable/constant/method, inline variable, and source-generate
+                // actions (accessors, constructor, equals/hashCode, toString).
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![
@@ -464,10 +492,8 @@ impl LanguageServer for Backend {
                     // completion is requested explicitly (Ctrl-Space) or by the
                     // editor as the user types.
                     trigger_characters: Some(vec![".".to_string()]),
-                    // Javadoc is fetched lazily, only when the client
-                    // asks via `completionItem/resolve` — never during
-                    // `textDocument/completion` itself. See
-                    // `Backend::completion_resolve`.
+                    // Javadoc is fetched lazily via `completionItem/resolve`,
+                    // never during `textDocument/completion` itself.
                     resolve_provider: Some(true),
                     ..Default::default()
                 }),
@@ -491,15 +517,12 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
-                // Call hierarchy (incoming/outgoing calls). Its type-
-                // hierarchy sibling is registered dynamically in
-                // `initialized` — see `type_hierarchy_dynamic`.
+                // Call hierarchy (incoming/outgoing calls). Type hierarchy is
+                // registered dynamically in `initialized` instead.
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
-                // The one-shot, trust-gated `javac` check command
-                // and the classpath-rebuild command. The extension only
-                // sends either after confirming Workspace Trust; see
-                // `javac`'s module doc comment (and `REBUILD_CLASSPATH_COMMAND`'s)
-                // for the rest of the security invariants.
+                // The trust-gated `javac` check command and the classpath-rebuild
+                // command; the extension sends either only after confirming
+                // Workspace Trust.
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         javac::CHECK_PROJECT_COMMAND.to_string(),
@@ -518,9 +541,8 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "java-vsix-lite server initialized")
             .await;
 
-        // Type hierarchy is registered dynamically, client permitting —
-        // `ls-types` 0.0.6's `ServerCapabilities` cannot advertise it
-        // statically (no `typeHierarchyProvider` field).
+        // Registered dynamically since `ls-types` 0.0.6 has no static
+        // `typeHierarchyProvider` capability field.
         if self.type_hierarchy_dynamic.get().copied().unwrap_or(false) {
             let registration = Registration {
                 id: "jvl-type-hierarchy".to_string(),
@@ -538,16 +560,16 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Watch build files for classpath invalidation, client
-        // permitting. VS Code supports dynamic registration; a client that
-        // doesn't just never gets watched — the LSP spec has no static
-        // alternative for this capability.
+        // Watches build files (classpath invalidation) and `.java` sources
+        // (project-file cache/index invalidation), client permitting; a
+        // client without dynamic registration just never gets watched.
         if self.classpath_watch_dynamic.get().copied().unwrap_or(false) {
             let watchers = [
                 "**/pom.xml",
                 "**/build.gradle",
                 "**/build.gradle.kts",
                 "**/gradle/libs.versions.toml",
+                "**/*.java",
             ]
             .into_iter()
             .map(|pattern| FileSystemWatcher {
@@ -580,9 +602,8 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        // Derive a fallback project root from the first file, in case no
-        // workspace folder was provided. Done before open_document so the
-        // classpath (built lazily there for diagnostics) can see it.
+        // Derive a fallback project root from the first file if no workspace
+        // folder was provided, before open_document builds the classpath.
         if self.workspace_root.get().and_then(|r| r.as_ref()).is_none() {
             let _ = self
                 .project_root_hint
@@ -601,66 +622,95 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         let encoding = self.encoding();
 
-        // Warm the classpath before taking the documents lock — see
-        // `open_document`'s identical call for why: `compute_diagnostics`
-        // below needs it for the unresolved-member pass, and a cold
-        // first-ever build (JDK/project dependency scan) should not run
-        // while other requests are blocked on the documents lock.
+        // Warm the classpath before taking the documents lock: a cold
+        // first build shouldn't block other requests waiting on that lock.
         self.classpath();
 
-        // Apply edits to the cached text + tree under the lock (all synchronous),
-        // reparse, then drop the lock before the async publish.
-        let diagnostics = {
+        // Apply edits under the lock, reparse, and check whether a
+        // declaration changed (`declaration_fingerprint` ignores bodies), so
+        // only a real declaration edit re-checks every open document.
+        let full_refresh = {
             let mut docs = self.documents.lock().await;
-            {
-                let Some(doc) = docs.get_mut(uri.as_str()) else {
-                    return; // change for a document we never opened
-                };
-                doc.version = version;
+            let Some(doc) = docs.get(uri.as_str()) else {
+                return; // change for a document we never opened
+            };
+            let before = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+                source: &doc.text,
+                tree: &doc.tree,
+            });
 
-                let mut from_scratch = false;
-                for change in params.content_changes {
-                    match change.range {
-                        Some(range) => {
-                            let applied = jvl_syntax::apply_content_change(
-                                &doc.text,
-                                encoding,
-                                range,
-                                &change.text,
-                            );
-                            // A full replacement earlier in the batch invalidated
-                            // the tree; skip incremental edits and reparse fresh.
-                            if !from_scratch {
-                                doc.tree.edit(&applied.input_edit);
-                            }
-                            doc.text = applied.new_text;
+            let doc = docs
+                .get_mut(uri.as_str())
+                .expect("presence just confirmed under the same lock hold");
+            doc.version = version;
+
+            let mut from_scratch = false;
+            for change in params.content_changes {
+                match change.range {
+                    Some(range) => {
+                        let applied = jvl_syntax::apply_content_change(
+                            &doc.text,
+                            encoding,
+                            range,
+                            &change.text,
+                        );
+                        // A full replacement earlier in the batch invalidated
+                        // the tree; skip incremental edits and reparse fresh.
+                        if !from_scratch {
+                            doc.tree.edit(&applied.input_edit);
                         }
-                        None => {
-                            doc.text = change.text;
-                            from_scratch = true;
-                        }
+                        doc.text = applied.new_text;
+                    }
+                    None => {
+                        doc.text = change.text;
+                        from_scratch = true;
                     }
                 }
-
-                let old = (!from_scratch).then_some(&doc.tree);
-                doc.tree = self.parse(&doc.text, old);
             }
-            // An edit invalidates any javac diagnostics for this file —
-            // they're stale the instant the source they were computed from
-            // changes. Removed INSIDE the documents critical section, after
-            // the version bump above: the compiler publication paths check
-            // their run's start version and swap the javac map under this
-            // same lock, so an in-flight run can neither observe the
-            // pre-edit version as still current nor re-insert a stale entry
-            // after this removal — and the entry is gone before
-            // `compute_diagnostics` below would merge it.
+
+            let old = (!from_scratch).then_some(&doc.tree);
+            doc.tree = self.parse(&doc.text, old);
+
+            let after = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+                source: &doc.text,
+                tree: &doc.tree,
+            });
+
+            self.semantic_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // An edit stales any javac diagnostics for this file, so remove
+            // them here under the same lock the compiler publication path
+            // uses — this prevents an in-flight run from re-inserting a
+            // stale entry after this removal.
             self.javac_diagnostics
                 .lock()
                 .expect("javac diagnostics poisoned")
                 .remove(uri.as_str());
-            self.compute_diagnostics(&docs, uri.as_str())
+
+            if before != after {
+                self.provider_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            before != after
         };
 
+        if full_refresh {
+            self.refresh_open_diagnostics(diagnostics::StaleJavac::AllOpen)
+                .await;
+            return;
+        }
+
+        // Fast path: only this document's own diagnostics can have changed.
+        // Never calls `ensure_workspace_index` — this is the per-keystroke
+        // hot path.
+        let diagnostics = {
+            let docs = self.documents.lock().await;
+            let symbols = CombinedSymbols(
+                ProjectSymbols::new(self, &docs),
+                ClasspathSymbols(self.classpath()),
+            );
+            self.compute_diagnostics(&docs, uri.as_str(), &symbols)
+        };
         self.client
             .publish_diagnostics(uri, diagnostics, Some(version))
             .await;
@@ -669,27 +719,43 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.lock().await.remove(uri.as_str());
-        // Clear diagnostics for the closed file.
+        self.semantic_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.provider_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.client.publish_diagnostics(uri, vec![], None).await;
+        // Closing can change what OTHER open files resolve: a type this
+        // buffer shadowed now falls through to its on-disk copy, or to nothing.
+        self.refresh_open_diagnostics(diagnostics::StaleJavac::AllOpen)
+            .await;
     }
 
-    /// A watched build file changed. Events that don't actually name
-    /// one of the watched build files (`is_classpath_build_file`) are
-    /// ignored outright — no log message, no coalescer state touched — so
-    /// an unrelated file's change never triggers a rebuild (verified
-    /// end to end via log absence, since a test drives this notification
-    /// directly rather than through a real filesystem watcher).
-    ///
-    /// A matching event either elects this call as the debounce/rebuild
-    /// driver (`RebuildCoalescer::on_event` returning `true`, in which case
-    /// it runs `drive_classpath_rebuild` to completion) or folds into
-    /// whichever call already is.
+    /// Evicts the saved file from the project-file cache outright, since a
+    /// same-size in-place rewrite can race the cache's `(mtime, len)`
+    /// freshness key. No republish here — the open buffer's own diagnostics
+    /// already reflect its live text; only other files' resolution of it
+    /// could differ, and `did_change` already handles that.
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if let Some(path) = params.text_document.uri.to_file_path() {
+            self.evict_project_file(&path);
+        }
+        self.semantic_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Route Java source events separately, then coalesce matching build-file
+    /// changes into one classpath rebuild driver.
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        if !params
+        let (java, build): (Vec<FileEvent>, Vec<FileEvent>) = params
             .changes
-            .iter()
-            .any(|c| is_classpath_build_file(&c.uri))
-        {
+            .into_iter()
+            .partition(|c| c.uri.as_str().ends_with(".java"));
+
+        if !java.is_empty() {
+            self.on_java_source_events(java).await;
+        }
+
+        if !build.iter().any(|c| is_classpath_build_file(&c.uri)) {
             return;
         }
         let become_driver = {
@@ -704,14 +770,8 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// `workspace/executeCommand` — `javac::CHECK_PROJECT_COMMAND`
-    /// or `REBUILD_CLASSPATH_COMMAND`. One-shot per invocation; the extension
-    /// only sends either after confirming Workspace Trust (the server itself
-    /// has no notion of that and just does what it's told — see `javac`'s
-    /// module doc comment). The extension additionally sends the javac
-    /// check on project load and after Java file saves (debounced, still
-    /// trust-gated, opt-out via `javac.checkOnSave`) — the single-flight
-    /// guard below is what makes that safe against overlapping runs.
+    /// Execute classpath rebuilds or javac checks requested by the trusted
+    /// extension. The single-flight guard prevents overlapping javac runs.
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -762,19 +822,8 @@ impl LanguageServer for Backend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
-    /// `workspace/symbol` over the lazy, bounded workspace index (see
-    /// `workspace_index`), built here on the first request. Query matching
-    /// is case-insensitive substring or camel-hump prefix (see
-    /// `workspace_index::matches_query`). Open documents are looked up live
-    /// via `jvl_syntax::document_symbols` (a real parse, so more precise)
-    /// and shadow whatever the index says about that same file, rather than
-    /// being merged with it.
-    ///
-    /// Locations for entries the index found on disk (i.e. never opened)
-    /// use a zero-length range at 0:0 — resolving the exact name range would
-    /// require parsing the file, which is exactly what the index avoids;
-    /// VS Code jumps to the top of the file, and opening it makes precise,
-    /// live symbols (and later queries) reflect the real position.
+    /// Query the lazy workspace index, with open documents shadowing disk.
+    /// Disk-only symbols use a zero-length range to avoid parsing each file.
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
@@ -822,11 +871,9 @@ impl LanguageServer for Backend {
                 continue;
             };
             let index = LineIndex::new(&doc.text, self.encoding());
-            // Only the top-level Vec entries are top-level type
-            // declarations (Java allows only types at a file's root); each
-            // one's own children (methods/fields/nested types) are
-            // intentionally not flattened in here, matching the on-disk
-            // index's top-level-types-only scope.
+            // Only top-level Vec entries are top-level type declarations;
+            // their children aren't flattened here, matching the on-disk
+            // index's top-level-only scope.
             for symbol in jvl_syntax::document_symbols(&doc.tree, &doc.text, &index) {
                 if !workspace_index::matches_query(&query, &symbol.name) {
                     continue;
@@ -921,7 +968,10 @@ impl LanguageServer for Backend {
         // (for cross-file types). All synchronous — no await held.
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         Ok(jvl_syntax::hover(&open, 0, &index, position, &symbols))
     }
 
@@ -937,7 +987,10 @@ impl LanguageServer for Backend {
         // document, for cross-file overload resolution. All synchronous.
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         Ok(jvl_syntax::signature_help(
             &open, 0, &index, position, &symbols,
         ))
@@ -948,16 +1001,17 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let docs = self.documents.lock().await;
-        // `open_docs_and_uris` (not plain `open_docs`) because in-project
-        // items' lazy-resolve `data` payloads carry the declaring document
-        // as a slice index that is meaningless once this request ends —
-        // `stamp_completion_data_uri` translates it into the document's URI
-        // before the items go on the wire.
+        // `open_docs_and_uris`, not `open_docs`: a lazy-resolve item's `data`
+        // carries a slice index meaningless after this request ends, so
+        // `stamp_completion_data_uri` translates it to a URI before the wire.
         let Some((open, uris)) = open_docs_and_uris(&docs, uri.as_str()) else {
             return Ok(None);
         };
         let index = LineIndex::new(open[0].source, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         let mut result =
             jvl_syntax::completion(&open, 0, &index, position, self.snippet_support(), &symbols);
         for item in &mut result.items {
@@ -975,11 +1029,8 @@ impl LanguageServer for Backend {
         )
     }
 
-    /// Code actions — add-import quick fixes for the identifier under
-    /// the cursor plus "Organize Imports". `jvl_syntax::code_actions` returns
-    /// URI-less sketches; the request's own document URI is stamped on here.
-    /// The client's `context.only` filter is honored hierarchically (a
-    /// requested `source` matches our `source.organizeImports`).
+    /// Build add-import and organize-imports actions, stamping the current URI
+    /// onto syntax-layer edits and honoring `context.only`.
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         self.ensure_workspace_index().await;
         let uri = params.text_document.uri;
@@ -989,7 +1040,10 @@ impl LanguageServer for Backend {
         };
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         let sketches = jvl_syntax::code_actions(&open, 0, &index, params.range, &symbols);
 
         let allowed = |kind: &str| match &params.context.only {
@@ -1018,19 +1072,8 @@ impl LanguageServer for Backend {
         Ok((!actions.is_empty()).then_some(actions))
     }
 
-    /// The strictly-lazy counterpart to `completion` — Javadoc is
-    /// fetched only here, on demand, from whatever key `completion` attached
-    /// to the item's `data` field (see `jvl_syntax::resolve_documentation`).
-    /// A `data`-less item (locals, params, keywords, type names — none of
-    /// which ever carried eager docs) is returned unchanged.
-    ///
-    /// An in-project key is re-resolved against the
-    /// **originating document only** (the `data.uri` stamped at completion
-    /// time), never by scanning all open documents — with two open files
-    /// declaring same-named types and members, a simple-name scan could
-    /// silently attach the *other* file's Javadoc. A stale URI (document
-    /// closed since the completion request) resolves to no documentation
-    /// rather than a guess. External keys carry no URI and ignore `open`.
+    /// Resolve completion Javadoc on demand from the item's stored key.
+    /// In-project keys use only their originating open document; stale keys stay empty.
     async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
         self.ensure_workspace_index().await;
         let Some(data) = item.data.clone() else {
@@ -1048,7 +1091,10 @@ impl LanguageServer for Backend {
                 }]
             })
             .unwrap_or_default();
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         if let Some(doc) = jvl_syntax::resolve_documentation(&open, &data, &symbols) {
             item.documentation = Some(doc);
         }
@@ -1059,15 +1105,10 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // Deliberately ClasspathSymbols-only, NOT CombinedSymbols.
-        // jvl_syntax::definition's ladder step (c) — landing precisely
-        // inside an unopened project file via locate_in_project_file —
-        // is *triggered* by the SymbolSource failing to recognize a bare
-        // type name (see definition.rs's module doc). ProjectSymbols
-        // would make that name resolve instead, short-circuiting the
-        // ladder into step (d)'s classpath-only External handling, which
-        // can't locate a real project file at all. See
-        // `definition_into_unopened_project_file` in lifecycle.rs.
+        // Deliberately ClasspathSymbols-only, not CombinedSymbols: using
+        // project symbols here would resolve a bare type name early,
+        // short-circuiting the definition ladder before it can land inside
+        // an unopened project file.
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -1085,15 +1126,10 @@ impl LanguageServer for Backend {
         &self,
         params: GotoTypeDefinitionParams,
     ) -> Result<Option<GotoTypeDefinitionResponse>> {
-        // Deliberately ClasspathSymbols-only, NOT CombinedSymbols.
-        // jvl_syntax::definition's ladder step (c) — landing precisely
-        // inside an unopened project file via locate_in_project_file —
-        // is *triggered* by the SymbolSource failing to recognize a bare
-        // type name (see definition.rs's module doc). ProjectSymbols
-        // would make that name resolve instead, short-circuiting the
-        // ladder into step (d)'s classpath-only External handling, which
-        // can't locate a real project file at all. See
-        // `definition_into_unopened_project_file` in lifecycle.rs.
+        // Deliberately ClasspathSymbols-only, not CombinedSymbols: using
+        // project symbols here would resolve a bare type name early,
+        // short-circuiting the definition ladder before it can land inside
+        // an unopened project file.
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
@@ -1107,19 +1143,12 @@ impl LanguageServer for Backend {
         Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
-    /// `textDocument/implementation` — bounded, single-tier scan
-    /// (see `scan_implementations`'s doc comment): resolve the cursor to an
-    /// in-project type or method (`jvl_syntax::implementation_target`),
-    /// prefilter the workspace for candidate files by the type's simple
-    /// name (reusing the `references::prefilter`), and confirm each
-    /// with `jvl_syntax::implementations_in_doc` (supertype simple-name
-    /// match + import/package-aware resolution — the same confirm-by-
-    /// resolution convention `references.rs`'s `bare_type_site` uses).
+    /// `textDocument/implementation`: resolves the cursor to an in-project
+    /// type or method, prefilters candidate files by simple name, and
+    /// confirms each with import/package-aware resolution.
     ///
-    /// Only symbols declared in a currently *open* document are supported
-    /// (open-files-first, like every other feature here) —
-    /// `jvl_syntax::implementation_target` answers `None` for anything else,
-    /// and this handler answers `Ok(None)` in that case.
+    /// Only symbols declared in a currently open document are supported;
+    /// anything else answers `Ok(None)`.
     async fn goto_implementation(
         &self,
         params: GotoImplementationParams,
@@ -1166,31 +1195,8 @@ impl LanguageServer for Backend {
         Ok((!locations.is_empty()).then_some(GotoImplementationResponse::Array(locations)))
     }
 
-    /// `textDocument/references` — two-tier, bounded, confirm-by-
-    /// resolution (see the `jvl_syntax::references` module doc for the full
-    /// design). The target's visibility tier (`jvl_syntax::Tier`, read off
-    /// its declaration's modifiers) decides the scan's reach:
-    ///
-    /// - `FileLocal` (local/param/`private` member): only the declaring file
-    ///   is scanned — already open, already parsed, no disk I/O.
-    /// - `Workspace` (package-private/protected/public): a bounded textual
-    ///   prefilter (`references::prefilter`) finds candidate files under the
-    ///   discovered source roots; each is parsed on demand (reusing the
-    ///   ladder-step-(c) `(path, mtime)` cache, or a currently-open
-    ///   document's live text/tree when the hit is itself open) and
-    ///   semantically confirmed one file at a time
-    ///   (`jvl_syntax::references_in_doc`), yielding to the runtime between
-    ///   files so a cancelled request actually stops promptly.
-    ///
-    /// Only symbols declared in a currently *open* document are supported
-    /// (open-files-first, like every other feature here) —
-    /// `jvl_syntax::reference_target` answers `None` for anything else
-    /// (an external/JDK symbol, an unopened project file, `this`/`super`, a
-    /// non-identifier), and this handler answers `Ok(None)` in that case.
-    /// `textDocument/prepareCallHierarchy` — the cursor must resolve
-    /// (via the reference machinery) to a method/constructor
-    /// **declared in an open document**; anything else answers `None`, the
-    /// same open-files-first refusal shape as references/rename.
+    /// Prepare call hierarchy only for a method or constructor declared in an
+    /// open document. Unresolved or closed-file targets return `None`.
     async fn prepare_call_hierarchy(
         &self,
         params: CallHierarchyPrepareParams,
@@ -1271,11 +1277,9 @@ impl LanguageServer for Backend {
         Ok(Some(calls))
     }
 
-    /// `callHierarchy/outgoingCalls` — every call site inside the
-    /// item's body, each resolved through the same ladder as
-    /// go-to-definition (open docs, closed project files, JDK/dependency
-    /// stubs as `jvl-src` virtual documents). Unresolvable callees are
-    /// silently omitted rather than guessed.
+    /// `callHierarchy/outgoingCalls`: every call site in the item's body,
+    /// resolved through the same ladder as go-to-definition. Unresolvable
+    /// callees are silently omitted rather than guessed.
     async fn outgoing_calls(
         &self,
         params: CallHierarchyOutgoingCallsParams,
@@ -1349,11 +1353,9 @@ impl LanguageServer for Backend {
         Ok(Some(vec![type_item(&info, item_uri, &decl_index)]))
     }
 
-    /// `typeHierarchy/supertypes` — the item's `extends`/`implements`
-    /// simple names, located open-files-first, then in closed workspace
-    /// files through the declaring file's import candidates + the workspace
-    /// index. JDK/dependency supertypes are omitted (no real file to point
-    /// at) — a documented gap, not a guess.
+    /// `typeHierarchy/supertypes`: locates the item's `extends`/`implements`
+    /// names open-files-first, then in closed workspace files. JDK/dependency
+    /// supertypes are omitted — no real file to point at.
     async fn supertypes(
         &self,
         params: TypeHierarchySupertypesParams,
@@ -1539,12 +1541,9 @@ impl LanguageServer for Backend {
         Ok((!locations.is_empty()).then_some(locations))
     }
 
-    /// `textDocument/prepareRename` — `Some` only when the cursor
-    /// resolves to an in-project declaration (see
-    /// `jvl_syntax::prepare_rename`'s doc comment for the full refusal
-    /// list: external/JDK symbols, keywords, literals, `this`/`super`, and
-    /// non-identifiers all yield `None`, never an error — the client should
-    /// simply not offer rename UI for these).
+    /// `textDocument/prepareRename`: `Some` only when the cursor resolves to
+    /// an in-project declaration. External/JDK symbols, keywords, literals,
+    /// and non-identifiers all yield `None`, never an error.
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
@@ -1558,7 +1557,10 @@ impl LanguageServer for Backend {
         };
         let open = open_docs(&docs, uri.as_str(), current);
         let index = LineIndex::new(&current.text, self.encoding());
-        let symbols = CombinedSymbols(ProjectSymbols(self), ClasspathSymbols(self.classpath()));
+        let symbols = CombinedSymbols(
+            ProjectSymbols::new(self, &docs),
+            ClasspathSymbols(self.classpath()),
+        );
         let Some(prep) = jvl_syntax::prepare_rename(&open, 0, &index, position, &symbols) else {
             return Ok(None);
         };
@@ -1568,32 +1570,8 @@ impl LanguageServer for Backend {
         }))
     }
 
-    /// `textDocument/rename` — conservative: refuse rather than
-    /// corrupt. Reuses the find-references orchestration
-    /// (`target_snapshot`/`scan_references`) to collect every occurrence
-    /// (declaration included — rename always renames it too), then applies
-    /// every refusal guard, in order:
-    ///
-    /// 1. `new_name` must be a syntactically valid Java identifier and not
-    ///    a reserved word/literal (`jvl_syntax::is_valid_new_name`).
-    /// 2. The cursor must resolve to an in-project declaration (same as
-    ///    `prepareRename`).
-    /// 3. The declaring scope must not already bind `new_name` to a sibling
-    ///    of the same kind (`jvl_syntax::collides_with_existing`).
-    /// 4. The scan must not have hit its file cap (`outcome.truncated`).
-    /// 5. Every textual hit must have been confirmed by resolution
-    ///    (`outcome.possible == 0`).
-    /// 6. For a `Tier::Workspace` target, every prefiltered candidate file
-    ///    must have parsed (`outcome.unparsed_hit_files == 0`) — an
-    ///    occurrence could be hiding in one that didn't.
-    ///
-    /// Only once all of these pass is a `WorkspaceEdit` assembled: one
-    /// `TextDocumentEdit` per file (versioned when the file is open), plus —
-    /// when renaming a `public` top-level type whose file name matches it,
-    /// and the client's `workspace.workspaceEdit.resourceOperations`
-    /// includes `"rename"` — a trailing `RenameFile` resource op (text edits
-    /// come first in the array, addressed by the OLD uri, which is still
-    /// valid at that point in document-change application order).
+    /// Rename only when the name, target, collision check, and bounded reference
+    /// scan are complete. The resulting edits precede any public-type file rename.
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -1753,10 +1731,9 @@ struct MissingDependencyCoord {
     version: String,
 }
 
-/// A degraded coordinate the server deliberately will not offer to
-/// download (a dynamic/unresolved version, an unsupported classifier, a
-/// resolver bound) — surfaced so the extension's UI can explain the gap
-/// rather than silently drop it.
+/// A degraded coordinate the server deliberately won't offer to download
+/// (dynamic version, unsupported classifier, resolver bound), surfaced so
+/// the extension's UI can explain the gap instead of silently dropping it.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct SkippedDependency {
     group: String,
@@ -1765,10 +1742,9 @@ struct SkippedDependency {
     reason: String,
 }
 
-/// The `jvl/missingDependencies` custom request's result: the extension's
-/// `java-vsix-lite.downloadDependencies` command queries this (after
-/// confirming Workspace Trust) to learn what it may offer to download, and
-/// re-queries it after each rebuild in its fixed-point loop.
+/// The `jvl/missingDependencies` custom request's result: what the extension
+/// may offer to download, queried after confirming Workspace Trust and again
+/// after each rebuild in its fixed-point loop.
 #[derive(Debug, Serialize, Default)]
 struct MissingDependenciesResult {
     missing: Vec<MissingDependencyCoord>,
@@ -1776,13 +1752,10 @@ struct MissingDependenciesResult {
 }
 
 impl Backend {
-    /// `jvl/missingDependencies` — reports the current classpath's
-    /// degraded coordinates, split into `missing` (a real `g:a:v` absent
-    /// from the local cache — fetchable) and `skipped` (resolution
-    /// deliberately declined to pursue further — not fetchable, with a
-    /// reason). Read-only and network-free: this only inspects whatever the
-    /// last (static, offline) resolution already recorded — see
-    /// `jvl_classpath::parse_degraded_entry` for the parsing rules.
+    /// `jvl/missingDependencies`: splits the classpath's degraded coordinates
+    /// into `missing` (fetchable, absent from the local cache) and `skipped`
+    /// (declined, with a reason). Read-only and network-free — it only
+    /// inspects the last resolution's already-recorded results.
     async fn missing_dependencies(&self) -> Result<MissingDependenciesResult> {
         let classpath = self.classpath();
         let mut result = MissingDependenciesResult::default();
@@ -1876,12 +1849,8 @@ fn discovered_test_classes(
 }
 
 impl Backend {
-    /// `jvl/tests` — static JUnit 4/5 test discovery for the requested
-    /// files, powering the extension's Test Explorer tree. Purely syntactic
-    /// (no execution, no classpath): open documents use their live tree,
-    /// closed files the bounded on-demand parse cache. A uri outside the
-    /// workspace root yields empty classes — this request never widens the
-    /// server's filesystem reach.
+    /// Discover JUnit 4/5 tests syntactically inside the workspace.
+    /// Files outside the workspace return no classes.
     async fn tests(&self, params: TestsParams) -> Result<TestsResult> {
         let root_canonical = self
             .project_root()
@@ -1938,6 +1907,10 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
             members: info
                 .members
                 .iter()
+                // Non-visible members are kept only for accessibility checks
+                // (e.g. a private constructor), never for completion/hover —
+                // except hidden constructors, needed for instantiation checks.
+                .filter(|m| !m.hidden || m.kind == jvl_classpath::MemberKind::Constructor)
                 .map(|m| jvl_syntax::ExternalMember {
                     name: m.name.clone(),
                     kind: match m.kind {
@@ -1952,8 +1925,10 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
                     is_static: m.is_static,
                     ret_fqn: m.ret_fqn.clone(),
                     ret_display: m.ret_display.clone(),
+                    metadata: m.metadata.clone(),
                 })
                 .collect(),
+            metadata: info.metadata.clone(),
         })
     }
 
@@ -1973,10 +1948,9 @@ impl jvl_syntax::SymbolSource for ClasspathSymbols {
         (subpackages, types.into_iter().map(candidate).collect())
     }
 
-    /// Type arguments each supertype entry is instantiated with (index-aligned
-    /// with `class(fqn)?.supers`, `{i}` placeholders over `fqn`'s own type
-    /// params) — the shapes match by design, so this is a straight delegation
-    /// to the classpath crate's `Signature`-attribute parse.
+    /// Type arguments each supertype entry is instantiated with, index-aligned
+    /// with `class(fqn)?.supers`. Straight delegation to the classpath crate's
+    /// `Signature`-attribute parse.
     fn super_type_args(&self, fqn: &str) -> Vec<Vec<String>> {
         self.0
             .class(fqn)
@@ -2049,11 +2023,9 @@ fn open_docs<'a>(
     open
 }
 
-/// Like [`open_docs`], but also returns a parallel vector of URIs (index-for-
-/// index with the `OpenDoc`s) — needed by goto-definition/type-definition to
-/// build a `Location` in whichever open document a cross-file symbol resolves
-/// into (`Definition::InOpenDoc { doc, .. }` names an index into this same
-/// slice). `None` if `current_uri` isn't an open document.
+/// Like [`open_docs`], but also returns a parallel vector of URIs, needed by
+/// goto-definition to build a `Location` in whichever open document a
+/// cross-file symbol resolves into. `None` if `current_uri` isn't open.
 fn open_docs_and_uris<'a>(
     docs: &'a HashMap<String, Document>,
     current_uri: &str,
@@ -2078,17 +2050,8 @@ fn open_docs_and_uris<'a>(
     Some((open, uris))
 }
 
-/// Translate an in-project completion item's lazy-resolve
-/// `data.doc` (the declaring document's index in the `&[OpenDoc]` slice this
-/// request ran against — `jvl-syntax` is URI-free, so an index is all it can
-/// name) into that document's URI, which stays meaningful across requests.
-/// `completion_resolve` uses it to re-find the exact originating document,
-/// never scanning all open documents (where a same-simple-name type declared
-/// elsewhere could win the lookup and attach the wrong member's Javadoc).
-/// An item whose payload can't be translated (no object, no `doc` index, or
-/// an out-of-range index — none reachable from `jvl-syntax`'s own output,
-/// but a resolve key must never be emitted broken) loses its `data` entirely,
-/// degrading to "no documentation on resolve".
+/// Replace an in-project completion's document index with its originating URI.
+/// Invalid indices lose their data rather than risking Javadoc from another file.
 fn stamp_completion_data_uri(item: &mut CompletionItem, uris: &[&str]) {
     let Some(obj) = item.data.as_mut().and_then(|d| d.as_object_mut()) else {
         return;
@@ -2124,11 +2087,9 @@ fn print_version_and_exit_if_requested() {
 async fn main() -> std::process::ExitCode {
     print_version_and_exit_if_requested();
 
-    // Logs go to stderr; stdout is the wire transport (LSP, or DAP for the
-    // `dap` subcommand). ANSI is disabled because the editor's output panel
-    // renders raw escape codes as a jumble; the noisy module-path target is
-    // dropped; and the default filter mutes the LSP framework's debug
-    // chatter (e.g. spurious cancel-request notices).
+    // Logs go to stderr; stdout is the wire transport (LSP, or DAP). ANSI is
+    // disabled since the editor's output panel renders raw escape codes as a
+    // jumble, and the default filter mutes the LSP framework's debug chatter.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -2257,9 +2218,8 @@ mod tests {
         assert!(unresolved_member_diagnostics_opt(&params));
     }
 
-    /// The project-file cache never exceeds its cap — at
-    /// the cap it clears wholesale and keeps accepting inserts (a Tier-2
-    /// references request can push up to 500 files through it in one go).
+    /// The project-file cache never exceeds its cap: at the cap it clears
+    /// wholesale and keeps accepting inserts.
     #[test]
     fn project_file_cache_clears_at_cap_and_stays_bounded() {
         let mut parser = jvl_syntax::new_parser();
@@ -2273,6 +2233,7 @@ mod tests {
                 PathBuf::from(format!("/proj/F{i}.java")),
                 CachedProjectFile {
                     mtime: SystemTime::now(),
+                    len: 11,
                     text: Arc::new("class X {}\n".to_string()),
                     tree: tree.clone(),
                 },
@@ -2287,9 +2248,7 @@ mod tests {
         assert!(cache.contains_key(Path::new(&format!("/proj/F{}.java", cap * 3 - 1))));
     }
 
-    /// A fresh, empty temp directory for a filesystem-backed test — mirrors
-    /// `references.rs`'s own `temp_dir` helper (small enough, and specific
-    /// enough to each module's needs, not worth sharing across files).
+    /// A fresh, empty temp directory for a filesystem-backed test.
     fn temp_project_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "jvl-main-{label}-{}-{}",
@@ -2303,20 +2262,192 @@ mod tests {
         dir
     }
 
-    /// A bare `Backend` for a direct (non-LSP-transport) unit test —
-    /// `LspService::new` is the only public way to get a `Client` to build
-    /// one; the returned service's `.inner()` hands back the `Backend`
-    /// itself. The paired `ClientSocket` is dropped: these tests never send
-    /// client notifications.
+    /// A bare `Backend` for a direct (non-LSP-transport) unit test. The
+    /// paired `ClientSocket` is dropped since these tests never send
+    /// notifications.
     fn test_backend() -> LspService<Backend> {
         let (service, _socket) = LspService::new(Backend::new);
         service
     }
 
-    /// The oversize guard added to `parsed_project_file`: a file over
-    /// `MAX_PROJECT_FILE_BYTES` must be reported exactly like an unreadable
-    /// one — `None`, never read into memory, never inserted into the parse
-    /// cache — rather than being parsed wholesale.
+    /// A body-only edit (touching a `return`, not a declaration) leaves
+    /// `declaration_fingerprint` unchanged, so `did_change` takes its fast
+    /// path instead of a workspace-wide refresh.
+    #[test]
+    fn declaration_fingerprint_is_stable_across_an_incremental_body_only_edit() {
+        let service = test_backend();
+        let backend = service.inner();
+
+        let text =
+            "package p;\nclass A {\n    int m() {\n        return 1;\n    }\n}\n".to_string();
+        let tree = backend.parse(&text, None);
+        let before = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+            source: &text,
+            tree: &tree,
+        });
+
+        let index = LineIndex::new(&text, PositionEncoding::Utf16);
+        let needle = text.find('1').expect("fixture contains a `1`");
+        let range = Range {
+            start: index.position(needle),
+            end: index.position(needle + 1),
+        };
+        let applied = jvl_syntax::apply_content_change(&text, PositionEncoding::Utf16, range, "2");
+        let mut edited_tree = tree.clone();
+        edited_tree.edit(&applied.input_edit);
+        let new_tree = backend.parse(&applied.new_text, Some(&edited_tree));
+
+        let after = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+            source: &applied.new_text,
+            tree: &new_tree,
+        });
+
+        assert_eq!(
+            before, after,
+            "a body-only edit must leave the declaration fingerprint unchanged (fast path)"
+        );
+    }
+
+    /// Renaming a method IS a declaration-affecting edit — a different open
+    /// file could call it by name — so the fingerprint must change.
+    #[test]
+    fn declaration_fingerprint_changes_across_an_incremental_declaration_edit() {
+        let service = test_backend();
+        let backend = service.inner();
+
+        let text =
+            "package p;\nclass A {\n    int m() {\n        return 1;\n    }\n}\n".to_string();
+        let tree = backend.parse(&text, None);
+        let before = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+            source: &text,
+            tree: &tree,
+        });
+
+        let index = LineIndex::new(&text, PositionEncoding::Utf16);
+        let needle = text.find("m()").expect("fixture contains `m()`");
+        let range = Range {
+            start: index.position(needle),
+            end: index.position(needle + 1), // just the method's own name, "m"
+        };
+        let applied =
+            jvl_syntax::apply_content_change(&text, PositionEncoding::Utf16, range, "renamed");
+        let mut edited_tree = tree.clone();
+        edited_tree.edit(&applied.input_edit);
+        let new_tree = backend.parse(&applied.new_text, Some(&edited_tree));
+
+        let after = jvl_syntax::declaration_fingerprint(&jvl_syntax::OpenDoc {
+            source: &applied.new_text,
+            tree: &new_tree,
+        });
+
+        assert_ne!(
+            before, after,
+            "renaming a method must change the declaration fingerprint (forces a full refresh)"
+        );
+    }
+
+    /// A path under the project root, outside any excluded directory, with
+    /// no delete involved — the ordinary accepted case.
+    #[test]
+    fn accepted_java_source_path_accepts_ordinary_project_file() {
+        let root = temp_project_dir("accept-ordinary");
+        let path = root.join("src/main/java/p/Foo.java");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create dirs");
+        std::fs::write(&path, "package p;\nclass Foo {}\n").expect("write");
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize root");
+
+        assert!(accepted_java_source_path(
+            &path,
+            &root,
+            &canonical_root,
+            false
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path that canonicalizes outside the project root must never be
+    /// accepted, delete or not.
+    #[test]
+    fn accepted_java_source_path_rejects_path_outside_root() {
+        let root = temp_project_dir("reject-outside");
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize root");
+        // Exists (so canonicalize succeeds) but is unrelated to `root`.
+        let outside = std::env::temp_dir();
+
+        assert!(!accepted_java_source_path(
+            &outside,
+            &root,
+            &canonical_root,
+            false
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path under an excluded directory (`target/`) must never be accepted
+    /// even though it resolves inside the project root.
+    #[test]
+    fn accepted_java_source_path_rejects_excluded_directory_component() {
+        let root = temp_project_dir("reject-excluded");
+        let path = root.join("target/generated/Foo.java");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create dirs");
+        std::fs::write(&path, "class Foo {}\n").expect("write");
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize root");
+
+        assert!(!accepted_java_source_path(
+            &path,
+            &root,
+            &canonical_root,
+            false
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A delete names a path that no longer exists — its nearest existing
+    /// ancestor (here, the containing directory) is what gets
+    /// canonicalized and boundary-checked instead.
+    #[test]
+    fn accepted_java_source_path_uses_nearest_existing_ancestor_for_deletes() {
+        let root = temp_project_dir("delete-ancestor");
+        let dir = root.join("src/main/java/p");
+        std::fs::create_dir_all(&dir).expect("create dirs");
+        let deleted_path = dir.join("Deleted.java"); // never created
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize root");
+
+        assert!(accepted_java_source_path(
+            &deleted_path,
+            &root,
+            &canonical_root,
+            true
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A deleted path whose (also nonexistent) tail lies under an excluded
+    /// directory is still rejected: the exclusion check covers the full
+    /// originally-named path, not just its nearest existing ancestor.
+    #[test]
+    fn accepted_java_source_path_rejects_deleted_path_under_excluded_directory() {
+        let root = temp_project_dir("delete-excluded");
+        std::fs::create_dir_all(&root).expect("create root");
+        let deleted_path = root.join("target/generated/Deleted.java"); // never created
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize root");
+
+        assert!(!accepted_java_source_path(
+            &deleted_path,
+            &root,
+            &canonical_root,
+            true
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file over `MAX_PROJECT_FILE_BYTES` must be reported as `None`,
+    /// like an unreadable file — never read into memory or cached.
     #[test]
     fn parsed_project_file_skips_oversized_files_without_reading_or_caching_them() {
         let service = test_backend();
@@ -2343,15 +2474,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The conservative-completeness contract this whole audit item exists
-    /// for: `scan_references`'s Tier-2 workspace scan must treat BOTH an
-    /// oversized candidate (caught by `references::prefilter`'s own
-    /// per-file guard, before it's ever read) AND an unreadable one (caught
-    /// by `parsed_project_file`, after prefiltering) as incomplete —
-    /// flipping the exact signals `rename()` already refuses on
-    /// (`ScanOutcome::truncated` and `ScanOutcome::unparsed_hit_files`),
-    /// rather than silently pretending either file simply had no
-    /// occurrences.
+    /// `scan_references`'s workspace scan must treat both an oversized
+    /// candidate and an unreadable one as incomplete (via
+    /// `ScanOutcome::truncated`/`unparsed_hit_files`), never silently as
+    /// "no occurrences".
     #[tokio::test]
     async fn scan_references_treats_oversized_and_unreadable_candidates_as_incomplete() {
         let service = test_backend();
@@ -2359,9 +2485,8 @@ mod tests {
 
         let root = temp_project_dir("scan-references-incomplete");
 
-        // The declaring ("target") file: always scanned directly by
-        // `scan_references`'s own-file step, never through the candidate
-        // loop this test is exercising.
+        // The declaring file is always scanned directly, not through the
+        // candidate loop this test exercises.
         let target_path = root.join("Target.java");
         let target_text = "class Target {\n    void widget() {}\n}\n".to_string();
         std::fs::write(&target_path, &target_text).expect("write target file");
@@ -2379,18 +2504,15 @@ mod tests {
             tier: jvl_syntax::Tier::Workspace,
         };
 
-        // A candidate containing the needle but too large to read safely —
-        // `references::prefilter`'s per-file guard must skip it via a
-        // `metadata()` stat alone, and never hand it to this loop at all.
+        // Too large to read safely; the prefilter must skip it via a stat
+        // alone, never handing it to this loop.
         let big_path = root.join("Big.java");
         let mut big_contents = "widget".to_string();
         big_contents.push_str(&"x".repeat(references::MAX_SINGLE_FILE_BYTES as usize));
         std::fs::write(&big_path, &big_contents).expect("write oversized candidate");
 
-        // A candidate that passes the prefilter (small, and a plain
-        // substring search never requires valid UTF-8) but is not valid
-        // UTF-8 text, so `parsed_project_file`'s `read_to_string` fails and
-        // it can't be parsed for the semantic confirm step.
+        // Passes the prefilter (small) but isn't valid UTF-8, so
+        // `parsed_project_file` fails to read it for the confirm step.
         let bad_path = root.join("Bad.java");
         let mut bad_bytes = b"class Bad { void widget() {} }\n".to_vec();
         bad_bytes.push(0xFF); // not valid UTF-8 on its own
@@ -2488,25 +2610,23 @@ mod tests {
     mod rebuild_coalescer {
         use super::*;
 
-        /// N events arriving before the debounce settles must still yield
-        /// exactly one rebuild: every event after the first is coalesced
-        /// (not a new driver), and the debounce only proceeds to a rebuild
-        /// once nothing further arrived during the wait.
+        /// N events before the debounce settles still yield exactly one
+        /// rebuild: only the first becomes the driver, and it waits until
+        /// nothing further arrives.
         #[test]
         fn n_events_in_one_window_yield_one_rebuild() {
             let mut c = RebuildCoalescer::new();
             assert!(c.on_event(), "first event becomes the driver");
             assert!(!c.on_event(), "second event coalesces into the driver");
             assert!(!c.on_event(), "third event coalesces into the driver");
-            // The two coalesced events landed during the wait, so the driver
-            // must wait a full debounce window again ("a fresh event resets
-            // the timer") before it may proceed...
+            // The coalesced events landed during the wait, so the driver
+            // must wait a full window again before it may proceed.
             assert!(
                 !c.on_debounce_elapsed(),
                 "coalesced events reset the window once"
             );
-            // ...and only then, with nothing further arriving, settles to
-            // exactly one rebuild — not one per event.
+            // Only then, with nothing further arriving, does it settle to
+            // one rebuild.
             assert!(
                 c.on_debounce_elapsed(),
                 "settled with nothing new -> proceed to exactly one rebuild"
@@ -2560,9 +2680,8 @@ mod tests {
             );
         }
 
-        /// The base case: no events at all -> nothing to do, and a rebuild
-        /// finishing cleanly (no `dirty`) stops driving rather than looping
-        /// forever.
+        /// No events at all: a rebuild finishing cleanly stops driving
+        /// rather than looping forever.
         #[test]
         fn quiescent_rebuild_stops_driving() {
             let mut c = RebuildCoalescer::new();

@@ -1,40 +1,5 @@
-// Asserts the "limited" `untrustedWorkspaces` contract declared in
-// package.json: in an UNTRUSTED workspace the pure-Rust default tier keeps
-// working (semantic tokens, outline/document symbols, activation), while
-// every trust-gated feature refuses to run -- the `vscode.workspace.isTrusted`
-// guards in `src/extension.ts`:
-//   - `javacBackgroundCheckEnabled()` (automatic checkOnSave / on-load check)
-//   - `checkProject()` (the `java-vsix-lite.checkProject` command)
-//   - `installDependencies()` (`java-vsix-lite.installDependencies`)
-//   - `downloadDependencies()` (`java-vsix-lite.downloadDependencies`)
-//
-// This suite is launched by `runTest.ts` via a SEPARATE `runTests()` call
-// than the trusted `../suite/` tests: that call does NOT pass
-// `--disable-workspace-trust` (Workspace Trust stays enabled) and it opens
-// `test-fixture-untrusted` for the first time in a throwaway profile whose
-// seeded `User/settings.json` sets
-// `security.workspace.trust.startupPrompt: "never"` -- the opposite launch
-// config from the trusted suite, and enough to keep a *real* VS Code window
-// untrusted without a blocking modal.
-//
-// BUT: `@vscode/test-electron` always launches via `--extensionDevelopmentPath`
-// (the "Extension Development Host"), and that host is unconditionally
-// trusted by VS Code regardless of those settings -- confirmed empirically
-// here: even with trust enabled and a never-before-seen folder in a brand
-// new profile, `vscode.workspace.isTrusted` still read `true`. There is no
-// launch flag that changes this; it is intentional VS Code behavior so that
-// F5-debugging an extension is never interrupted by a trust prompt.
-//
-// To still exercise the REAL trust gates in `extension.ts` (not a mock of
-// them), `suiteSetup` below overrides the shared `vscode.workspace.isTrusted`
-// getter to return `false` for the duration of this suite. This works
-// because the extension host is one Node process: this test file's
-// `import * as vscode from "vscode"` and `extension.ts`'s resolve to the
-// exact same module instance, so `checkProject()`, `installDependencies()`,
-// `downloadDependencies()`, and `javacBackgroundCheckEnabled()` all observe
-// the override live and take their genuine untrusted-workspace code paths --
-// only the one signal this harness cannot otherwise force is faked; every
-// assertion below still exercises unmodified production code.
+// Verifies pure-Rust features stay active while every trust-gated feature refuses.
+// `suiteSetup` overrides VS Code's always-trusted Extension Host signal for this suite.
 import * as assert from "assert";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -99,9 +64,8 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 type ErrorMessageFn = typeof vscode.window.showErrorMessage;
 
 /**
- * Temporarily intercepts `vscode.window.showErrorMessage` to capture the
- * refusal text a trust-gated command shows the user, without a real modal
- * ever appearing (this harness has no UI driver to dismiss one).
+ * Intercepts `vscode.window.showErrorMessage` to capture a trust-gated
+ * command's refusal text without a real modal appearing.
  */
 async function captureErrorMessage(
   action: () => Thenable<unknown>,
@@ -129,10 +93,9 @@ suite("untrusted workspace", () => {
       vscode.workspace,
       "isTrusted",
     );
-    // Force the untrusted signal (see the file header for why the Extension
-    // Development Host can't be made genuinely untrusted from launch args
-    // alone). Fail loudly, not vacuously, if a future VS Code makes this
-    // property non-configurable -- every assertion below depends on it.
+    // Force the untrusted signal (see file header). Fail loudly if a future
+    // VS Code makes this property non-configurable -- every assertion below
+    // depends on it.
     try {
       Object.defineProperty(vscode.workspace, "isTrusted", {
         configurable: true,
@@ -187,24 +150,41 @@ suite("untrusted workspace", () => {
     const uri = fixtureUri("src", "main", "java", "demo", "TypeError.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
+    const originalText = doc.getText();
 
-    // Give the (would-be) debounced on-load/on-save javac check every chance
-    // to fire if the trust gate were broken -- well past its 1.5s debounce.
-    await new Promise((r) => setTimeout(r, 5_000));
-    const javacDiags = vscode.languages.getDiagnostics(uri).filter((d) => d.source === "javac");
-    assert.strictEqual(
-      javacDiags.length,
-      0,
-      "javac diagnostics appeared in an untrusted workspace -- checkOnSave must " +
-        "be trust-gated (see javacBackgroundCheckEnabled() in extension.ts)",
-    );
+    try {
+      // Only a save can trigger the automatic javac backstop, so trigger a
+      // real save to prove the trust gate actually blocks it.
+      const appendEdit = new vscode.WorkspaceEdit();
+      appendEdit.insert(uri, doc.positionAt(originalText.length), "\n");
+      assert.ok(await vscode.workspace.applyEdit(appendEdit), "workspace edit was not applied");
+      assert.ok(await doc.save(), "save failed");
+
+      // Wait past the 1.5s debounce so the javac check would fire here if
+      // the trust gate were broken.
+      await new Promise((r) => setTimeout(r, 5_000));
+      const javacDiags = vscode.languages.getDiagnostics(uri).filter((d) => d.source === "javac");
+      assert.strictEqual(
+        javacDiags.length,
+        0,
+        "javac diagnostics appeared in an untrusted workspace -- checkOnSave must " +
+          "be trust-gated (see javacBackgroundCheckEnabled() in extension.ts)",
+      );
+    } finally {
+      const restoreEdit = new vscode.WorkspaceEdit();
+      restoreEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)),
+        originalText,
+      );
+      await vscode.workspace.applyEdit(restoreEdit);
+      await doc.save();
+    }
   });
 
   test("native return diagnostic is not trust-gated: jvl.incompatibleReturn arrives with no javac", async () => {
-    // Task 4 proof: the pure-Rust return check flags a wrong-typed method
-    // return in an UNTRUSTED workspace — no JDK process, no Workspace Trust,
-    // no automatic compiler setting involved. The complement of the test
-    // above: the javac tier stays silent while the native tier still works.
+    // The native return-type diagnostic works in an untrusted workspace with
+    // no JDK process, Workspace Trust, or compiler setting involved.
     const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypeError.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
@@ -231,8 +211,7 @@ suite("untrusted workspace", () => {
       "incompatible types: String cannot be converted to int",
     );
 
-    // Same invariant as the test above, on this file: the native proof must
-    // not have come from a leaked compiler run.
+    // Confirm the native diagnostic didn't come from a leaked javac run.
     const javacDiags = vscode.languages.getDiagnostics(uri).filter((d) => d.source === "javac");
     assert.strictEqual(
       javacDiags.length,
@@ -253,8 +232,8 @@ suite("untrusted workspace", () => {
       `expected the untrusted-workspace refusal message from checkProject(), got: ${message}`,
     );
 
-    // The command must have refused before spawning javac at all -- confirm
-    // no diagnostic ever lands, not just that the error message appeared.
+    // Confirm javac never actually ran, not just that the error message
+    // appeared.
     const arrived = await waitFor(
       () =>
         vscode.languages

@@ -56,7 +56,18 @@ pub(crate) async fn prefilter(
     boundary: Option<&Path>,
     needle: &str,
 ) -> Prefilter {
-    let boundary_canon = boundary.and_then(|b| fs::canonicalize(b).ok());
+    let boundary_canon = match boundary {
+        Some(boundary) => match fs::canonicalize(boundary) {
+            Ok(boundary) => Some(boundary),
+            Err(_) => {
+                return Prefilter {
+                    files: Vec::new(),
+                    truncated: true,
+                };
+            }
+        },
+        None => None,
+    };
     let needle_bytes = needle.as_bytes();
     let mut files = Vec::new();
     let mut files_scanned = 0usize;
@@ -64,37 +75,36 @@ pub(crate) async fn prefilter(
     let mut truncated = false;
 
     for root in roots {
-        let stopped_early =
-            crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
-                if files_scanned >= MAX_FILES_SCANNED || bytes_scanned >= MAX_BYTES_SCANNED {
-                    return false;
-                }
-                let oversized = fs::metadata(path)
-                    .map(|meta| meta.len() > MAX_SINGLE_FILE_BYTES)
-                    .unwrap_or(false);
-                if oversized {
-                    // Can't read this file without defeating the point of a
-                    // per-file guard, so whether it contains `needle` is
-                    // genuinely unknown — conservatively mark the whole scan
-                    // incomplete (the same signal a hit aggregate cap sets)
-                    // rather than silently treating it as a non-match. Other
-                    // candidates keep being scanned; only this one is
-                    // skipped.
-                    truncated = true;
-                    return true;
-                }
-                if let Ok(bytes) = fs::read(path) {
+        let walk = crate::fs_scan::walk_java_files(root, boundary_canon.as_deref(), |path| {
+            if files_scanned >= MAX_FILES_SCANNED || bytes_scanned >= MAX_BYTES_SCANNED {
+                return false;
+            }
+            let oversized = fs::metadata(path)
+                .map(|meta| meta.len() > MAX_SINGLE_FILE_BYTES)
+                .unwrap_or(false);
+            if oversized {
+                // An unread candidate makes a complete result impossible.
+                truncated = true;
+                return true;
+            }
+            match fs::read(path) {
+                Ok(bytes) => {
                     files_scanned += 1;
                     bytes_scanned += bytes.len();
                     if contains_subslice(&bytes, needle_bytes) {
                         files.push(path.to_path_buf());
                     }
                 }
-                true
-            })
-            .await;
-        if stopped_early {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => truncated = true,
+            }
+            true
+        })
+        .await;
+        if walk.stopped_early || walk.io_errors {
             truncated = true;
+        }
+        if walk.stopped_early {
             break;
         }
     }

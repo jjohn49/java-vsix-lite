@@ -1,25 +1,10 @@
-//! Go-to-definition and go-to-type-definition: a cheapest-first resolution
-//! ladder over the same substrate hover/completion use (bindings, the
-//! in-project type table, and the external [`SymbolSource`] seam).
-//!
-//! 1. **(a)** a local/param/field usage resolves to its declaring identifier,
-//!    possibly in another open document (an inherited field);
-//! 2. **(b)** `recv.member` resolves through the receiver's type hierarchy —
-//!    an in-project member yields its declaration; when the *receiver's own
-//!    type* is external, an external member falls to (d): its FQN + name;
-//! 3. **(c)** a bare type name not declared in any open document, and not
-//!    recognized by the classpath either, resolves (via `imports.rs`) to a
-//!    candidate FQN for the server to locate as an unopened project source
-//!    file;
-//! 4. **(d)** a type/member the external `SymbolSource` (JDK/dependency
-//!    classpath) recognizes resolves to that FQN, for the server to serve as
-//!    a virtual `jvl-src:` document.
-//!
-//! [`type_definition`] runs the same ladder over the *type* of the symbol at
-//! the cursor (a variable's declared type, a method's return type, a field's
-//! type) rather than the symbol itself. External member types aren't modeled
-//! structurally (only a rendered signature string), so that one case is
-//! punted — see the task report.
+//! Go-to-definition and go-to-type-definition: resolves the symbol under the
+//! cursor to its declaration via a cheapest-first ladder over bindings, the
+//! in-project type table, and the external [`SymbolSource`] seam — (a) local
+//! binding, (b) in-project or external member, (c) unopened project type,
+//! (d) classpath type. [`type_definition`] runs the same ladder over the
+//! symbol's *type* instead of the symbol itself; external member types
+//! aren't modeled structurally, so that case is skipped.
 
 use std::ops::Range;
 
@@ -29,8 +14,8 @@ use tree_sitter::{Node, Tree};
 use crate::external::SymbolSource;
 use crate::hover::{field_is, identifier_at, is_decl_name};
 use crate::imports::Imports;
-use crate::model::{base_type_name, named_children, DeclSite, MemberKind, TypeTable};
-use crate::resolve::{self, Ctx, HierMember, Resolved, ResolvedType};
+use crate::model::{named_children, type_ref_simple_name, DeclSite, MemberKind, TypeTable};
+use crate::resolve::{self, Ctx, FactsCache, HierMember, Resolved, ResolvedType};
 use crate::{node_text, LineIndex, OpenDoc};
 
 /// Where a symbol (or, for [`type_definition`], a symbol's type) is declared.
@@ -43,17 +28,15 @@ pub enum Definition {
         name_range: Range<usize>,
         full_range: Range<usize>,
     },
-    /// A bare type name that resolves (via imports/package) to a candidate
-    /// fully-qualified name, but is declared in no open document and isn't
-    /// recognized by the classpath either — most likely an unopened project
-    /// source file. The server locates and parses it (ladder step (c)).
+    /// A bare type name resolved (via imports/package) to a candidate FQN
+    /// but declared in no open document and not on the classpath — likely
+    /// an unopened project source file (step c).
     ProjectType {
         simple_name: String,
         fqn: Option<String>,
     },
-    /// A JDK/dependency type or member the classpath recognizes. The server
-    /// resolves it via `Classpath` (real source, or a signature-only stub)
-    /// and serves it as a virtual `jvl-src:` document (ladder step (d)).
+    /// A JDK/dependency type or member the classpath recognizes; the server
+    /// serves it as a virtual `jvl-src:` document (step d).
     External { fqn: String, member: Option<String> },
 }
 
@@ -79,12 +62,15 @@ pub fn definition(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let name_node = identifier_at(doc.tree, cursor)?;
@@ -105,29 +91,72 @@ pub fn type_definition(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let name_node = identifier_at(doc.tree, cursor)?;
-    let (type_node, type_source) = declared_type_of(name_node, &ctx)?;
-    let simple = base_type_name(type_node, type_source)?;
-    definition_for_type_name(simple, &ctx)
+    // The expression's resolved type carries type arguments through
+    // (`Shelter<Dog>.first()` is a `Dog`, `var d = s.first()` too); the
+    // declared type node alone would name `T` or `var`, which no file
+    // declares. Fall back to the declared node when resolution can't answer.
+    if let Some(def) = expression_type_definition(name_node, &ctx) {
+        return Some(def);
+    }
+    let (type_node, _, type_doc) = declared_type_of(name_node, &ctx)?;
+    let dctx = if type_doc == current {
+        None
+    } else {
+        ctx.for_document(type_doc)
+    };
+    definition_for_type_name(type_node, dctx.as_ref().unwrap_or(&ctx))
 }
 
-/// Resolve the identifier `name_node` to what `definition` should return.
-/// Mirrors `hover::resolve_target`'s branching (declaration name, member
-/// access/call, mid-edit scoped path, plain reference), but yields a
-/// [`Definition`] instead of rendered hover content.
+/// Where the type of the expression at `name_node` is declared, via full
+/// resolution (overload selection, class and method type arguments applied).
+/// `None` when the expression's type isn't a concrete in-project or
+/// classpath type.
+fn expression_type_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Definition> {
+    let parent = name_node.parent()?;
+    let expression = match parent.kind() {
+        "field_access" if field_is(parent, "field", name_node) => parent,
+        "method_invocation" if field_is(parent, "name", name_node) => parent,
+        _ => name_node,
+    };
+    let resolved = resolve::resolve_expression_type(expression, ctx)?;
+    definition_of_resolved_type(resolved, ctx)
+}
+
+fn definition_of_resolved_type(
+    resolved: ResolvedType<'_>,
+    ctx: &Ctx<'_, '_>,
+) -> Option<Definition> {
+    match resolved {
+        ResolvedType::InProject { decl, .. } => decl.decl_site().map(Definition::from_site),
+        ResolvedType::External { fqn, .. } => Some(Definition::External { fqn, member: None }),
+        // An array's type definition is its element type's.
+        ResolvedType::Array { element } => {
+            definition_of_resolved_type(ResolvedType::from_type_ref(&element, ctx)?, ctx)
+        }
+        ResolvedType::Primitive(_) | ResolvedType::Void | ResolvedType::Null => None,
+    }
+}
+
+/// Resolve `name_node` to what `definition` should return, mirroring
+/// `hover::resolve_target`'s branching but yielding a [`Definition`] instead
+/// of rendered hover content.
 fn resolve_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Definition> {
     if matches!(name_node.kind(), "this" | "super") {
         let resolved = resolve::resolve_receiver_type(name_node, ctx)?;
         return match resolved.ty {
-            ResolvedType::InProject(td) => td.decl_site().map(Definition::from_site),
+            ResolvedType::InProject { decl, .. } => decl.decl_site().map(Definition::from_site),
             ResolvedType::External { fqn, .. } => Some(Definition::External { fqn, member: None }),
             ResolvedType::Primitive(_)
             | ResolvedType::Void
@@ -140,9 +169,8 @@ fn resolve_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Defi
 
     if let Some(parent) = name_node.parent() {
         if is_decl_name(parent, name_node) {
-            // Already at the declaration: report a self-referential site
-            // (harmless — many clients simply don't call goto-definition on
-            // the declaring identifier itself).
+            // Already at the declaration; harmless since clients rarely
+            // invoke goto-definition on the declaring identifier itself.
             return Some(Definition::InOpenDoc {
                 doc: ctx.current,
                 name_range: name_node.byte_range(),
@@ -159,19 +187,18 @@ fn resolve_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Defi
                 let resolved = match parent.child_by_field_name("object") {
                     Some(object) => resolve::resolve_receiver_type(object, ctx)?,
                     None => Resolved {
-                        ty: ResolvedType::InProject(resolve::enclosing_typedecl(
-                            name_node,
-                            ctx.doc.source,
-                            ctx.current,
-                        )?),
+                        ty: ResolvedType::InProject {
+                            decl: resolve::enclosing_typedecl(name_node, ctx.table, ctx.current)?,
+                            args: Vec::new(),
+                        },
                         static_only: false,
                     },
                 };
                 return member_definition(&resolved, ctx, name);
             }
-            // Mid-edit `recv.member` (no trailing `;`) parses as a scoped path;
-            // same treatment as hover: resolve the trailing segment as a member
-            // of the prefix's type.
+            // Mid-edit `recv.member` (no trailing `;`) parses as a scoped
+            // path; treat like hover: resolve the trailing segment as a
+            // member of the prefix's type.
             "scoped_type_identifier" | "scoped_identifier" => {
                 let segments = named_children(parent);
                 if segments.len() >= 2 && segments.last() == Some(&name_node) {
@@ -197,17 +224,14 @@ fn resolve_definition<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Defi
             return Some(Definition::from_site(site));
         }
     }
-    definition_for_type_name(name, ctx)
+    definition_for_type_name(name_node, ctx)
 }
 
-/// (b): the definition of `name` as a member of `resolved`'s type — an
-/// in-project member's own declaration, or (falling to (d)) an external
-/// member's owning FQN + name, when the receiver's own resolved type is
-/// itself external (e.g. `"".length()`). When the receiver is in-project but
-/// the member is only reachable by inheriting *through* an external
-/// supertype, the owning FQN isn't tracked by the shared member-resolution
-/// machinery (`HierMember::External` carries no FQN) — that case yields no
-/// result rather than guessing; see the task report.
+/// (b): `name`'s definition as a member of `resolved`'s type — an
+/// in-project member's own declaration, or (d) an external member's FQN +
+/// name when the receiver's own type is itself external. A member reachable
+/// only by inheriting through an external supertype yields no result: the
+/// owning FQN isn't tracked, so we don't guess.
 fn member_definition<'t>(
     resolved: &Resolved<'t>,
     ctx: &Ctx<'_, 't>,
@@ -224,7 +248,7 @@ fn member_definition<'t>(
             fqn: fqn.clone(),
             member: Some(name.to_string()),
         }),
-        ResolvedType::InProject(_)
+        ResolvedType::InProject { .. }
         | ResolvedType::Primitive(_)
         | ResolvedType::Void
         | ResolvedType::Null
@@ -232,13 +256,16 @@ fn member_definition<'t>(
     }
 }
 
-/// (c)/(d): resolve a bare type's simple name — in-project if some open
-/// document declares it; else the first import candidate (explicit import,
-/// same package, wildcard, `java.lang` — see `imports.rs`) the classpath
-/// recognizes (d); else the best candidate FQN, for the server to try as an
+/// (c)/(d): resolve a bare type's simple name — in-project if an open
+/// document declares it, else the first import candidate the classpath
+/// recognizes (d), else the best candidate FQN for the server to try as an
 /// unopened project source file (c).
-fn definition_for_type_name(simple: &str, ctx: &Ctx) -> Option<Definition> {
-    if let Some(td) = ctx.table.get(simple) {
+fn definition_for_type_name<'t>(node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Definition> {
+    let simple = type_ref_simple_name(node, ctx.doc.source)?;
+    if let Some(td) =
+        ctx.table
+            .resolve_type_name_node(node, ctx.doc.source, ctx.current, ctx.imports)
+    {
         return td.decl_site().map(Definition::from_site);
     }
     let candidates = ctx.imports.candidates(simple);
@@ -256,16 +283,21 @@ fn definition_for_type_name(simple: &str, ctx: &Ctx) -> Option<Definition> {
     })
 }
 
-/// The declared-type node backing [`type_definition`]: what a plain binding
-/// reference, a declaration name, or a member access/call resolves its *type*
-/// to. Mirrors [`resolve_definition`]'s branching, one level removed (the
-/// type of the thing, not the thing).
-fn declared_type_of<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<(Node<'t>, &'t str)> {
+/// The declared-type node backing [`type_definition`]: mirrors
+/// [`resolve_definition`]'s branching, one level removed (the type of the
+/// thing, not the thing itself). Returns the node, its source text, and the
+/// document that DECLARES the type, which may differ from `ctx.current` —
+/// the type name must be resolved against that document's own
+/// imports/package, not the caller's.
+fn declared_type_of<'t>(
+    name_node: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+) -> Option<(Node<'t>, &'t str, usize)> {
     let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
         if is_decl_name(parent, name_node) {
-            return decl_type_of(parent, ctx.doc.source);
+            return decl_type_of(parent, ctx.doc.source, ctx.current);
         }
         match parent.kind() {
             "field_access" if field_is(parent, "field", name_node) => {
@@ -277,11 +309,10 @@ fn declared_type_of<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<(Node<
                 let resolved = match parent.child_by_field_name("object") {
                     Some(object) => resolve::resolve_receiver_type(object, ctx)?,
                     None => Resolved {
-                        ty: ResolvedType::InProject(resolve::enclosing_typedecl(
-                            name_node,
-                            ctx.doc.source,
-                            ctx.current,
-                        )?),
+                        ty: ResolvedType::InProject {
+                            decl: resolve::enclosing_typedecl(name_node, ctx.table, ctx.current)?,
+                            args: Vec::new(),
+                        },
                         static_only: false,
                     },
                 };
@@ -306,23 +337,26 @@ fn declared_type_of<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<(Node<
         ctx.table,
         ctx.current,
     )?;
-    Some((binding.type_node?, binding.source))
+    Some((binding.type_node?, binding.source, ctx.current))
 }
 
 /// The declared-type node of a declaration name's own declaration (`parent`
-/// is the decl node the name belongs to): a method's return type, a
-/// field/local/param's type. `None` for declarations with no type of their
-/// own (an inferred for-loop/lambda variable, a type declaration, an enum
-/// constant).
-fn decl_type_of<'t>(parent: Node<'t>, source: &'t str) -> Option<(Node<'t>, &'t str)> {
+/// is the decl node): a method's return type or a field/local/param's type.
+/// `None` for declarations with no type of their own (inferred var, type
+/// declaration, enum constant).
+fn decl_type_of<'t>(
+    parent: Node<'t>,
+    source: &'t str,
+    doc: usize,
+) -> Option<(Node<'t>, &'t str, usize)> {
     match parent.kind() {
-        "method_declaration" => parent.child_by_field_name("type").map(|t| (t, source)),
+        "method_declaration" => parent.child_by_field_name("type").map(|t| (t, source, doc)),
         "variable_declarator" => parent
             .parent()?
             .child_by_field_name("type")
-            .map(|t| (t, source)),
+            .map(|t| (t, source, doc)),
         "formal_parameter" | "enhanced_for_statement" => {
-            parent.child_by_field_name("type").map(|t| (t, source))
+            parent.child_by_field_name("type").map(|t| (t, source, doc))
         }
         _ => None,
     }
@@ -336,11 +370,14 @@ fn member_type_of<'t>(
     resolved: &Resolved<'t>,
     ctx: &Ctx<'_, 't>,
     name: &str,
-) -> Option<(Node<'t>, &'t str)> {
+) -> Option<(Node<'t>, &'t str, usize)> {
     match resolve::find_member_hier(resolved, ctx, name)? {
         HierMember::InProject(m) => match m.kind {
-            MemberKind::Method => m.node.child_by_field_name("type").map(|t| (t, m.source)),
-            MemberKind::Field => member_field_type_node(m.node).map(|t| (t, m.source)),
+            MemberKind::Method => m
+                .node
+                .child_by_field_name("type")
+                .map(|t| (t, m.source, m.doc)),
+            MemberKind::Field => member_field_type_node(m.node).map(|t| (t, m.source, m.doc)),
             _ => None,
         },
         HierMember::External(_) => None,
@@ -355,20 +392,13 @@ fn member_field_type_node<'t>(declarator: Node<'t>) -> Option<Node<'t>> {
     declarator.parent()?.child_by_field_name("type")
 }
 
-/// Find the name range of a type declared `simple_name` in a single parsed
-/// source file — the parse-on-demand path backing ladder step (c) (a type
-/// reference into a project source file that isn't open in the editor). The
-/// server reads/parses at most one such file per request; this just answers
-/// "where, in this one already-parsed tree, is that type's name?", the same
-/// question [`TypeDecl::decl_site`](crate::model::TypeDecl::decl_site)
-/// answers for an open document.
+/// Find a top-level type's name range in one parsed unopened source file.
+/// This mirrors `TypeDecl::decl_site` without adding the file to open documents.
 pub fn locate_type_in_source(tree: &Tree, source: &str, simple_name: &str) -> Option<Range<usize>> {
     let docs = [OpenDoc { source, tree }];
     let table = TypeTable::build(&docs, 0);
-    table
-        .get(simple_name)
-        .and_then(|td| td.decl_site())
-        .map(|site| site.name_range)
+    let td = table.candidates(simple_name).next()?;
+    td.decl_site().map(|site| site.name_range)
 }
 
 #[cfg(test)]
@@ -399,8 +429,10 @@ mod tests {
                             is_static: false,
                             ret_fqn: None,
                             ret_display: None,
+                            metadata: None,
                         })
                         .collect(),
+                    metadata: None,
                 })
         }
     }
@@ -589,11 +621,93 @@ mod tests {
         assert_eq!(name_range, expected..expected + "Widget".len());
     }
 
+    /// Definition of a generic member call lands on the member declaration
+    /// regardless of the receiver's type arguments.
+    #[test]
+    fn definition_of_generic_member_call_resolves_to_declaration() {
+        let src = "class Dog {}\n\
+                   class Shelter<T> { T first() { return null; } }\n\
+                   class C { void m() { Shelter<Dog> s; s.first(); } }\n";
+        let def = def_at(src, "first();", &NoSymbols).expect("definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        let expected = src.find("first() {").unwrap();
+        assert_eq!(name_range, expected..expected + "first".len());
+    }
+
+    /// Type definition of a generic call follows the substituted type
+    /// (`Shelter<Dog>.first()` -> `Dog`), not the declared variable `T`.
+    #[test]
+    fn type_definition_of_generic_call_resolves_to_substituted_type() {
+        let src = "class Dog {}\n\
+                   class Shelter<T> { T first() { return null; } T item; }\n\
+                   class C { void m() { Shelter<Dog> s; s.first(); s.item.toString(); } }\n";
+        let def = type_def_at(src, "first();", &NoSymbols).expect("type definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        let expected = src.find("Dog {}").unwrap();
+        assert_eq!(name_range, expected..expected + "Dog".len());
+
+        let def = type_def_at(src, "item.toString", &NoSymbols).expect("type definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        assert_eq!(name_range, expected..expected + "Dog".len());
+    }
+
+    /// A generic method's inferred type argument drives type definition too
+    /// (`<E> E pick(E)` called with `Dog` -> `Dog`).
+    #[test]
+    fn type_definition_of_generic_method_call_uses_inferred_argument() {
+        let src = "class Dog {}\n\
+                   class Util { static <E> E pick(E value) { return value; } }\n\
+                   class C { void m() { Util.pick(new Dog()); } }\n";
+        let def = type_def_at(src, "pick(new", &NoSymbols).expect("type definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        let expected = src.find("Dog {}").unwrap();
+        assert_eq!(name_range, expected..expected + "Dog".len());
+    }
+
+    /// `var` locals follow the initializer's type.
+    #[test]
+    fn type_definition_of_var_local_uses_inferred_type() {
+        let src = "class Dog {}\n\
+                   class Shelter<T> { T first() { return null; } }\n\
+                   class C { void m() { Shelter<Dog> s; var d = s.first(); d.toString(); } }\n";
+        let def = type_def_at(src, "d.toString", &NoSymbols).expect("type definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        let expected = src.find("Dog {}").unwrap();
+        assert_eq!(name_range, expected..expected + "Dog".len());
+    }
+
     #[test]
     fn definition_on_non_identifier_is_none() {
         let src = "class C { }\n";
         let def = def_at(src, "{", &NoSymbols);
         assert!(def.is_none());
+    }
+
+    /// A generic member inherited through a parameterized supertype projects
+    /// the subclass's argument (`Kennel extends Shelter<Dog>`: `k.item` is
+    /// a `Dog`), so the jump doesn't dead-end on `T`.
+    #[test]
+    fn type_definition_of_inherited_generic_field_projects_supertype_argument() {
+        let src = "class Dog {}\n\
+                   class Shelter<T> { T item; }\n\
+                   class Kennel extends Shelter<Dog> {}\n\
+                   class C { void m() { Kennel k; k.item.toString(); } }\n";
+        let def = type_def_at(src, "item.toString", &NoSymbols).expect("type definition");
+        let Definition::InOpenDoc { name_range, .. } = def else {
+            panic!("expected InOpenDoc: {def:?}")
+        };
+        let expected = src.find("Dog {}").unwrap();
+        assert_eq!(name_range, expected..expected + "Dog".len());
     }
 
     // --- locate_type_in_source (server-side step-(c) parse-on-demand path) ---

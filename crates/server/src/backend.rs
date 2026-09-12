@@ -1,12 +1,5 @@
-//! Backend state, document parsing, caches, and classpath management.
-//!
-//! Holds the [`Backend`] struct definition plus construction and the
-//! cache/classpath/project-root parsing helpers built directly on its
-//! state. The `impl LanguageServer for Backend` trait implementation and
-//! `main()` stay in `main.rs`; other responsibility groups (diagnostics,
-//! navigation/references/implementations, call/type hierarchy) live in
-//! their own sibling modules and share this struct via additional
-//! `impl Backend` blocks.
+//! Backend state, parsing, caches, and classpath management.
+//! The LSP trait lives in `main.rs`; sibling modules extend [`Backend`].
 
 use std::collections::HashMap;
 use std::ops::Range as StdRange;
@@ -20,70 +13,49 @@ use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::Client;
 
+use crate::diagnostics::StaleJavac;
 use crate::javac;
 use crate::workspace_index;
 use crate::{infer_source_root, open_doc_path};
 
-/// Bound on the step-(d) external stub/source cache: cleared wholesale past
-/// this many entries rather than tracking LRU — the path is rare enough
-/// (cold, one-off lookups) that eviction pressure is low and a simple bound
-/// is not worth extra bookkeeping.
+/// Cap on the external stub/source cache; cleared wholesale (not LRU) once
+/// exceeded, since this path is cold and eviction pressure is low.
 const EXTERNAL_CACHE_CAP: usize = 32;
 
-/// Bound on the parse-on-demand project-file cache, shared by goto-definition
-/// ladder step (c) (one file per request) and find-references' Tier-2
-/// confirm (up to `references::MAX_FILES_SCANNED` = 500 hit files in a single
-/// request). Same clear-wholesale-on-overflow policy as
-/// [`EXTERNAL_CACHE_CAP`], but sized so a typical references request's hit
-/// set survives within one request *and* is still warm for a follow-up
-/// request on the same symbol (500 hit files is the pathological cap;
-/// real hit sets are far smaller). ~256 parsed small-to-medium `.java` files
-/// is a few tens of MB at worst — bounded, and cleared rather than grown when
-/// exceeded.
+/// Bound on the on-demand project-file cache, shared by goto-definition's
+/// file lookup and find-references' per-hit-file confirm. Cleared wholesale
+/// like [`EXTERNAL_CACHE_CAP`] when exceeded.
 const PROJECT_FILE_CACHE_CAP: usize = 256;
 
-/// Hard cap on a single unopened project source file's size before
-/// [`Backend::parsed_project_file`] will read and cache it. Guards both of
-/// that function's callers — a one-off goto-definition lookup and, more
-/// importantly, find-references' Tier-2 per-hit-file confirm — against a
-/// pathologically large file (vendored/generated code, a mis-tagged binary
-/// blob sitting under a source root) being read wholesale and handed to
-/// tree-sitter for a cold, on-demand parse. Generous for a hand-written Java
-/// source file (a few MB) — a guard against a resource pathology, not a
-/// functional limit on real code. A file over this cap is treated exactly
-/// like an unreadable one (see the doc comment on `parsed_project_file`
-/// itself for why that's conservatively safe for `rename`).
+/// Max size of an unopened source file [`Backend::parsed_project_file`]
+/// will read and cache, guarding against a pathologically large file being
+/// parsed cold. A file over this cap is treated exactly like an unreadable
+/// one.
 pub(crate) const MAX_PROJECT_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// A single project source file parsed on demand for ladder step (c),
-/// invalidated by `mtime` so an on-disk edit is picked up without an explicit
-/// notification (the server never watches files).
+/// A project source file parsed on demand and cached, invalidated by
+/// `(mtime, len)` so an on-disk edit is picked up without an explicit
+/// notification. `evict_project_file` forces a re-read regardless of both.
 pub(crate) struct CachedProjectFile {
     pub(crate) mtime: SystemTime,
+    pub(crate) len: u64,
     pub(crate) text: Arc<String>,
     pub(crate) tree: Tree,
 }
 
-/// A single open document: its current text and the parse tree kept in sync
-/// with it, plus its LSP version (`rename`'s `WorkspaceEdit` prefers
-/// versioned `TextDocumentEdit`s for open documents over the client's
-/// `documentChanges` capability — see `Backend::rename`).
+/// An open document: current text, synced parse tree, and LSP version.
+/// `rename` prefers versioned `TextDocumentEdit`s for open documents over
+/// the client's `documentChanges` capability.
 pub(crate) struct Document {
     pub(crate) text: String,
     pub(crate) tree: Tree,
     pub(crate) version: i32,
 }
 
-/// Debounce/coalescing decision state for classpath rebuilds
-/// triggered by watched build-file changes — pure and synchronous, so it's
-/// unit-tested directly with no real timers involved (see the `tests`
-/// module below). The actual timing (the debounce wait, `spawn_blocking`
-/// for the rebuild itself) lives in `Backend::drive_classpath_rebuild`,
-/// which just calls these methods at the right points. `on_event`'s `bool`
-/// return elects exactly one caller as "the driver" for however many
-/// debounce-then-rebuild cycles it takes to settle, so at most one rebuild
-/// ever runs at a time and no unbounded queue of pending rebuilds can build
-/// up — a fresh event always folds into whichever cycle is already running.
+/// Debounce/coalescing decision state for classpath rebuilds, kept pure
+/// and synchronous so it's easy to unit-test (see `tests` below). Elects
+/// exactly one caller as the driver per rebuild cycle, so at most one
+/// rebuild runs at a time and later events fold into it.
 #[derive(Default)]
 pub(crate) struct RebuildCoalescer {
     /// Some caller already owns driving a debounce-wait-then-maybe-rebuild
@@ -102,11 +74,9 @@ impl RebuildCoalescer {
         Self::default()
     }
 
-    /// A matching build-file change arrived. Returns `true` exactly once per
-    /// debounce-then-rebuild cycle: the caller that gets `true` must drive
-    /// it (wait the debounce window, call `on_debounce_elapsed`, and so on
-    /// until settled); every other concurrent/later caller gets `false` —
-    /// its event has already been folded into the driver's next decision.
+    /// A build-file change arrived. Returns `true` for the one caller that
+    /// must drive the debounce/rebuild cycle; other callers get `false`
+    /// since their event is already folded in.
     pub(crate) fn on_event(&mut self) -> bool {
         if self.driving {
             // Already being handled by the current debounce-wait-then-maybe-
@@ -119,10 +89,8 @@ impl RebuildCoalescer {
         }
     }
 
-    /// The driver's debounce wait elapsed. `true` means proceed straight to
-    /// a rebuild (nothing arrived during the wait); `false` means a fresh
-    /// event reset the window and the driver must wait a full debounce
-    /// window again before re-checking.
+    /// The debounce wait elapsed. Returns `true` to proceed with the
+    /// rebuild, or `false` if a fresh event reset the window.
     pub(crate) fn on_debounce_elapsed(&mut self) -> bool {
         if self.dirty {
             self.dirty = false;
@@ -133,10 +101,8 @@ impl RebuildCoalescer {
         }
     }
 
-    /// The in-flight rebuild finished. `true` means at least one event
-    /// arrived during the rebuild and exactly one follow-up debounce/rebuild
-    /// cycle must run (the driver keeps going); `false` means it's fully
-    /// settled and the driver may stop.
+    /// The in-flight rebuild finished. Returns `true` if a follow-up cycle
+    /// must run (an event arrived mid-rebuild), else `false` once settled.
     pub(crate) fn on_rebuild_finished(&mut self) -> bool {
         self.in_flight = false;
         if self.dirty {
@@ -154,40 +120,32 @@ pub(crate) struct Backend {
     /// Reused across parses; held only for synchronous parse calls, never across
     /// an `.await`.
     parser: StdMutex<Parser>,
-    /// Open documents, keyed by URI string — their live in-memory text and
-    /// parse tree. Closed project source files are indexed separately (see
-    /// `workspace_index` and `project_symbols`), so the workspace is not
-    /// limited to whatever happens to be open here.
+    /// Open documents keyed by URI string: live text and parse tree.
+    /// Closed project files are indexed separately via `workspace_index`.
     pub(crate) documents: Mutex<HashMap<String, Document>>,
     /// LSP position encoding negotiated during `initialize` (defaults to UTF-16).
     pub(crate) encoding: OnceLock<PositionEncoding>,
     /// Whether the client supports snippet completion (`$1` tab stops). Defaults
     /// to `false` until negotiated during `initialize`.
     pub(crate) snippet_support: OnceLock<bool>,
-    /// Bytecode-backed symbols for imported (JDK/dependency) types. Built lazily
-    /// on first use so the JDK's jmods aren't scanned until completion/hover needs
-    /// them. Swappable — a watched build-file change triggers a
-    /// debounced rebuild (see `RebuildCoalescer`/`drive_classpath_rebuild`)
-    /// that atomically swaps in a freshly resolved `Classpath`. Every read
-    /// path takes its own `Arc` snapshot via `classpath()` at the start of a
-    /// request and never holds this lock across an `.await`.
+    /// Bytecode-backed symbols for imported types, built lazily on first
+    /// use. A watched build-file change triggers a debounced rebuild that
+    /// atomically swaps in a fresh `Classpath`; readers take their own
+    /// `Arc` snapshot via `classpath()` and never hold this lock across an
+    /// `.await`.
     classpath: StdRwLock<Option<Arc<jvl_classpath::Classpath>>>,
     /// Whether the client supports dynamic registration of
-    /// `workspace/didChangeWatchedFiles` (negotiated during `initialize`) —
-    /// gates whether `initialized()` bothers registering the build-file
-    /// watch at all; the LSP spec has no static alternative for this
-    /// capability, so a client without it simply never gets watched.
+    /// `workspace/didChangeWatchedFiles`. Gates whether `initialized()`
+    /// registers the build-file watch; a client without it never gets
+    /// watched, since the LSP spec has no static alternative.
     pub(crate) classpath_watch_dynamic: OnceLock<bool>,
     /// Whether the client supports dynamic registration for type
-    /// hierarchy. `ls-types` 0.0.6's `ServerCapabilities` has no
-    /// `typeHierarchyProvider` field to advertise statically, so the
-    /// feature is registered dynamically in `initialized` instead — VS Code
-    /// supports exactly that.
+    /// hierarchy, since `ServerCapabilities` has no static field to
+    /// advertise it.
     pub(crate) type_hierarchy_dynamic: OnceLock<bool>,
     /// Debounce window for a classpath rebuild after a watched build-file
-    /// change (`classpath_debounce_ms_opt`) — 2s by default, overridable via
-    /// `initializationOptions.classpathDebounceMs` so tests aren't forced to
-    /// sleep multiple seconds.
+    /// change; 2s by default, overridable via `classpathDebounceMs` so
+    /// tests don't need multi-second sleeps.
     pub(crate) classpath_debounce_ms: OnceLock<u64>,
     /// Debounce/coalescing decision state (see [`RebuildCoalescer`]),
     /// guarded by a plain `Mutex` — decisions are synchronous and quick,
@@ -237,19 +195,26 @@ pub(crate) struct Backend {
     /// `javac::run`'s polling loop so `shutdown` can kill+reap it — see
     /// `javac::kill_running_child`.
     pub(crate) javac_child: javac::SharedChild,
-    /// Bounded accounting of the reader threads abandoned by
-    /// timed-out/cancelled runs, so a misbehaving `jdk.home` binary can't
-    /// leak blocked threads without bound — `javac::run` refuses to start
-    /// once the cap is hit. See `javac::LeakedReaders` for the security
-    /// rationale.
+    /// Bounded accounting of reader threads abandoned by timed-out or
+    /// cancelled runs. `javac::run` refuses to start once the cap is hit,
+    /// so a misbehaving `jdk.home` binary can't leak threads without bound.
     pub(crate) javac_leaked_readers: javac::LeakedReaders,
-    /// Diagnostics from the last `checkProject` run, keyed by URI
-    /// string, merged into `compute_diagnostics`'s result for that file.
-    /// Cleared for a file on its next `didChange` (stale after edit) and
-    /// wholesale-replaced (with a publish to clear anything that dropped
-    /// out) on every new `checkProject` run — see
-    /// `Backend::publish_javac_diagnostics`.
+    /// Diagnostics from the last `checkProject` run, keyed by URI, merged
+    /// into `compute_diagnostics`'s result. Cleared for a file on its next
+    /// `didChange`, and wholesale-replaced on each new `checkProject` run.
     pub(crate) javac_diagnostics: StdMutex<HashMap<String, Vec<Diagnostic>>>,
+    /// Bumped on every event that can change an open document's
+    /// diagnostics (edit, open, close, watched file event).
+    /// `refresh_open_diagnostics` checks this before publishing, so a pass
+    /// superseded by a newer edit never overwrites fresher results.
+    pub(crate) semantic_generation: std::sync::atomic::AtomicU64,
+    /// Bumped only when a *provider* changes meaning for other files: an
+    /// accepted on-disk `.java` create/change/delete, an open document
+    /// closing, or a declaration-level edit. A `javac` run that started
+    /// before such a bump describes a workspace that no longer exists and
+    /// must not publish. Not bumped by `did_open`/`did_save` (autosave
+    /// would otherwise starve the compiler backstop).
+    pub(crate) provider_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Backend {
@@ -280,6 +245,8 @@ impl Backend {
             javac_child: Arc::new(StdMutex::new(None)),
             javac_leaked_readers: javac::LeakedReaders::new(),
             javac_diagnostics: StdMutex::new(HashMap::new()),
+            semantic_generation: std::sync::atomic::AtomicU64::new(0),
+            provider_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -301,15 +268,12 @@ impl Backend {
         self.supports_rename_file.get().copied().unwrap_or(false)
     }
 
-    /// The imported-type symbol source, built on first use from the user's JDK
-    /// plus the project's declared dependencies. The project root is the
-    /// workspace folder, or (if none) one derived from the first opened file.
+    /// The imported-type symbol source, built on first use from the JDK
+    /// plus the project's declared dependencies.
     ///
-    /// Returns a snapshot `Arc`: the caller holds its own reference-counted
-    /// handle to whichever `Classpath` was current the moment it asked, so a
-    /// concurrent rebuild swap never invalidates work already in
-    /// flight, and this method never holds `self.classpath`'s lock across an
-    /// `.await`.
+    /// Returns a snapshot `Arc`, so a concurrent rebuild swap never
+    /// invalidates work already in flight, and this method never holds
+    /// `self.classpath`'s lock across an `.await`.
     pub(crate) fn classpath(&self) -> Arc<jvl_classpath::Classpath> {
         if let Some(existing) = self
             .classpath
@@ -338,10 +302,9 @@ impl Backend {
         Duration::from_millis(self.classpath_debounce_ms.get().copied().unwrap_or(2000))
     }
 
-    /// Re-resolve the classpath from scratch on the blocking pool — the same
-    /// static, offline resolution the initial lazy build uses (no build tool
-    /// is ever invoked) — and swap it in atomically. Never holds
-    /// `self.classpath`'s lock across the `.await`.
+    /// Re-resolve the classpath from scratch on the blocking pool, using
+    /// the same static offline resolution as the initial build, and swap
+    /// it in atomically without holding the lock across an `.await`.
     async fn rebuild_classpath(&self) {
         let root = self.project_root();
         let built = tokio::task::spawn_blocking(move || {
@@ -352,12 +315,9 @@ impl Backend {
         *self.classpath.write().expect("classpath lock poisoned") = Some(Arc::new(built));
     }
 
-    /// Drive one or more debounce-then-rebuild cycles until settled.
-    /// Only the single caller that won `RebuildCoalescer::on_event`'s race
-    /// calls this (see `did_change_watched_files`) — every other concurrent
-    /// or later matching event just folds into the cycle already running
-    /// here, so at most one rebuild is ever in flight and exactly one more
-    /// runs if anything changed while it was.
+    /// Drive one or more debounce-then-rebuild cycles until settled. Only
+    /// the caller that wins `RebuildCoalescer::on_event`'s race calls this;
+    /// every other concurrent event folds into the cycle already running.
     pub(crate) async fn drive_classpath_rebuild(&self) {
         loop {
             tokio::time::sleep(self.classpath_debounce()).await;
@@ -399,8 +359,8 @@ impl Backend {
     }
 
     /// The workspace folder, or (if none) the root derived from the first
-    /// opened file — used both for classpath discovery and (here) as the base
-    /// for ladder step (c)'s conventional source-root candidates.
+    /// opened file. Used for classpath discovery and as the base for
+    /// conventional source-root candidates.
     pub(crate) fn project_root(&self) -> Option<PathBuf> {
         self.workspace_root
             .get()
@@ -408,12 +368,11 @@ impl Backend {
             .or_else(|| self.project_root_hint.get().and_then(|r| r.clone()))
     }
 
-    /// Candidate source roots for ladder step (c): the conventional
-    /// `src/main/java` and `src/test/java` under the project root, plus one
-    /// inferred from each open document's own path and `package` declaration
-    /// (`file = root/a/b/C.java` + `package a.b;` ⇒ `root`). No directory
-    /// walking — every root here is either a fixed convention or derived from
-    /// data already in memory (open documents' parsed trees).
+    /// Candidate source roots: the conventional `src/main/java` and
+    /// `src/test/java` under the project root, plus one inferred from each
+    /// open document's own path and `package` declaration. No directory
+    /// walking; every root is either a fixed convention or derived from
+    /// data already in memory.
     pub(crate) fn source_roots(
         &self,
         docs: &HashMap<String, Document>,
@@ -433,10 +392,10 @@ impl Backend {
         roots
     }
 
-    /// Candidate file paths for an FQN under every discovered source root
-    /// (ladder step (c)). `None` (rather than an empty list) when no project
-    /// root is known at all, or when `fqn` isn't safe to turn into a path
-    /// (guards against a crafted `package`/`import` escaping the root).
+    /// Candidate file paths for an FQN under every discovered source root.
+    /// Empty when no project root is known, or when `fqn` isn't safe to
+    /// turn into a path (guards against a crafted `package`/`import`
+    /// escaping the root).
     pub(crate) fn candidate_paths(
         &self,
         docs: &HashMap<String, Document>,
@@ -455,28 +414,8 @@ impl Backend {
             .collect()
     }
 
-    /// Rule (c): the package a document's own path implies it should
-    /// declare — `None` when no project root is known at all (a lone file
-    /// with no workspace) or the URI isn't a `file:`
-    /// path; otherwise the dotted directory segments between the *most
-    /// specific* containing source root and the file (possibly `""` — the
-    /// unnamed/default package — when the file sits directly under the
-    /// root). Only a root that is an actual prefix of the file's directory
-    /// counts as "confidently containing" it, matching rule (c)'s
-    /// conservative gate.
-    ///
-    /// Deliberately does NOT reuse [`Self::source_roots`]: that ladder
-    /// includes roots *inferred from other open documents'* package/path
-    /// coincidences (`infer_source_root`), which is fine for best-effort
-    /// navigation but unacceptable for a diagnostic — what error a file gets
-    /// must never depend on which unrelated sibling files happen to be open.
-    /// Only the fixed conventional roots (`src/main/java`, `src/test/java`
-    /// under the workspace root) qualify. The bare workspace root itself is
-    /// also deliberately excluded: a file at `root/tools/Foo.java` is far
-    /// more likely an ad-hoc/unconventional layout than a genuine claim
-    /// that `Foo` belongs to package `tools`, so flagging it would be a
-    /// false positive by construction. Unconventional layouts simply stay
-    /// silent — lone files and unknown roots produce no diagnostic.
+    /// Package implied by a file's location under fixed `src/main/java` or
+    /// `src/test/java` roots. Unknown layouts and the bare workspace root stay silent.
     pub(crate) fn expected_package(&self, uri: &str) -> Option<String> {
         let path = open_doc_path(uri)?;
         let dir = path.parent()?;
@@ -497,24 +436,15 @@ impl Backend {
         })
     }
 
-    /// The lazy, bounded workspace symbol index (see `workspace_index`),
-    /// exposed so another feature in this crate (e.g. a future add-import)
-    /// can do "simple name -> paths" lookups without re-walking the
-    /// workspace itself. Building/rebuilding only happens via `ensure_built`
-    /// (called from the `symbol` handler); this accessor never triggers it.
+    /// The lazy, bounded workspace symbol index, exposed for "simple name
+    /// -> paths" lookups without re-walking the workspace. This accessor
+    /// never triggers a build; only `ensure_built` does that.
     pub(crate) fn workspace_index(&self) -> &workspace_index::WorkspaceIndex {
         &self.workspace_index
     }
 
-    /// Refresh the workspace type-name index (see `workspace_index`)
-    /// before consulting `ProjectSymbols` — the same lock-roots-then-
-    /// release-then-walk choreography the `symbol` handler already used,
-    /// factored out so every interactive handler that now consults
-    /// closed project files can call it too. Cheap on the common case (a
-    /// handful of `stat`s, no walk) once nothing under a source root has
-    /// changed. Must be called *before* taking `self.documents`'s own lock
-    /// — it briefly takes that lock itself to compute source roots, and
-    /// `tokio::sync::Mutex` isn't reentrant.
+    /// Build the workspace type index before using `ProjectSymbols`.
+    /// Call before locking `documents`, because this method locks it briefly.
     pub(crate) async fn ensure_workspace_index(&self) {
         let project_root = self.project_root();
         let roots = {
@@ -529,23 +459,12 @@ impl Backend {
             .await;
     }
 
-    /// Parse (or reuse a cached parse of) a single project source file,
-    /// invalidated by `mtime` so an on-disk edit is picked up without an
-    /// explicit notification (the server never watches files). Shared by
-    /// ladder step (c) (`locate_in_project_file`, below) and
-    /// find-references' Tier 2 per-hit-file confirm (`references()`/
-    /// `references.rs`) — both are one-off, cold, parse-on-demand lookups
-    /// of a file that isn't open in the editor.
-    ///
-    /// A file over [`MAX_PROJECT_FILE_BYTES`] is reported exactly like an
-    /// unreadable one (`None`), never read or cached — conservatively safe
-    /// for every caller: ladder step (c) just tries the next fallback, and
-    /// `scan_references`'s Tier 2 confirm folds a `None` here into
-    /// `unparsed_hit_files`, which already forces `rename` to refuse rather
-    /// than risk missing an occurrence hiding in the skipped file.
+    /// Read or reuse a project file cached by `(mtime, len)`; watched changes
+    /// evict it explicitly. Oversized or unreadable files return `None`.
     pub(crate) fn parsed_project_file(&self, path: &Path) -> Option<(Arc<String>, Tree)> {
         let metadata = std::fs::metadata(path).ok()?;
-        if metadata.len() > MAX_PROJECT_FILE_BYTES {
+        let len = metadata.len();
+        if len > MAX_PROJECT_FILE_BYTES {
             return None;
         }
         let mtime = metadata.modified().ok()?;
@@ -554,7 +473,9 @@ impl Backend {
             .project_file_cache
             .lock()
             .expect("project file cache poisoned");
-        let fresh = cache.get(path).is_some_and(|c| c.mtime == mtime);
+        let fresh = cache
+            .get(path)
+            .is_some_and(|c| c.mtime == mtime && c.len == len);
         if !fresh {
             let text = std::fs::read_to_string(path).ok()?;
             let tree = self.parse(&text, None);
@@ -564,6 +485,7 @@ impl Backend {
                 path.to_path_buf(),
                 CachedProjectFile {
                     mtime,
+                    len,
                     text: Arc::new(text),
                     tree,
                 },
@@ -573,10 +495,26 @@ impl Backend {
         Some((Arc::clone(&cached.text), cached.tree.clone()))
     }
 
-    /// Parse (or reuse a cached parse of) a single project source file for
-    /// ladder step (c). At most one file is read per candidate tried, and the
-    /// caller (`resolve_location`) stops at the first hit — no directory
-    /// walking or indexing.
+    /// Evict `path` (both its literal and canonicalized form) from the
+    /// project-file cache, forcing the next [`Self::parsed_project_file`]
+    /// call to re-read it regardless of `(mtime, len)` — needed since a
+    /// same-size in-place rewrite can land within one mtime tick.
+    pub(crate) fn evict_project_file(&self, path: &Path) {
+        let mut cache = self
+            .project_file_cache
+            .lock()
+            .expect("project file cache poisoned");
+        cache.remove(path);
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            if canon != path {
+                cache.remove(&canon);
+            }
+        }
+    }
+
+    /// Parse (or reuse a cached parse of) a project source file candidate.
+    /// The caller stops at the first hit, so at most one file is read per
+    /// candidate tried — no directory walking or indexing.
     pub(crate) fn locate_in_project_file(
         &self,
         path: &Path,
@@ -627,19 +565,16 @@ impl Backend {
         jvl_syntax::parse(&mut parser, text, old).expect("parser yields a tree for in-memory text")
     }
 
-    /// Parse a freshly opened (or fully replaced) document from scratch, store
-    /// it, and publish its diagnostics.
+    /// Parse a freshly opened (or fully replaced) document, store it, and
+    /// recompute every open document's diagnostics, since opening a file
+    /// can change what other already-open files can now resolve.
     pub(crate) async fn open_document(&self, uri: Uri, version: i32, text: String) {
         let tree = self.parse(&text, None);
-        // Warm the classpath (its first-ever build scans the JDK/project
-        // dependencies and can be comparatively slow) before taking the
-        // documents lock below — `compute_diagnostics` calls `self.classpath()`
-        // again for the unresolved-member pass, but by then it's just an
-        // `Arc` clone under `classpath`'s own (separate, briefly-held) lock,
-        // never the expensive build. Safe because `classpath()` is an
-        // idempotent, order-independent double-checked read/build.
+        // Warm the classpath (first build scans the JDK/project deps and
+        // can be slow) before taking the documents lock below; `classpath()`
+        // is an idempotent, order-independent double-checked read/build.
         self.classpath();
-        let diagnostics = {
+        {
             let mut docs = self.documents.lock().await;
             docs.insert(
                 uri.as_str().to_string(),
@@ -649,22 +584,17 @@ impl Backend {
                     version,
                 },
             );
-            self.compute_diagnostics(&docs, uri.as_str())
-        };
-        self.client
-            .publish_diagnostics(uri, diagnostics, Some(version))
-            .await;
+            self.semantic_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.refresh_open_diagnostics(StaleJavac::None).await;
     }
 
-    /// `REBUILD_CLASSPATH_COMMAND` — an immediate, synchronous classpath
-    /// rebuild (unlike `drive_classpath_rebuild`'s debounced version driven by
-    /// watched build-file changes), used by the fixed-point loop that follows
-    /// a consent-gated dependency install: the extension awaits this
-    /// `executeCommand` response before re-querying `jvl/missingDependencies`,
-    /// so it must reflect the just-installed jar(s) by the time it returns.
-    /// Reuses the exact same static/offline resolution as every other
-    /// rebuild path — this command itself never touches the network; it only
-    /// re-reads whatever the extension already placed under `~/.m2`.
+    /// `REBUILD_CLASSPATH_COMMAND`: an immediate, synchronous classpath
+    /// rebuild (unlike `drive_classpath_rebuild`'s debounced version), used
+    /// after a dependency install so `jvl/missingDependencies` reflects the
+    /// just-installed jars. Never touches the network itself; it only
+    /// re-reads what the extension already placed under `~/.m2`.
     pub(crate) async fn run_rebuild_classpath_command(&self) -> serde_json::Value {
         self.rebuild_classpath().await;
         self.republish_all_diagnostics().await;
@@ -673,9 +603,8 @@ impl Backend {
 }
 
 /// Whether every dotted segment of a fully-qualified name is a safe, single
-/// path component — guards ladder step (c)'s file lookup against a crafted
-/// `package`/`import` declaration escaping the inferred source root (e.g. a
-/// `..` segment) when building a candidate path.
+/// path component. Guards file lookup against a crafted `package`/`import`
+/// escaping the source root (e.g. via a `..` segment).
 fn is_safe_fqn(fqn: &str) -> bool {
     !fqn.is_empty()
         && fqn
@@ -690,11 +619,9 @@ pub(crate) fn simple_name(fqn: &str) -> &str {
 }
 
 /// Render a signature-only stub `.java`-shaped text from bytecode-derived
-/// `ClassInfo` — used when no `-sources.jar`/`src.zip` entry exists for an
+/// `ClassInfo`, used when no `-sources.jar`/`src.zip` entry exists for an
 /// external type. Reuses the member signatures `jvl-classpath` already
-/// rendered (via its own signature/generics helpers) rather than re-deriving
-/// them; declarations have no bodies, which is ordinary Java syntax
-/// (abstract methods, interface methods) and parses fine.
+/// rendered rather than re-deriving them.
 fn render_stub(info: &jvl_classpath::ClassInfo) -> String {
     let mut out = format!(
         "// Signature-only stub for {} (no sources available)\nclass {} {{\n",
@@ -711,10 +638,8 @@ fn render_stub(info: &jvl_classpath::ClassInfo) -> String {
 }
 
 /// Insert into the bounded project-file cache, clearing it wholesale when
-/// the cap is reached (the same simple bound-not-LRU policy as the external
-/// stub cache — see [`PROJECT_FILE_CACHE_CAP`]'s doc comment for sizing).
-/// A free function (not a `Backend` method) so the overflow behavior is
-/// directly unit-testable without constructing a `Client`.
+/// the cap is reached. A free function (not a `Backend` method) so the
+/// overflow behavior is unit-testable without constructing a `Client`.
 pub(crate) fn insert_bounded_project_file(
     cache: &mut HashMap<PathBuf, CachedProjectFile>,
     cap: usize,
@@ -731,5 +656,117 @@ pub(crate) fn byte_range_to_lsp(index: &LineIndex, range: StdRange<usize>) -> Ra
     Range {
         start: index.position(range.start),
         end: index.position(range.end),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::LspService;
+
+    /// A bare `Backend` for a direct (non-LSP-transport) unit test — mirrors
+    /// `main.rs`'s own `test_backend` helper (private to that module's test
+    /// suite, so duplicated here rather than shared).
+    fn test_backend() -> LspService<Backend> {
+        let (service, _socket) = LspService::new(Backend::new);
+        service
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jvl-backend-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A same-mtime, different-length content change must be picked up: the
+    /// `(mtime, len)` cache key catches what an `mtime`-only key would miss
+    /// whenever a rewrite happens to land within one filesystem mtime tick.
+    #[test]
+    fn parsed_project_file_rereads_when_length_changes_at_same_mtime() {
+        let service = test_backend();
+        let backend = service.inner();
+        let dir = temp_dir("len-change");
+        let path = dir.join("Foo.java");
+
+        std::fs::write(&path, "class Foo {}\n").expect("write");
+        let (text, _) = backend.parsed_project_file(&path).expect("first parse");
+        assert_eq!(text.as_str(), "class Foo {}\n");
+        let mtime = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        // Different length, same mtime forced back onto the file.
+        std::fs::write(&path, "class FooRenamed {}\n").expect("rewrite");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for mtime reset")
+            .set_modified(mtime)
+            .expect("reset mtime");
+
+        let (text, _) = backend.parsed_project_file(&path).expect("second parse");
+        assert_eq!(
+            text.as_str(),
+            "class FooRenamed {}\n",
+            "a different length at the same mtime must force a re-read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `evict_project_file` forces a re-read even when a rewrite happens to
+    /// land on both the exact same mtime AND the exact same length — the one
+    /// case the `(mtime, len)` cache key alone cannot distinguish from "the
+    /// file didn't change".
+    #[test]
+    fn evict_project_file_forces_reread_even_when_mtime_and_len_unchanged() {
+        let service = test_backend();
+        let backend = service.inner();
+        let dir = temp_dir("evict");
+        let path = dir.join("Foo.java");
+
+        std::fs::write(&path, "class Foo1 {}\n").expect("write");
+        let (text, _) = backend.parsed_project_file(&path).expect("first parse");
+        assert!(text.contains("Foo1"));
+        let mtime = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        // Same length ("Foo1" / "Foo2"), same mtime forced back onto the file.
+        std::fs::write(&path, "class Foo2 {}\n").expect("rewrite, same length");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for mtime reset")
+            .set_modified(mtime)
+            .expect("reset mtime");
+
+        let (stale, _) = backend
+            .parsed_project_file(&path)
+            .expect("still-cached parse");
+        assert!(
+            stale.contains("Foo1"),
+            "sanity: an unchanged (mtime, len) key must still serve the stale cached text"
+        );
+
+        backend.evict_project_file(&path);
+        let (fresh, _) = backend
+            .parsed_project_file(&path)
+            .expect("post-evict parse");
+        assert!(
+            fresh.contains("Foo2"),
+            "evict_project_file must force a re-read even with an unchanged (mtime, len) key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

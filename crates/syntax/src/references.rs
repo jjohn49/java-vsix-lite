@@ -1,35 +1,5 @@
-//! Find references — two-tier, bounded, confirm-by-resolution.
-//!
-//! Every reference target falls into one of two visibility tiers, read off
-//! the declaration's modifiers via [`crate::model::has_modifier`] (a missing
-//! modifier is Java's package-private default):
-//!
-//! - [`Tier::FileLocal`]: a local variable, a parameter, or a `private`
-//!   member — such a declaration cannot be referenced outside the file that
-//!   declares it, so its references are found by scanning *that one file*.
-//! - [`Tier::Workspace`]: package-private, `protected`, or `public` — such a
-//!   declaration may be referenced from any file in the workspace (subject to
-//!   the server's bounded prefilter/scan; this crate stays filesystem-free
-//!   and only ever sees documents the caller hands it).
-//!
-//! Both tiers use the same confirm-by-resolution substrate as goto-definition
-//! (`lookup_binding`, `resolve_receiver_type`, and the namespace-aware
-//! `find_member_hier_of_kind` — fields and methods are separate namespaces in
-//! Java, so a field and a same-named method must never conflate) — this
-//! module adds no new resolution logic beyond one local refinement: a bare
-//! type name is only accepted as a match when the *scanned file's own*
-//! imports/package would actually resolve that name to the candidate's real
-//! package (see [`bare_type_site`]). Without that check, two
-//! same-simple-name types from different packages would be conflated
-//! whenever only one of them is present in the small per-file confirm slice
-//! (see the module's `different_package_import_is_not_confirmed` test).
-//!
-//! [`reference_target`] resolves the cursor to a target + tier; the server
-//! decides, from the tier, whether to scan just the declaring file (already
-//! open, already parsed) or to run its own bounded workspace prefilter and
-//! call [`references_in_doc`] once per hit file (parsed on demand). Keeping
-//! that orchestration in the server — not here — is what keeps this crate a
-//! pure library over given sources (no directory walking, no file reads).
+//! Bounded find-references with file-local and workspace visibility tiers.
+//! Every text hit is confirmed through the same resolver as goto-definition.
 
 use std::ops::Range;
 
@@ -43,7 +13,8 @@ use crate::model::{
     has_modifier, named_children, DeclSite, Member, MemberKind, TypeDecl, TypeTable,
 };
 use crate::resolve::{
-    self, Binding, BindingKind, Ctx, HierMember, MemberNamespace, Resolved, ResolvedType,
+    self, Binding, BindingKind, Ctx, FactsCache, HierMember, MemberNamespace, Resolved,
+    ResolvedType,
 };
 use crate::{node_text, LineIndex, OpenDoc};
 
@@ -69,12 +40,10 @@ pub struct ReferenceTarget {
     pub tier: Tier,
 }
 
-/// The confirmed reference ranges within one scanned document, plus a count
-/// of textually-plausible member-access occurrences that could not be
-/// confirmed at all (the receiver's type didn't resolve — e.g. an unknown
-/// supertype). Those are conservatively excluded from `ranges` rather than
-/// risking a false positive; `possible` lets a caller surface that the
-/// result may be incomplete.
+/// Confirmed reference ranges in one scanned document, plus a count of
+/// textually-plausible member-access occurrences whose receiver type
+/// didn't resolve. Those are excluded from `ranges`; `possible` lets a
+/// caller flag that the result may be incomplete.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceHits {
     pub ranges: Vec<Range<usize>>,
@@ -82,10 +51,9 @@ pub struct ReferenceHits {
 }
 
 /// Resolve the identifier under the cursor to a [`ReferenceTarget`]. Only
-/// symbols declared in one of the given open documents are supported
-/// (open-files-first, matching the rest of this crate): `None` for anything
-/// else — an external (JDK/dependency) symbol, a bare type name that isn't
-/// declared in any given document, `this`/`super`, or a non-identifier.
+/// symbols declared in one of the given open documents are supported;
+/// `None` covers everything else (external symbols, undeclared bare
+/// types, `this`/`super`, non-identifiers).
 pub fn reference_target(
     docs: &[OpenDoc],
     current: usize,
@@ -97,12 +65,15 @@ pub fn reference_target(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let name_node = identifier_at(doc.tree, cursor)?;
@@ -118,21 +89,8 @@ pub fn reference_target(
     })
 }
 
-/// List every reference to `target` inside `docs[current]`: walk every
-/// identifier-like node in its tree, resolve each the same way
-/// [`reference_target`] resolves the cursor (using `docs[current]`'s own
-/// imports/package context — [`bare_type_site`] is what makes this
-/// file-context-sensitive rather than a blind textual match), and keep the
-/// ones whose resolved declaration site is `target`.
-///
-/// `target_doc` indexes into *this same* `docs` slice — the caller places the
-/// target's declaring document there (at the same index in both the
-/// single-file scan for [`Tier::FileLocal`] and the two-document
-/// `[hit, target]` slice built per hit file for [`Tier::Workspace`]).
-///
-/// When `include_declaration` is `false`, the declaration's own name
-/// occurrence (identified by its byte range exactly matching `target`'s) is
-/// omitted from the result.
+/// Resolve references to `target` inside `docs[current]`.
+/// `target.doc` must index this slice; declarations are optional.
 pub fn references_in_doc(
     docs: &[OpenDoc],
     current: usize,
@@ -145,22 +103,23 @@ pub fn references_in_doc(
     };
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let mut ranges = Vec::new();
     let mut possible = 0usize;
     let mut stack = vec![doc.tree.root_node()];
     while let Some(node) = stack.pop() {
-        // Only identifiers spelled exactly like the target can reference it
-        // (Java has no aliasing) — everything else is skipped before any
-        // resolution work, which both keeps the walk cheap and scopes the
-        // `possible` counter to *this target's* unconfirmable textual hits.
+        // Only identifiers spelled like the target can reference it (Java
+        // has no aliasing), so everything else skips resolution entirely.
         if matches!(node.kind(), "identifier" | "type_identifier")
             && node_text(node, doc.source) == target.name
         {
@@ -193,19 +152,18 @@ enum Occurrence<'t> {
     /// in-project member, or an in-project type. May or may not be the
     /// requested target; the caller compares `DeclSite`s.
     Site(ResolvedSite<'t>),
-    /// A member-access position (`recv.name` / `recv.name()`) whose receiver
-    /// type could not be resolved at all — textually plausible but
-    /// unconfirmable (tracked as `possible`, never counted as a match).
+    /// A member-access position (`recv.name` / `recv.name()`) whose
+    /// receiver type didn't resolve — plausible but unconfirmable, tracked
+    /// as `possible`, never a match.
     UnresolvedReceiver,
     /// Not a reference this analysis recognizes, or one that resolves to an
     /// external symbol (no `DeclSite` to compare against).
     None,
 }
 
-/// A resolved declaration, tagged by which of the three substrates
-/// (`resolve.rs`'s bindings, `model.rs`'s members, or its type table)
-/// produced it — enough to answer both "where is it declared" and "how
-/// visible is it".
+/// A resolved declaration, tagged by which substrate produced it —
+/// bindings, members, or the type table — enough to know where it's
+/// declared and how visible it is.
 enum ResolvedSite<'t> {
     Binding(Binding<'t>),
     Member(Member<'t>),
@@ -221,10 +179,8 @@ impl<'t> ResolvedSite<'t> {
         }
     }
 
-    /// This declaration's visibility tier, from its own modifiers (a missing
-    /// modifier on a field/method/type is Java's package-private default —
-    /// `Tier::Workspace`, since another file in the same package may
-    /// reference it).
+    /// This declaration's visibility tier, from its own modifiers. A
+    /// missing modifier is Java's package-private default (`Tier::Workspace`).
     fn tier(&self) -> Tier {
         match self {
             ResolvedSite::Binding(b) => match b.kind {
@@ -252,11 +208,9 @@ fn field_tier(decl_node: Node, source: &str) -> Tier {
     }
 }
 
-/// A member's tier: same `private`-on-self-or-owner check as
-/// [`field_tier`] for a field member (record components are field-shaped
-/// `formal_parameter` nodes with no modifiers of their own — parent lookup
-/// is harmless there and simply finds none); methods and nested types carry
-/// their own modifiers directly.
+/// A member's tier: same private-on-self-or-owner check as [`field_tier`]
+/// for fields; methods and nested types carry their own modifiers
+/// directly.
 fn member_tier(m: &Member) -> Tier {
     let private = match m.kind {
         MemberKind::Field => field_tier(m.node, m.source) == Tier::FileLocal,
@@ -277,20 +231,12 @@ fn type_tier(td: &TypeDecl) -> Tier {
     }
 }
 
-/// Resolve one identifier-like node the same way goto-definition's ladder
-/// does (mirrors `definition::resolve_definition`'s branching), with three
-/// reference-specific differences:
-///
-/// - a bare type name goes through [`bare_type_site`]'s package-aware gate
-///   instead of a blind `TypeTable` lookup;
-/// - a method declaration's own name — the one shape goto-definition never
-///   resolves *from* — is its own declaration site directly (no lookup: the
-///   node in hand IS the declaration, so a same-named field can't hijack it);
-/// - member lookups are namespace-aware (JLS §6.5: fields and methods live
-///   in separate namespaces): a `method_invocation`'s name resolves against
-///   METHODS only, a `field_access` field / bare expression identifier
-///   against FIELDS only — a field and a same-named method must never
-///   conflate (see `resolve::MemberNamespace`).
+/// Resolve one identifier node the same way goto-definition does, with two
+/// reference-specific differences: bare type names use
+/// [`bare_type_site`]'s package-aware gate, and a method declaration's own
+/// name is its own declaration site directly (no lookup needed). Member
+/// lookups are also namespace-aware — fields and methods (JLS §6.5) never
+/// conflate.
 fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     if !matches!(name_node.kind(), "identifier" | "type_identifier") {
         return Occurrence::None;
@@ -298,9 +244,8 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
-        // A method's own declaration name resolves to ITS OWN declaration —
-        // the node in hand is the declaration, so no member lookup is needed
-        // (and a name-only lookup could wrongly land on a same-named field).
+        // A method's own declared name is its own declaration; no lookup
+        // is needed, so a same-named field can't hijack it.
         if parent.kind() == "method_declaration" && field_is(parent, "name", name_node) {
             return Occurrence::Site(ResolvedSite::Member(Member {
                 name,
@@ -324,14 +269,19 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
                 };
             }
             "method_invocation" if field_is(parent, "name", name_node) => {
-                let resolved = match parent.child_by_field_name("object") {
-                    Some(object) => resolve::resolve_receiver_type(object, ctx),
-                    None => resolve::enclosing_typedecl(name_node, ctx.doc.source, ctx.current)
-                        .map(|td| Resolved {
-                            ty: ResolvedType::InProject(td),
-                            static_only: false,
-                        }),
-                };
+                let resolved =
+                    match parent.child_by_field_name("object") {
+                        Some(object) => resolve::resolve_receiver_type(object, ctx),
+                        None => resolve::enclosing_typedecl(name_node, ctx.table, ctx.current).map(
+                            |td| Resolved {
+                                ty: ResolvedType::InProject {
+                                    decl: td,
+                                    args: Vec::new(),
+                                },
+                                static_only: false,
+                            },
+                        ),
+                    };
                 return match resolved {
                     Some(resolved) => {
                         member_occurrence(&resolved, ctx, name, MemberNamespace::Method)
@@ -357,9 +307,9 @@ fn classify<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
         }
     }
 
-    // Plain reference: a local/param/field binding (a bare identifier in
-    // expression position can only be a variable or field, never a method —
-    // methods require an argument list), else a bare in-project type name.
+    // Plain reference: a local/param/field binding, else a bare
+    // in-project type name. A bare identifier can never be a method —
+    // methods require an argument list.
     if let Some(binding) = resolve::lookup_binding(
         ctx.doc.tree,
         ctx.doc.source,
@@ -381,22 +331,17 @@ fn member_occurrence<'t>(
 ) -> Occurrence<'t> {
     match resolve::find_member_hier_of_kind(resolved, ctx, name, namespace) {
         Some(HierMember::InProject(m)) => Occurrence::Site(ResolvedSite::Member(m)),
-        // External (no `DeclSite`) or no such member on an otherwise-resolved
-        // receiver: genuinely not our target, not a receiver-resolution
-        // failure — not "possible" either.
+        // External member, or no such member on a resolved receiver: not
+        // our target, and not a `possible` receiver-resolution failure.
         _ => Occurrence::None,
     }
 }
 
-/// A bare type name, gated by whether the *scanned file's own*
-/// imports/package would actually resolve `name` to the candidate's real
-/// package. Without this, a same-simple-name type declared in a different
-/// package would be wrongly confirmed whenever the per-file confirm slice
-/// happens to contain only the target's declaration and not the
-/// unrelated same-named type the scanned file actually imports (there is
-/// nothing else in that small slice for `TypeTable::get` to prefer). A type
-/// declared in the *scanned file itself* needs no such check — it is
-/// unambiguously in scope regardless of what it imports.
+/// A bare type name, gated by whether the scanned file's own
+/// imports/package actually resolve `name` to the candidate's real
+/// package. Without this gate, same-simple-name types from different
+/// packages could be conflated whenever the small per-file confirm slice
+/// contains only one of them.
 fn bare_type_site<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     match confirm_bare_type(name, ctx) {
         Some(td) => Occurrence::Site(ResolvedSite::Type(td)),
@@ -404,33 +349,16 @@ fn bare_type_site<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Occurrence<'t> {
     }
 }
 
-/// The confirm-by-resolution core of [`bare_type_site`], factored out so
-/// go-to-implementation (`implementation.rs`) can reuse the exact same
-/// import/package-aware gate for confirming a supertype (`extends`/
-/// `implements`) reference in a scanned file actually names the target type
-/// declaration, not an unrelated same-simple-name type from a different
-/// package. See [`bare_type_site`]'s doc comment for the gate's rationale.
+/// Core of [`bare_type_site`], factored out so `implementation.rs` can
+/// reuse the same package-aware gate when confirming `extends`/
+/// `implements` supertype references.
 pub(crate) fn confirm_bare_type<'t>(name: &str, ctx: &Ctx<'_, 't>) -> Option<TypeDecl<'t>> {
-    let td = ctx.table.get(name)?;
-    if td.doc != ctx.current {
-        let actual_fqn = package_of(td.node, td.source)
-            .map(|pkg| format!("{pkg}.{name}"))
-            .unwrap_or_else(|| name.to_string());
-        if !ctx.imports.candidates(name).contains(&actual_fqn) {
-            return None;
-        }
-    }
-    Some(td.clone())
+    resolve::resolve_simple_in_project(name, ctx)
 }
 
-/// The dotted `package` path declared in `node`'s own document (walked up to
-/// the root, independent of any particular file's `Imports` — used to learn
-/// a *candidate* type's actual package, as opposed to the scanned file's
-/// own, which `Imports::parse` already gives us).
-///
-/// `pub(crate)`: also used by `implementation.rs` to compute the
-/// TARGET type's real FQN for confirming fully-qualified `extends`/
-/// `implements` entries.
+/// The dotted `package` path declared in `node`'s own document — used to
+/// learn a *candidate* type's actual package, as opposed to the scanned
+/// file's own (already given by `Imports::parse`).
 pub(crate) fn package_of(node: Node, source: &str) -> Option<String> {
     let mut root = node;
     while let Some(parent) = root.parent() {
@@ -461,10 +389,9 @@ mod tests {
             .expect("reference target resolved")
     }
 
-    /// A local variable's target resolves with `Tier::FileLocal`, and
-    /// scanning its declaring document finds exactly its two usages (plus the
-    /// declaration when `includeDeclaration` is honored) — an inner shadowing
-    /// declaration of the same name is NOT counted for the outer variable.
+    /// A local variable's target is `Tier::FileLocal`; its two usages are
+    /// found (plus the declaration when included). A shadowing inner
+    /// declaration of the same name is not counted for the outer variable.
     #[test]
     fn local_var_usages_found_with_shadow_excluded() {
         let src = "class C {\n\
@@ -505,10 +432,9 @@ mod tests {
         assert!(with_decl.ranges.contains(&(decl..decl + 1)));
     }
 
-    /// A `private` method's target resolves with `Tier::FileLocal`;
-    /// calls within the declaring file (unqualified and via `this.`) are all
-    /// counted, but a same-named method on a *different* type in the same
-    /// file is not.
+    /// A `private` method's target is `Tier::FileLocal`. Calls in the
+    /// declaring file are counted, but a same-named method on a different
+    /// type is not.
     #[test]
     fn private_method_calls_counted_different_type_excluded() {
         let src = "class A {\n\
@@ -535,11 +461,9 @@ mod tests {
         assert!(!hits.ranges.iter().any(|r| r.start == b_helper_decl));
     }
 
-    /// A public type's target (declared in one given document) is
-    /// confirmed as a reference from a *second* given document that imports
-    /// it, but NOT from a third document that imports a same-simple-name
-    /// type from a *different* package — semantic (import-aware) confirm
-    /// beats a blind textual/simple-name match.
+    /// A public type's reference is confirmed from a document that imports
+    /// it, but not from one that imports a same-simple-name type from a
+    /// different package — import-aware confirm beats a blind name match.
     #[test]
     fn public_type_confirmed_via_import_different_package_excluded() {
         let doc_a = "package pub1;\npublic class Foo {}\n";
@@ -626,11 +550,9 @@ mod tests {
         assert_eq!(hits.ranges[0], this_name..this_name + "name".len());
     }
 
-    /// A field and a method with the SAME name
-    /// in the same class (Java keeps them in separate namespaces) must not
-    /// conflate — references on the field find only field occurrences
-    /// (declaration + `c.foo`), references on the method only method
-    /// occurrences (declaration + `c.foo()`), from every cursor position.
+    /// A field and method with the same name in one class (separate
+    /// namespaces in Java) must not conflate — each finds only its own
+    /// occurrences, from every cursor position.
     #[test]
     fn field_and_method_with_same_name_do_not_conflate() {
         let src = "class C {\n\
@@ -649,9 +571,8 @@ mod tests {
         let field_use = src.find("foo + 1").unwrap();
         let call = src.find("foo();").unwrap();
 
-        // All four cursor positions resolve, and to exactly two distinct
-        // targets: {field decl, field use} -> the field's DeclSite;
-        // {method decl, call} -> the method's DeclSite.
+        // All four cursor positions resolve to exactly two distinct
+        // targets: the field's DeclSite, or the method's DeclSite.
         let t_field_decl = target_at(&docs, 0, "foo;");
         let t_method_decl = target_at(&docs, 0, "foo() {}");
         let t_field_use = target_at(&docs, 0, "foo + 1");
@@ -691,11 +612,9 @@ mod tests {
         assert!(method_hits.ranges.contains(&(call..call + 3)));
     }
 
-    /// Cross-kind through the hierarchy — a
-    /// field `foo` in the superclass (another doc) and a method `foo()` in
-    /// the subclass must stay separate: `b.foo` resolves to the inherited
-    /// field, `b.foo()` to the subclass method, and neither's references
-    /// include the other's occurrences.
+    /// A superclass field and subclass method sharing a name stay separate
+    /// through inheritance: `b.foo` resolves to the field, `b.foo()` to
+    /// the method, with no cross-contamination.
     #[test]
     fn cross_kind_same_name_through_hierarchy_does_not_conflate() {
         let doc_a = "class A { int foo; }\n";

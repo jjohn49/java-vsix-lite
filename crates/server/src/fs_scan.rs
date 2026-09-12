@@ -1,88 +1,89 @@
-//! Shared depth-first `.java` file traversal used by both the workspace
-//! symbol index (`workspace_index`) and the references/rename prefilter
-//! (`references`). Both need the exact same walking discipline — skip
-//! hidden/`build`/`target`/`.git` dirs, canonicalize and boundary-check every
-//! path so a symlink can't escape the workspace root, de-duplicate visited
-//! canonical directories so an in-boundary symlink can't be walked twice or
-//! cycle forever, and yield to the async runtime periodically for
-//! cancellability — but apply a different cap and a different leaf action to
-//! what they find (a filename + header scan vs. a full-content substring
-//! search), so this module owns only the walk itself: each caller supplies
-//! its own per-file callback and decides for itself when its own cap has
-//! been reached.
+//! Shared bounded `.java` traversal for workspace symbols and references.
+//! Skips unsafe paths, prevents symlink cycles, and yields for cancellation.
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-/// Directory names skipped unconditionally while walking (build output and
-/// VCS metadata never contain source worth indexing or searching). Hidden
-/// (dot-prefixed) directories are skipped separately, by name pattern.
+/// Directories always skipped when walking (build output and VCS metadata).
+/// Hidden (dot-prefixed) directories are skipped separately.
 pub(crate) const SKIPPED_DIR_NAMES: [&str; 3] = ["target", "build", ".git"];
 
-/// How many directory entries are processed between yields to the async
-/// runtime — keeps a cancelled (dropped) caller future stopping promptly
-/// rather than running a whole scan to completion in one synchronous burst.
+/// Whether a path component is skipped by the walk: hidden (dot-prefixed) or
+/// one of [`SKIPPED_DIR_NAMES`]. Also used by watched-file validation so
+/// excluded paths are rejected consistently.
+pub(crate) fn is_excluded_component(name: &str) -> bool {
+    name.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name)
+}
+
+/// Directory entries processed between yields to the async runtime, so a
+/// cancelled scan stops promptly instead of running to completion.
 const YIELD_INTERVAL: usize = 32;
 
-/// Depth-first walk of `root` for `.java` files, invoking `on_file` once per
-/// candidate file found (in unspecified order).
-///
-/// `on_file` returns whether the walk should keep going: a caller enforcing
-/// its own cap (entry count, byte count, or some combination) checks that
-/// cap at the top of its callback and returns `false` once it's already been
-/// reached, without doing any further work for that file. The walk stops as
-/// soon as `on_file` returns `false`, and this function returns `true` (this
-/// root's scan was cut short); it returns `false` once `root`'s subtree has
-/// been walked to completion.
-///
-/// Applies uniformly, regardless of what `on_file` does with each file:
-/// - **hidden/build dirs**: any dot-prefixed directory name, plus
-///   `target`/`build`/`.git` ([`SKIPPED_DIR_NAMES`]), is skipped outright.
-/// - **workspace boundary**: every path is canonicalized before being
-///   followed (a directory) or handed to `on_file` (a file); when `boundary`
-///   is given — expected already-canonicalized, since callers canonicalize
-///   it once rather than once per root — anything that canonicalizes
-///   outside it, including a symlink pointing outside it, is skipped rather
-///   than followed or read.
-/// - **symlink escape/cycle protection**: canonical directory paths already
-///   walked (within this one call, i.e. this one root) are tracked; a
-///   symlink pointing at an already-visited sibling (would duplicate its
-///   contents) or at an ancestor (would cycle forever) resolves to an
-///   already-seen canonical path and is skipped rather than re-descended
-///   into.
-/// - **cancellation**: yields to the tokio runtime every [`YIELD_INTERVAL`]
-///   directory entries processed, so a dropped caller future actually stops
-///   promptly instead of running one uninterrupted synchronous burst.
+/// Outcome of a [`walk_java_files`] call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Walk {
+    /// `on_file` returned `false`, so the walk was cut short.
+    pub(crate) stopped_early: bool,
+    /// A directory read or path canonicalization failed, so files may be
+    /// missing. Callers caching the result should treat it as incomplete.
+    pub(crate) io_errors: bool,
+}
+
+/// Walk `.java` files under `root` until `on_file` returns `false`.
+/// Paths must stay inside `boundary`; [`Walk`] reports partial scans.
 pub(crate) async fn walk_java_files(
     root: &Path,
     boundary: Option<&Path>,
     mut on_file: impl FnMut(&Path) -> bool,
-) -> bool {
+) -> Walk {
+    let mut walk = Walk::default();
     let mut stack = vec![root.to_path_buf()];
     let mut since_yield = 0usize;
     let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-    if let Ok(root_canon) = fs::canonicalize(root) {
-        visited_dirs.insert(root_canon);
+    match fs::canonicalize(root) {
+        Ok(root_canon) => {
+            visited_dirs.insert(root_canon);
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => walk.io_errors = true,
+        Err(_) => {}
     }
 
     while let Some(dir) = stack.pop() {
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            continue;
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    walk.io_errors = true;
+                }
+                continue;
+            }
         };
-        for dir_entry in read_dir.flatten() {
+        for result in read_dir {
+            let dir_entry = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        walk.io_errors = true;
+                    }
+                    continue;
+                }
+            };
             let path = dir_entry.path();
             let name = dir_entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || SKIPPED_DIR_NAMES.contains(&name_str.as_ref()) {
+            if is_excluded_component(name_str.as_ref()) {
                 continue;
             }
-
-            // Canonicalize + boundary check up front: this is also what
-            // keeps a symlink escaping the workspace root from being
-            // followed (a dir) or read (a file).
-            let Ok(canon) = fs::canonicalize(&path) else {
-                continue;
+            let canon = match fs::canonicalize(&path) {
+                Ok(canon) => canon,
+                Err(error) => {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        walk.io_errors = true;
+                    }
+                    continue;
+                }
             };
             if let Some(boundary) = boundary {
                 if !canon.starts_with(boundary) {
@@ -95,11 +96,11 @@ pub(crate) async fn walk_java_files(
                     // Newly-seen canonical directory: descend into it.
                     stack.push(path);
                 }
-                // Already-walked canonical directory: a same-root sibling
-                // symlink (would duplicate every file under it) or an
-                // ancestor symlink (would cycle). Skip either way.
+                // Already-walked directory: a duplicate sibling symlink or a
+                // cycling ancestor symlink. Skip either way.
             } else if name_str.ends_with(".java") && !on_file(&path) {
-                return true;
+                walk.stopped_early = true;
+                return walk;
             }
 
             since_yield += 1;
@@ -110,7 +111,7 @@ pub(crate) async fn walk_java_files(
         }
     }
 
-    false
+    walk
 }
 
 #[cfg(test)]
@@ -150,13 +151,13 @@ mod tests {
 
         let mut found = Vec::new();
         let root_canon = fs::canonicalize(&root).expect("canonicalize root");
-        let truncated = walk_java_files(&root, Some(&root_canon), |path| {
+        let walk = walk_java_files(&root, Some(&root_canon), |path| {
             found.push(path.to_path_buf());
             true
         })
         .await;
 
-        assert!(!truncated);
+        assert_eq!(walk, Walk::default());
         assert_eq!(found.len(), 1, "only the non-skipped file must be found");
         assert!(found[0].ends_with("Foo.java"));
 
@@ -173,13 +174,13 @@ mod tests {
 
         let mut found = Vec::new();
         let root_canon = fs::canonicalize(&root).expect("canonicalize root");
-        let truncated = walk_java_files(&root, Some(&root_canon), |path| {
+        let walk = walk_java_files(&root, Some(&root_canon), |path| {
             found.push(path.to_path_buf());
             true
         })
         .await;
 
-        assert!(!truncated);
+        assert_eq!(walk, Walk::default());
         assert!(
             found.is_empty(),
             "a symlink escaping the boundary must not be followed"
@@ -199,13 +200,13 @@ mod tests {
 
         let mut found = Vec::new();
         let root_canon = fs::canonicalize(&root).expect("canonicalize root");
-        let truncated = walk_java_files(&root, Some(&root_canon), |path| {
+        let walk = walk_java_files(&root, Some(&root_canon), |path| {
             found.push(path.to_path_buf());
             true
         })
         .await;
 
-        assert!(!truncated, "a cycle must not be reported as a cap hit");
+        assert_eq!(walk, Walk::default(), "a cycle is a complete walk");
         assert_eq!(found.len(), 1, "the cycle must not produce duplicates");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -223,7 +224,7 @@ mod tests {
         }
 
         let mut found = Vec::new();
-        let truncated = walk_java_files(&root, None, |path| {
+        let walk = walk_java_files(&root, None, |path| {
             if found.len() >= 3 {
                 return false;
             }
@@ -232,7 +233,8 @@ mod tests {
         })
         .await;
 
-        assert!(truncated);
+        assert!(walk.stopped_early);
+        assert!(!walk.io_errors);
         assert_eq!(found.len(), 3);
 
         let _ = std::fs::remove_dir_all(&root);

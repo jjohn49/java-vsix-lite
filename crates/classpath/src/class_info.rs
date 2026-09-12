@@ -1,11 +1,18 @@
-//! Turn `.class` bytes into an owned [`ClassInfo`] via `cafebabe`, rendering
-//! readable (raw, generics-erased) member signatures from JVM descriptors.
+//! Parses `.class` bytes into an owned [`ClassInfo`] via `cafebabe`.
+//! Produces both display-ready member signatures and structured
+//! [`jvl_types`] metadata for semantic checks.
 
-use cafebabe::attributes::{AttributeData, AttributeInfo};
+use cafebabe::attributes::{AttributeData, AttributeInfo, InnerClassAccessFlags};
 use cafebabe::descriptors::{
     ClassName, FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor,
 };
-use cafebabe::{parse_class_with_options, FieldAccessFlags, MethodAccessFlags, ParseOptions};
+use cafebabe::{
+    parse_class_with_options, ClassAccessFlags, FieldAccessFlags, FieldInfo, MethodAccessFlags,
+    ParseOptions,
+};
+use jvl_types::{
+    Access, ClassKind, ClassMetadata, MemberMetadata, PrimitiveType, TypeId, TypeParameter, TypeRef,
+};
 
 use crate::{generics, ClassInfo, Member, MemberKind};
 
@@ -31,24 +38,90 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         .map(generics::class_type_params)
         .unwrap_or_default();
 
-    // Type arguments applied to each entry of `supers` (superclass, then
-    // interfaces, in that order) by the class's own Signature attribute, e.g.
-    // `class MyList extends AbstractList<String>` -> `[["String"], ...]`.
-    // A parse failure or an entry-count mismatch against `supers` (malformed/
-    // truncated attribute, or an edge case where the raw interface order and
-    // the signature's superinterface order disagree) degrades to "no extra
-    // info" for every entry rather than risk misaligning them.
+    // Type arguments for each entry of `supers` (superclass, then interfaces),
+    // from the class's own Signature attribute. Falls back to empty for
+    // every entry on a parse failure or count mismatch, rather than risk
+    // misaligning them.
     let super_type_args = signature_attr(&class.attributes)
         .map(|sig| generics::super_type_args(sig, &type_params))
         .filter(|args| args.len() == supers.len())
         .unwrap_or_else(|| vec![Vec::new(); supers.len()]);
 
-    // The class's own simple name — a constructor member is displayed as
-    // `ClassName(params)` (there's no method name to reuse, unlike a regular
-    // method) and doubles as the docsrc lookup key for its Javadoc (a source
-    // archive has no `<init>`, only a constructor declaration named after its
-    // class).
+    // The class's simple name: displays constructors as `ClassName(params)`
+    // and doubles as the Javadoc lookup key (source has no `<init>`).
     let this_simple = simple_name(&class.this_class);
+
+    // --- structured metadata (jvl_types): kind/access/hierarchy/type params ---
+    let class_flags = class.access_flags;
+    let access = if class_flags.contains(ClassAccessFlags::PUBLIC) {
+        Access::Public
+    } else {
+        Access::Package
+    };
+    let kind = if class_flags.contains(ClassAccessFlags::ANNOTATION) {
+        ClassKind::Annotation
+    } else if class_flags.contains(ClassAccessFlags::INTERFACE) {
+        ClassKind::Interface
+    } else if class_flags.contains(ClassAccessFlags::ENUM) {
+        ClassKind::Enum
+    } else if class.super_class.as_ref().map(fqn_of).as_deref() == Some("java.lang.Record") {
+        ClassKind::Record
+    } else {
+        ClassKind::Class
+    };
+    let structured =
+        signature_attr(&class.attributes).and_then(|s| generics::parse_class_signature(s, &fqn));
+    let (type_parameters, supertypes) = match structured {
+        Some((params, sups)) if sups.len() == supers.len() => (params, sups),
+        // Malformed or mismatched Signature: fall back to erased identity
+        // only, same conservative rule as `super_type_args` above.
+        _ => (
+            Vec::new(),
+            supers.iter().map(|s| TypeRef::named(s)).collect(),
+        ),
+    };
+    // Class params paired with their declared names, since member Signature
+    // text refers to a class type variable by name (`TE;`), not index.
+    // `type_params` and `type_parameters` are index-aligned.
+    let named_type_parameters: Vec<(String, TypeParameter)> = type_params
+        .iter()
+        .cloned()
+        .zip(type_parameters.iter().cloned())
+        .collect();
+    let enclosing_class = fqn.rsplit_once('$').map(|(outer, _)| TypeId::named(outer));
+    // The InnerClasses attribute carries the real static flag via a
+    // self-referencing entry (JVMS §4.7.6). Without one, conservatively
+    // assume non-static unless the kind implies static, so an unknown
+    // enclosing-instance requirement stays silent rather than wrongly
+    // flagged.
+    let this_internal = class.this_class.to_string();
+    let inner_classes_static = class.attributes.iter().find_map(|a| match &a.data {
+        AttributeData::InnerClasses(entries) => entries
+            .iter()
+            .find(|e| e.inner_class_info.as_ref() == this_internal.as_str())
+            .map(|e| e.access_flags.contains(InnerClassAccessFlags::STATIC)),
+        _ => None,
+    });
+    let is_static = inner_classes_static.unwrap_or_else(|| {
+        enclosing_class.is_none()
+            || matches!(
+                kind,
+                ClassKind::Interface | ClassKind::Enum | ClassKind::Record | ClassKind::Annotation
+            )
+    });
+    let metadata = Some(ClassMetadata {
+        id: TypeId::named(&fqn),
+        kind,
+        access,
+        is_abstract: class_flags.contains(ClassAccessFlags::ABSTRACT)
+            || kind == ClassKind::Interface,
+        is_static,
+        enclosing_class,
+        type_parameters: type_parameters.clone(),
+        supertypes,
+        hierarchy_complete: true,
+        constructors_complete: true,
+    });
 
     let mut members = Vec::new();
     for field in &class.fields {
@@ -69,14 +142,46 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             is_static: field.access_flags.contains(FieldAccessFlags::STATIC),
             ret_fqn: object_fqn(&field.descriptor),
             ret_display,
+            hidden: false,
+            metadata: Some(MemberMetadata {
+                declaring_class: TypeId::named(&fqn),
+                access: field_access(field.access_flags),
+                is_static: field.access_flags.contains(FieldAccessFlags::STATIC),
+                is_abstract: false,
+                parameters: None,
+                result: field_result_type(field, &named_type_parameters),
+                type_parameters: Vec::new(),
+                is_varargs: false,
+            }),
         });
     }
     for method in &class.methods {
-        // Compiler-synthesized bridge/synthetic methods are never surfaced,
-        // constructor or otherwise.
-        if !method_visible(method.access_flags) {
+        // Compiler-synthesized bridge/synthetic methods are never surfaced.
+        if method.access_flags.contains(MethodAccessFlags::SYNTHETIC)
+            || method.access_flags.contains(MethodAccessFlags::BRIDGE)
+        {
             continue;
         }
+        // Skip `<clinit>` and any other `<`-prefixed name: untrusted bytes
+        // could carry more than the spec defines, so exclude the whole class.
+        if method.name.starts_with('<') && method.name != "<init>" {
+            continue;
+        }
+        // Non-public/protected methods are kept, not dropped: accessibility
+        // checks need their metadata. `hidden` excludes them from completion.
+        let hidden = !method_visible(method.access_flags);
+        let owner = format!(
+            "{fqn}#{}({})",
+            method.name,
+            erased_descriptor_key(&method.descriptor)
+        );
+        let (method_type_params, method_params, result) = method_structured(
+            &method.descriptor,
+            signature_attr(&method.attributes),
+            &named_type_parameters,
+            &owner,
+        );
+        let is_varargs = method.access_flags.contains(MethodAccessFlags::VARARGS);
         if method.name == "<init>" {
             let template = signature_attr(&method.attributes)
                 .and_then(|sig| generics::method_template(sig, &type_params))
@@ -94,19 +199,24 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
                 name: this_simple.clone(),
                 kind: MemberKind::Constructor,
                 is_static: false,
-                // A constructor "returns" its own class, but chains reach that
-                // via `object_creation_expression`, never through a member
-                // result type — so nothing is carried here.
+                // A constructor's class is reached via `object_creation_expression`,
+                // not a member result type, so nothing is carried here.
                 ret_fqn: None,
                 ret_display: None,
+                hidden,
+                metadata: Some(MemberMetadata {
+                    declaring_class: TypeId::named(&fqn),
+                    access: method_access(method.access_flags),
+                    is_static: false,
+                    is_abstract: false,
+                    parameters: Some(method_params),
+                    // `<init>`'s descriptor return type is always void per
+                    // JVMS; `result` from `method_structured` agrees.
+                    result: TypeRef::Void,
+                    type_parameters: method_type_params,
+                    is_varargs,
+                }),
             });
-            continue;
-        }
-        // Skip <clinit> and any other reserved/synthetic special name — the
-        // JVM spec only defines `<init>`/`<clinit>` as `<`-prefixed method
-        // names, but untrusted bytes could carry anything, so this stays a
-        // blanket exclusion rather than an exact `<clinit>` match.
-        if method.name.starts_with('<') {
             continue;
         }
         let parsed = signature_attr(&method.attributes)
@@ -137,6 +247,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
                 ReturnDescriptor::Void => None,
             },
             ret_display,
+            hidden,
+            metadata: Some(MemberMetadata {
+                declaring_class: TypeId::named(&fqn),
+                access: method_access(method.access_flags),
+                is_static: method.access_flags.contains(MethodAccessFlags::STATIC),
+                is_abstract: method.access_flags.contains(MethodAccessFlags::ABSTRACT),
+                parameters: Some(method_params),
+                result,
+                type_parameters: method_type_params,
+                is_varargs,
+            }),
         });
     }
 
@@ -146,6 +267,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         type_params,
         members,
         super_type_args,
+        metadata,
     })
 }
 
@@ -238,11 +360,100 @@ fn render_field(descriptor: &FieldDescriptor) -> String {
     format!("{base}{}", "[]".repeat(descriptor.dimensions as usize))
 }
 
-/// Hand-assembles minimal, spec-valid `.class` bytes so `class_info::parse`
-/// can be exercised without a real JDK: one class extending `java/lang/Object`
-/// (optionally with a class-level `Signature`), plus configurable methods and
-/// fields (each optionally carrying its own `Signature` attribute, which may
-/// be deliberately malformed to test the fallback path).
+fn field_access(flags: FieldAccessFlags) -> Access {
+    if flags.contains(FieldAccessFlags::PUBLIC) {
+        Access::Public
+    } else if flags.contains(FieldAccessFlags::PROTECTED) {
+        Access::Protected
+    } else if flags.contains(FieldAccessFlags::PRIVATE) {
+        Access::Private
+    } else {
+        Access::Package
+    }
+}
+
+fn method_access(flags: MethodAccessFlags) -> Access {
+    if flags.contains(MethodAccessFlags::PUBLIC) {
+        Access::Public
+    } else if flags.contains(MethodAccessFlags::PROTECTED) {
+        Access::Protected
+    } else if flags.contains(MethodAccessFlags::PRIVATE) {
+        Access::Private
+    } else {
+        Access::Package
+    }
+}
+
+/// The structured [`TypeRef`] for a raw (non-generic) descriptor: maps a
+/// primitive `FieldType` directly, an object type to its dotted FQN, and
+/// wraps in [`TypeRef::Array`] per `dimensions`.
+fn descriptor_type_ref(descriptor: &FieldDescriptor) -> TypeRef {
+    let base = match &descriptor.field_type {
+        FieldType::Byte => TypeRef::Primitive(PrimitiveType::Byte),
+        FieldType::Char => TypeRef::Primitive(PrimitiveType::Char),
+        FieldType::Double => TypeRef::Primitive(PrimitiveType::Double),
+        FieldType::Float => TypeRef::Primitive(PrimitiveType::Float),
+        FieldType::Integer => TypeRef::Primitive(PrimitiveType::Int),
+        FieldType::Long => TypeRef::Primitive(PrimitiveType::Long),
+        FieldType::Short => TypeRef::Primitive(PrimitiveType::Short),
+        FieldType::Boolean => TypeRef::Primitive(PrimitiveType::Boolean),
+        FieldType::Object(class) => TypeRef::named(&fqn_of(class)),
+    };
+    (0..descriptor.dimensions).fold(base, |t, _| TypeRef::Array(Box::new(t)))
+}
+
+/// A field's structured declared type: from the `Signature` attribute when
+/// present, otherwise the erased descriptor.
+fn field_result_type(field: &FieldInfo, class_params: &[(String, TypeParameter)]) -> TypeRef {
+    signature_attr(&field.attributes)
+        .and_then(|sig| generics::parse_field_signature(sig, class_params))
+        .unwrap_or_else(|| descriptor_type_ref(&field.descriptor))
+}
+
+/// Erased parameter types joined into a key, used to build a
+/// `TypeVariableId` owner string that stays unique across overloads.
+fn erased_descriptor_key(descriptor: &MethodDescriptor) -> String {
+    descriptor
+        .parameters
+        .iter()
+        .map(render_field)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The method's structured type parameters, parameters, and return type:
+/// from the `Signature` attribute when its parameter count matches the
+/// descriptor, otherwise the erased descriptor.
+fn method_structured(
+    descriptor: &MethodDescriptor,
+    signature: Option<&str>,
+    class_params: &[(String, TypeParameter)],
+    owner: &str,
+) -> (Vec<TypeParameter>, Vec<TypeRef>, TypeRef) {
+    if let Some(sig) = signature {
+        if let Some((type_params, ret, params)) =
+            generics::parse_method_signature(sig, class_params, owner)
+        {
+            if params.len() == descriptor.parameters.len() {
+                return (type_params, params, ret);
+            }
+        }
+    }
+    let params = descriptor
+        .parameters
+        .iter()
+        .map(descriptor_type_ref)
+        .collect();
+    let result = match &descriptor.return_type {
+        ReturnDescriptor::Return(field) => descriptor_type_ref(field),
+        ReturnDescriptor::Void => TypeRef::Void,
+    };
+    (Vec::new(), params, result)
+}
+
+/// Hand-assembles minimal `.class` bytes so `class_info::parse` can be
+/// tested without a real JDK, with configurable methods, fields, and
+/// optional (possibly malformed) `Signature` attributes.
 #[cfg(test)]
 mod fixture {
     /// A method or field to include, plus its optional `Signature` attribute
@@ -367,9 +578,9 @@ mod fixture {
         out
     }
 
-    /// Assemble a minimal class named `this_name` (internal form, e.g.
-    /// `"test/Box"`) extending `java/lang/Object`, with the given methods and
-    /// fields, and an optional class-level `Signature` attribute.
+    /// Assembles a minimal class named `this_name` (e.g. `"test/Box"`)
+    /// extending `java/lang/Object`, with the given methods, fields, and
+    /// an optional class-level `Signature`.
     pub(super) fn build(
         this_name: &str,
         class_signature: Option<&str>,
@@ -392,9 +603,8 @@ mod fixture {
             .collect::<Vec<_>>()
             .concat();
 
-        // Class-level Signature attribute is built last so its Utf8 entries
-        // land after everything referenced above (order doesn't matter to a
-        // conforming reader, but keeping it last keeps this function simple).
+        // Built last so its Utf8 entries land after everything else; order
+        // doesn't matter to a conforming reader.
         let (class_attr_count, class_attr_bytes): (u16, Vec<u8>) = match class_signature {
             Some(sig) => (1, signature_attribute(&mut cp, sig_name_idx, sig)),
             None => (0, Vec::new()),
@@ -447,9 +657,8 @@ mod tests {
 
     #[test]
     fn method_type_param_shadowing_class_param_renders_by_name() {
-        // class Box<T> { <T> T foo(T x) } — legal Java: the method's own T
-        // shadows the class's T, so the rendered template must show the
-        // literal `T` everywhere, never the class's {0} placeholder.
+        // class Box<T> { <T> T foo(T x) }: the method's own T shadows the
+        // class's T, so the template must render literal `T`, never `{0}`.
         let bytes = build(
             "test/Box",
             Some("<T:Ljava/lang/Object;>Ljava/lang/Object;"),
@@ -518,10 +727,9 @@ mod tests {
 
     #[test]
     fn malformed_class_signature_falls_back_to_no_super_args() {
-        // A class-level Signature so badly truncated its superclass entry
-        // never parses — the class must still parse, with `super_type_args`
-        // degrading to "no extra info" (empty per entry) rather than
-        // panicking or misaligning against `supers`.
+        // A superclass Signature entry so truncated it never parses. The
+        // class must still parse, with `super_type_args` degrading to empty
+        // per entry rather than panicking or misaligning.
         let bytes = build(
             "test/BadClass",
             Some("<T:Ljava/util/List<TE"),
@@ -534,6 +742,57 @@ mod tests {
         // `plain` has no Signature attribute, so it's unaffected either way.
         let plain = info.members.iter().find(|m| m.name == "plain").unwrap();
         assert_eq!(plain.signature, "void plain()");
+        // Metadata is still populated on a malformed class signature; it
+        // degrades to erased-identity supertypes with no type parameters.
+        let metadata = info.metadata.expect("metadata always present");
+        assert!(metadata.type_parameters.is_empty());
+        assert_eq!(
+            metadata.supertypes,
+            vec![TypeRef::named("java.lang.Object")]
+        );
+    }
+
+    #[test]
+    fn class_signature_produces_structured_type_parameters_and_supertypes() {
+        // class MyAbstractList<E> extends AbstractList<E>: Signature carries
+        // the real type parameter and a structured supertype, not just `{0}`.
+        let bytes = build(
+            "test/MyAbstractList",
+            Some("<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;"),
+            &[],
+            &[],
+        );
+        let info = parse(&bytes).expect("parses");
+        let metadata = info.metadata.expect("metadata present");
+        assert_eq!(metadata.type_parameters.len(), 1);
+        let e = metadata.type_parameters[0].id.clone();
+        assert_eq!(
+            metadata.supertypes,
+            vec![TypeRef::Named {
+                id: TypeId::named("java.util.AbstractList"),
+                args: vec![TypeRef::Variable(e)],
+            }]
+        );
+    }
+
+    #[test]
+    fn method_without_signature_has_structured_parameters_from_descriptor() {
+        let bytes = build(
+            "test/Plain2",
+            None,
+            &[],
+            &[method("greet", "(ILjava/lang/String;)V")],
+        );
+        let info = parse(&bytes).expect("parses");
+        let greet = info.members.iter().find(|m| m.name == "greet").unwrap();
+        let metadata = greet.metadata.as_ref().expect("metadata present");
+        assert_eq!(
+            metadata.parameters,
+            Some(vec![
+                TypeRef::Primitive(PrimitiveType::Int),
+                TypeRef::named("java.lang.String"),
+            ])
+        );
     }
 
     #[test]
@@ -545,11 +804,9 @@ mod tests {
         assert_eq!(size.template, None);
     }
 
-    /// `<init>` methods are surfaced as `Constructor` members named
-    /// after the declaring class (not `<init>`), rendered `ClassName(params)`
-    /// — one plain, one carrying its own generic type parameter (so its
-    /// template renders the type variable by name, same shadow-by-name rule
-    /// a method's own type parameter follows).
+    /// `<init>` methods surface as `Constructor` members named after the
+    /// class, rendered `ClassName(params)` — including one with its own
+    /// generic type parameter.
     #[test]
     fn constructors_become_members_named_after_the_class() {
         let bytes = build(
@@ -722,11 +979,11 @@ mod tests {
         assert!(info.members.is_empty(), "{:?}", info.members);
     }
 
-    /// Private and package-private `<init>` methods go
-    /// through the same `method_visible` gate as regular methods — only
-    /// public/protected constructors are surfaced as `Constructor` members.
+    /// Private and package-private `<init>` methods are kept with
+    /// `hidden: true` and real `metadata.access`, since accessibility
+    /// checks need them; only completion listings filter `hidden` out.
     #[test]
-    fn non_visible_constructors_are_excluded() {
+    fn non_visible_constructors_are_hidden_but_present() {
         let bytes = build(
             "test/Vis",
             None,
@@ -739,17 +996,48 @@ mod tests {
             ],
         );
         let info = parse(&bytes).expect("parses");
-        let ctor_sigs: Vec<_> = info
+        let ctors: Vec<_> = info
             .members
             .iter()
             .filter(|m| matches!(m.kind, MemberKind::Constructor))
-            .map(|m| m.signature.as_str())
             .collect();
+        assert_eq!(ctors.len(), 4, "{:?}", info.members);
+        let by_sig = |sig: &str| ctors.iter().find(|m| m.signature == sig).unwrap();
+        assert!(by_sig("Vis()").hidden);
         assert_eq!(
-            ctor_sigs,
-            vec!["Vis(long)", "Vis(double)"],
-            "only protected/public constructors survive: {:?}",
-            info.members
+            by_sig("Vis()").metadata.as_ref().unwrap().access,
+            Access::Private
         );
+        assert!(by_sig("Vis(int)").hidden);
+        assert_eq!(
+            by_sig("Vis(int)").metadata.as_ref().unwrap().access,
+            Access::Package
+        );
+        assert!(!by_sig("Vis(long)").hidden);
+        assert_eq!(
+            by_sig("Vis(long)").metadata.as_ref().unwrap().access,
+            Access::Protected
+        );
+        assert!(!by_sig("Vis(double)").hidden);
+        assert_eq!(
+            by_sig("Vis(double)").metadata.as_ref().unwrap().access,
+            Access::Public
+        );
+    }
+    #[test]
+    fn abstract_method_flag_is_preserved_in_structured_metadata() {
+        let bytes = build(
+            "test/Abstract",
+            None,
+            &[],
+            &[method_flags("run", "()V", 0x0401)],
+        );
+        let info = parse(&bytes).expect("parses");
+        let run = info
+            .members
+            .iter()
+            .find(|member| member.name == "run")
+            .unwrap();
+        assert!(run.metadata.as_ref().unwrap().is_abstract);
     }
 }

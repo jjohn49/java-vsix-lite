@@ -1,61 +1,5 @@
-//! Go-to-implementation — bounded scan + supers confirm.
-//!
-//! `textDocument/implementation` answers two related queries:
-//!
-//! 1. Cursor on an interface/abstract (or concrete) **type** name → every
-//!    in-project type that `extends`/`implements` it.
-//! 2. Cursor on one of that type's **method** names (its declaration, or a
-//!    call resolving to it) → the overriding/implementing method
-//!    declaration in each of those types (types that don't declare their own
-//!    override are skipped — they inherit, nothing to jump to).
-//!
-//! Mechanism, reusing existing machinery rather than indexing anything new:
-//!
-//! - [`implementation_target`] resolves the cursor the same way
-//!   [`crate::reference_target`]/[`crate::definition`] do (declaration name,
-//!   member access/call, mid-edit scoped path, plain reference), yielding an
-//!   [`ImplementationTarget`] — the target type's simple name (the server's
-//!   bounded prefilter needle, same convention as
-//!   `ReferenceTarget::name`/`references::prefilter`) plus, for a
-//!   method-level query, the method's own name.
-//! - [`implementations_in_doc`] is the per-file confirm, checked *per
-//!   supertype-clause entry* (the raw `extends`/`implements` type nodes via
-//!   `model.rs`'s `super_type_nodes` — the same clause entries
-//!   [`TypeDecl::supers`] erases to simple names, so subclassing a concrete
-//!   class and implementing an interface are the same check). An entry
-//!   confirms iff its base simple name is the target's AND:
-//!   - **unqualified** (`implements Foo`): the name, read in the scanned
-//!     file's own import/package context, actually resolves to the target's
-//!     real declaration — [`crate::references::confirm_bare_type`], the
-//!     exact same import-aware confirm `references.rs`'s `bare_type_site`
-//!     uses, reused rather than duplicated;
-//!   - **fully qualified** (`implements com.example.Foo` — bypasses imports
-//!     entirely, so the import gate must neither vouch for it nor be needed
-//!     by it): the written dotted name equals the target's own real FQN
-//!     (its declaring document's `package` + simple name). A qualified
-//!     entry naming a *different* package's same-simple-name type is
-//!     rejected even when the file separately imports the target.
-//!
-//!   Method-level narrows further: only a type's own (non-inherited),
-//!   non-`static` method named `method_name` counts — `TypeDecl::own_members`
-//!   already excludes inherited members, so "didn't override, just
-//!   inherited" falls out for free, and a `static` same-named method hides
-//!   rather than overrides, so it is skipped too. Overloads
-//!   are matched by NAME only (no arity/parameter-type comparison — the
-//!   codebase's member model doesn't compare signatures structurally), so
-//!   an implementor declaring several same-named overloads is over-included:
-//!   every one of its own non-static `method_name` declarations is reported,
-//!   not just the true JLS override.
-//!
-//! External (JDK/jar) targets are out of scope: [`implementation_target`]
-//! only ever names an in-project type (`ctx.table`/`confirm_bare_type` never
-//! resolve to an external `SymbolSource` type), so a query on, say, `List`
-//! itself yields `None` rather than a (correct but unactionable, since the
-//! declaration isn't in an open document) result. An in-project type whose
-//! `implements` clause names an *external* interface is unaffected by this —
-//! it's the target side that's out of scope, not the implementor side (that
-//! case isn't reachable from this module at all, since it never appears as a
-//! query target in the first place).
+//! Bounded go-to-implementation for in-project types and methods.
+//! Candidates are confirmed by resolved supertype clauses; external targets are unsupported.
 
 use std::ops::Range;
 
@@ -68,7 +12,7 @@ use crate::imports::Imports;
 use crate::model::{base_type_name, super_type_nodes, MemberKind, TypeDecl, TypeTable};
 use crate::references::{confirm_bare_type, package_of};
 use crate::resolve::{
-    self, dotted_type_name, Ctx, HierMember, MemberNamespace, Resolved, ResolvedType,
+    self, dotted_type_name, Ctx, FactsCache, HierMember, MemberNamespace, Resolved, ResolvedType,
 };
 use crate::{node_text, LineIndex, OpenDoc};
 
@@ -93,10 +37,9 @@ pub struct ImplementationHit {
     pub full_range: Range<usize>,
 }
 
-/// Resolve the cursor to an [`ImplementationTarget`]. `None` for anything
-/// that isn't an in-project type/method reference — an external (JDK/
-/// dependency) symbol, a local/param/field, `this`/`super`, or a
-/// non-identifier — mirroring [`crate::reference_target`]'s refusal shape.
+/// Resolve the cursor to an [`ImplementationTarget`]. Returns `None` for
+/// anything that isn't an in-project type/method reference (external
+/// symbol, local/param/field, `this`/`super`, or non-identifier).
 pub fn implementation_target(
     docs: &[OpenDoc],
     current: usize,
@@ -108,12 +51,15 @@ pub fn implementation_target(
     let cursor = index.offset(pos);
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let name_node = identifier_at(doc.tree, cursor)?;
@@ -121,17 +67,14 @@ pub fn implementation_target(
 }
 
 /// Resolve one identifier-like node to an [`ImplementationTarget`]: a
-/// method's own declaration name (method-level, on its enclosing type), a
-/// type's own declaration name (type-level), a method call/access resolving
-/// to an in-project method (method-level, on the type that actually
-/// declares it), or a bare type-name reference (type-level, via
-/// [`confirm_bare_type`]).
+/// method or type declaration name, a method call resolving to an
+/// in-project method, or a bare type reference.
 fn classify_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<ImplementationTarget> {
     let name = node_text(name_node, ctx.doc.source);
 
     if let Some(parent) = name_node.parent() {
         if parent.kind() == "method_declaration" && field_is(parent, "name", name_node) {
-            let owner = resolve::enclosing_typedecl(name_node, ctx.doc.source, ctx.current)?;
+            let owner = resolve::enclosing_typedecl(name_node, ctx.table, ctx.current)?;
             return Some(ImplementationTarget {
                 type_name: owner.name.to_string(),
                 type_doc: owner.doc,
@@ -139,7 +82,7 @@ fn classify_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Impleme
             });
         }
         if is_decl_name(parent, name_node) && resolve::is_type_decl(parent.kind()) {
-            let td = TypeDecl::from_node(parent, ctx.doc.source, ctx.current)?;
+            let td = TypeDecl::from_node(parent, ctx.doc.source, ctx.current, None)?;
             return Some(ImplementationTarget {
                 type_name: td.name.to_string(),
                 type_doc: td.doc,
@@ -150,11 +93,10 @@ fn classify_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Impleme
             let resolved = match parent.child_by_field_name("object") {
                 Some(object) => resolve::resolve_receiver_type(object, ctx)?,
                 None => Resolved {
-                    ty: ResolvedType::InProject(resolve::enclosing_typedecl(
-                        name_node,
-                        ctx.doc.source,
-                        ctx.current,
-                    )?),
+                    ty: ResolvedType::InProject {
+                        decl: resolve::enclosing_typedecl(name_node, ctx.table, ctx.current)?,
+                        args: Vec::new(),
+                    },
                     static_only: false,
                 },
             };
@@ -172,13 +114,10 @@ fn classify_target<'t>(name_node: Node<'t>, ctx: &Ctx<'_, 't>) -> Option<Impleme
     })
 }
 
-/// Resolve `name` as a METHOD on `resolved`'s type hierarchy (namespace-aware
-/// — never a same-named field), then report the target as the type that
-/// actually *declares* that method (its own enclosing type, not necessarily
-/// `resolved` itself when the method is inherited) — that declaring type is
-/// what candidates must `implements`/`extends` to be an implementor.
-/// External members (no open-document `DeclSite`, hence no owner `TypeDecl`
-/// to report) are out of scope.
+/// Resolve `name` as a method (never a same-named field) on `resolved`'s
+/// hierarchy, reporting the type that actually declares it (not
+/// necessarily `resolved`, when inherited). External members are out of
+/// scope.
 fn method_target_from_member<'t>(
     resolved: &Resolved<'t>,
     ctx: &Ctx<'_, 't>,
@@ -190,7 +129,7 @@ fn method_target_from_member<'t>(
             HierMember::External(_) => return None,
         };
     let owner_node = resolve::enclosing_type_node(member.node)?;
-    let owner = TypeDecl::from_node(owner_node, member.source, member.doc)?;
+    let owner = ctx.table.by_node(member.doc, owner_node.id())?.clone();
     Some(ImplementationTarget {
         type_name: owner.name.to_string(),
         type_doc: owner.doc,
@@ -200,16 +139,8 @@ fn method_target_from_member<'t>(
 
 /// Scan `docs[current]` for confirmed implementors of `target` (or, when
 /// `target.method_name` is `Some`, their overriding method declaration).
-/// `target.type_doc` indexes into this *same* `docs` slice — the caller
-/// places the target's declaring document there (mirroring
-/// [`crate::references_in_doc`]'s convention: the single-file scan for the
-/// target's own declaring file, and the two-document `[hit, target]` slice
-/// built per prefiltered hit file otherwise).
-///
-/// No `SymbolSource` is threaded through: the confirm gate
-/// ([`confirm_bare_type`]) only ever needs the scanned file's own
-/// `TypeTable`/`Imports`, never the external symbol source — an
-/// [`NoSymbols`] stand-in is used internally.
+/// `target.type_doc` indexes into this same `docs` slice, pointing at the
+/// target's declaring document.
 pub fn implementations_in_doc(
     docs: &[OpenDoc],
     current: usize,
@@ -221,28 +152,27 @@ pub fn implementations_in_doc(
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
     let no_symbols = NoSymbols;
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols: &no_symbols,
+        docs,
+        facts: &facts,
     };
 
-    // File-level import/package confirm for UNQUALIFIED supertype entries:
-    // whether a bare `target.type_name`, read in THIS file's own
-    // import/package context, actually names the target's own declaration —
-    // not an unrelated same-simple-name type from a different package (see
-    // `confirm_bare_type`'s doc comment). Computed once per document; only
-    // vouches for unqualified entries (a fully-qualified entry bypasses
-    // imports, so it is confirmed against `target_fqn` below instead).
+    // Confirms UNQUALIFIED supertype entries: whether the bare
+    // `target.type_name`, read in this file's imports/package, resolves to
+    // the target (not an unrelated same-simple-name type). Qualified
+    // entries are confirmed separately via `target_fqn` below.
     let unqualified_confirmed =
         confirm_bare_type(&target.type_name, &ctx).is_some_and(|td| td.doc == target.type_doc);
 
-    // The target's own real FQN (its declaring document's `package` + simple
-    // name), for confirming FULLY-QUALIFIED supertype entries. `None` for a
-    // default-package target — no qualified reference can name the default
-    // package, so qualified entries then never match.
+    // The target's real FQN, for confirming FULLY-QUALIFIED supertype
+    // entries. `None` for a default-package target, so qualified entries
+    // never match it.
     let target_fqn = docs.get(target.type_doc).and_then(|target_doc| {
         package_of(target_doc.tree.root_node(), target_doc.source)
             .map(|pkg| format!("{pkg}.{}", target.type_name))
@@ -250,15 +180,14 @@ pub fn implementations_in_doc(
 
     let mut hits = Vec::new();
     for td in table.iter() {
-        // Only types actually declared *in this scanned document* — `table`
-        // spans the whole given `docs` slice (which also contains the
-        // target's own document when scanning a different file).
+        // Only types declared in this scanned document — `table` spans the
+        // whole `docs` slice.
         if td.doc != current {
             continue;
         }
-        // Per-supertype-entry confirm: an erased simple-name
-        // match alone is not enough — `implements com.other.Foo` must not
-        // pass on the strength of an unrelated `import com.example.Foo`.
+        // Simple-name match alone isn't enough: `implements com.other.Foo`
+        // must not pass on the strength of an unrelated `import
+        // com.example.Foo`.
         let implements_target = super_type_nodes(td.node).into_iter().any(|ty| {
             if base_type_name(ty, td.source) != Some(target.type_name.as_str()) {
                 return false;
@@ -348,8 +277,7 @@ mod tests {
         assert_eq!(target.type_doc, 0);
         assert_eq!(target.method_name, None);
 
-        // Scan doc B (index 0 in this 2-doc confirm slice) with the target
-        // remapped to doc index 1 (mirrors `references_in_doc`'s convention).
+        // Scan doc B (index 0) with target remapped to doc index 1.
         let scan_docs = [
             OpenDoc {
                 source: doc_b,
@@ -412,11 +340,9 @@ mod tests {
         assert_eq!(hits[0].name_range, expected..expected + "run".len());
     }
 
-    /// A same-simple-name interface declared in a *different* package
-    /// in a third doc must NOT be confirmed as the query's target — the
-    /// scanned file's own import/package context must actually resolve
-    /// `Foo` to the real target (mirrors `references.rs`'s
-    /// `different_package_import_is_not_confirmed`-style test).
+    /// A same-simple-name interface in a different package must NOT be
+    /// confirmed as the target — the scanned file's own import/package
+    /// context must resolve `Foo` to the real target.
     #[test]
     fn same_simple_name_interface_different_package_is_not_confirmed() {
         let doc_a = "package pub1;\npublic interface Foo { void run(); }\n";
@@ -451,10 +377,9 @@ mod tests {
         );
     }
 
-    /// Concrete-class subclassing (not just interface implementing)
-    /// works through the same `supers` mechanism, and a subclass that
-    /// doesn't override the method is skipped at the method level (it
-    /// inherits — nothing new to jump to).
+    /// Concrete-class subclassing works through the same `supers`
+    /// mechanism; a subclass that doesn't override the method is skipped
+    /// at the method level.
     #[test]
     fn concrete_subclass_override_lookup_skips_non_overriding_subclass() {
         let doc_a = "package p;\nclass A {\n  void greet() {}\n}\n";
@@ -519,12 +444,10 @@ mod tests {
         );
     }
 
-    /// A scanned file that
-    /// imports the target (`com.example.Foo`) but whose `implements` clause
-    /// names a *fully-qualified different* type (`com.other.Foo`) must NOT
-    /// be reported — the qualified supertype reference bypasses imports
-    /// entirely, so the file-level import confirm alone must not vouch for
-    /// it.
+    /// A file that imports the target (`com.example.Foo`) but whose
+    /// `implements` clause names a different fully-qualified type
+    /// (`com.other.Foo`) must NOT be reported — qualified references
+    /// bypass imports entirely.
     #[test]
     fn qualified_super_naming_different_fqn_is_not_confirmed() {
         let doc_a = "package com.example;\npublic interface Foo { void run(); }\n";
@@ -560,10 +483,9 @@ mod tests {
         );
     }
 
-    /// A scanned file with NO
-    /// import whose `implements` clause names the target *fully qualified*
-    /// (`implements com.example.Foo`, matching the target's real package)
-    /// IS a confirmed implementor.
+    /// A file with no import whose `implements` clause names the target
+    /// fully qualified (matching its real package) IS a confirmed
+    /// implementor.
     #[test]
     fn fully_qualified_super_with_matching_package_is_confirmed() {
         let doc_a = "package com.example;\npublic interface Foo { void run(); }\n";
@@ -603,9 +525,8 @@ mod tests {
         assert_eq!(hits[0].name_range, expected..expected + "Bar".len());
     }
 
-    /// A `static` method with the same name in a
-    /// subclass hides — it does not override — so a method-level query must
-    /// not report it.
+    /// A `static` method with the same name in a subclass hides — it does
+    /// not override — so a method-level query must not report it.
     #[test]
     fn static_same_name_method_is_not_an_override() {
         let doc_a = "package p;\nclass A {\n  void greet() {}\n}\n";

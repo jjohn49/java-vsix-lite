@@ -1,13 +1,5 @@
-// JUnit test support: Test Explorer discovery, run, and debug.
-//
-// Discovery is fully static and safe-tier: the server's `jvl/tests` request
-// classifies JUnit 4/5 annotations syntactically (no execution, no
-// classpath). Running tests EXECUTES project code, so both run profiles are
-// Workspace Trust-gated exactly like debugging and `javac`. Execution goes
-// through the existing DAP adapter (`jvl-server dap`) launching the JUnit
-// Platform Console Launcher — never `mvn test`/`gradle test`, per the threat
-// model's ban on default-tier build-file execution. Results are parsed from
-// the launcher's `--reports-dir` legacy JUnit XML.
+// JUnit discovery is static; run and debug execute project code and require trust.
+// Execution uses the Console Launcher through DAP, never Maven or Gradle test tasks.
 
 import * as fs from "fs";
 import * as os from "os";
@@ -17,16 +9,15 @@ import { LanguageClient, State } from "vscode-languageclient/node";
 
 import * as mavenFetch from "./mavenFetch";
 
-/** Default JUnit Platform version for the console launcher. The 1.x line
- * keeps the Java 8+ baseline (JUnit 6 requires Java 17). */
+/** Default JUnit Platform version for the console launcher. 1.x supports
+ * Java 8+ (JUnit 6 needs Java 17). */
 const DEFAULT_LAUNCHER_VERSION = "1.13.4";
 
 /** Same message pattern as the extension's other trust gates. */
 const UNTRUSTED_MESSAGE =
   "java-vsix-lite: running tests is disabled in an untrusted workspace — it runs your project's code. Trust this workspace to enable it.";
 
-/** Re-query debounce for edits to open test files (mirrors the save-check
- * debounce pattern in extension.ts, shorter because discovery is cheap). */
+/** Debounce for re-querying edited test files; short because discovery is cheap. */
 const DISCOVERY_DEBOUNCE_MS = 500;
 
 const TEST_FILE_GLOB = "**/src/test/java/**/*.java";
@@ -183,8 +174,7 @@ export function activateTesting(
   watcher.onDidChange((uri) => void queryFiles([uri.toString()]));
   watcher.onDidDelete((uri) => controller.items.delete(uri.toString()));
 
-  // Live edits to open test files: debounced re-query (same coalescing idea
-  // as extension.ts's SAVE_CHECK_DEBOUNCE_MS pattern).
+  // Live edits to open test files: debounced re-query, coalesced like javacScheduler.ts.
   const pendingUris = new Set<string>();
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   context.subscriptions.push(
@@ -252,8 +242,7 @@ async function runTests(
 ): Promise<void> {
   const targets = collectTargets(controller, request);
 
-  // Trust gate FIRST: tests are project code (same load-bearing refusal as
-  // debugging/javac — the server has no notion of Workspace Trust).
+  // Trust gate first: running tests executes project code, like debugging/javac.
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showErrorMessage(UNTRUSTED_MESSAGE);
     const run = controller.createTestRun(request);
@@ -278,8 +267,7 @@ async function runTests(
       return;
     }
 
-    // Group by workspace folder: each folder is one launch (its own
-    // classpath derivation and cwd).
+    // Group by workspace folder: each folder is its own launch (classpath + cwd).
     const byFolder = new Map<string, { folder: vscode.WorkspaceFolder; items: vscode.TestItem[] }>();
     for (const item of targets) {
       const folder = item.uri && vscode.workspace.getWorkspaceFolder(item.uri);
@@ -303,9 +291,8 @@ async function runTests(
   }
 }
 
-/** The requested items, with an empty request meaning "every known top-level
- * class" (never `--scan-classpath`, which would execute dependency-jar
- * tests). */
+/** Requested items; empty request means every known top-level class. Never
+ * uses `--scan-classpath`, which would execute dependency-jar tests. */
 function collectTargets(
   controller: vscode.TestController,
   request: vscode.TestRunRequest,
@@ -472,9 +459,9 @@ function waitForSessionEnd(
 // ---------------------------------------------------------------------------
 
 /**
- * The console-standalone jar's `~/.m2` path, downloading it (HTTPS +
- * checksum, one modal consent) when absent. `undefined` on decline/failure —
- * the caller reports and aborts, never a partial run.
+ * Path to the console-standalone jar in `~/.m2`, downloading it (HTTPS +
+ * checksum, one modal consent) if missing. Returns `undefined` on decline
+ * or failure.
  */
 async function ensureConsoleLauncher(): Promise<string | undefined> {
   const configured = vscode.workspace
@@ -518,13 +505,8 @@ async function ensureConsoleLauncher(): Promise<string | undefined> {
 }
 
 // ---------------------------------------------------------------------------
-// JUnit XML report parsing.
-//
-// The launcher's `--reports-dir` output is the legacy, flat JUnit XML schema
-// (one `TEST-<engine>.xml` per engine). The subset we need — `<testcase>`
-// attributes plus `<failure>`/`<error>`/`<skipped>` children — is stable and
-// regular enough for a small dedicated parser; a new npm dependency for this
-// would grow the audited surface for no gain.
+// JUnit XML report parsing: parses the launcher's flat `TEST-<engine>.xml`
+// reports directly since the needed subset is small and stable.
 // ---------------------------------------------------------------------------
 
 interface ReportCase {

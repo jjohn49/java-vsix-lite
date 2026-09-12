@@ -1,0 +1,9 @@
+target/
+editors/vscode/node_modules/
+editors/vscode/dist/
+editors/vscode/out/
+editors/vscode/server/
+editors/vscode/.vscode-test/
+tools/vscode-compare/out/
+.git/
+**/*.vsix

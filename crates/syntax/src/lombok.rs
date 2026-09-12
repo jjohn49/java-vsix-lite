@@ -1,16 +1,9 @@
-//! Lombok awareness — synthesize the members Lombok's annotation
-//! processor would generate (`@Getter`/`@Setter`/`@Data`/`@Value`/`@With`/
-//! `@Builder` accessors, fluent builders) so a project class using Lombok
-//! still completes, chains, and passes the unresolved-member check, even
-//! though its source declares none of those methods.
+//! Synthesizes the members Lombok's annotation processor would generate
+//! (`@Getter`/`@Setter`/`@Data`/`@Value`/`@With`/`@Builder`) so a Lombok
+//! class still completes and resolves without declaring those methods.
 //!
-//! Scope is deliberate: only the members that affect *callers* (getters,
-//! setters, withers, `builder()` and the builder type's fluent API).
-//! Constructors (`@AllArgsConstructor` et al.) are out — the member model
-//! never lists constructors anyway — and `toString`/`equals`/`hashCode`
-//! already arrive via `java.lang.Object`. Synthesis is gated on the
-//! declaring **file** importing `lombok.*`: a homemade `@Getter` annotation
-//! never conjures phantom members.
+//! Only caller-visible members are modeled, and synthesis requires the
+//! file to import `lombok.*`.
 
 use tree_sitter::Node;
 
@@ -18,10 +11,8 @@ use crate::external::{ExternalClass, ExternalMember, ExternalMemberKind};
 use crate::model::{has_modifier, modifiers_node, named_children, MemberKind, TypeDecl};
 use crate::node_text;
 
-/// A member Lombok would generate. Always a method; `ret_display` is the
-/// source-level type text (resolved later against the declaring file's
-/// context), `ret_fqn` is set only where synthesis itself knows the binary
-/// name (the builder type).
+/// A member Lombok would generate. Always a method; `ret_fqn` is only set
+/// when synthesis itself knows the binary name (the builder type).
 pub(crate) struct SyntheticMember {
     pub name: String,
     pub signature: String,
@@ -40,6 +31,7 @@ impl SyntheticMember {
             is_static: self.is_static,
             ret_fqn: self.ret_fqn,
             ret_display: self.ret_display,
+            metadata: None,
         }
     }
 }
@@ -122,10 +114,8 @@ fn marks_on(decl: Node, source: &str) -> Marks {
         };
         let name = node_text(name_node, source);
         let simple = name.rsplit('.').next().unwrap_or(name);
-        // `@Getter(AccessLevel.NONE)` (and PRIVATE/PROTECTED, which callers
-        // outside the class can't see either) suppresses generation for our
-        // purposes — only public accessors are modeled, matching the
-        // bytecode layer's visibility gate.
+        // `AccessLevel` below PUBLIC suppresses generation — only public
+        // accessors are modeled, matching the bytecode layer's visibility gate.
         if let Some(args) = child.child_by_field_name("arguments") {
             let args = node_text(args, source);
             if ["NONE", "PRIVATE", "PROTECTED", "PACKAGE", "MODULE"]
@@ -202,12 +192,11 @@ fn getter_name(field: &FieldInfo) -> String {
     }
 }
 
-/// The members Lombok would generate for `class_node` (a class declaration
-/// in a file that imports `lombok.*` — callers check [`file_uses_lombok`]
-/// first). Methods the class already declares by the same name are never
-/// duplicated, mirroring Lombok's own skip-if-present rule.
+/// The members Lombok would generate for `class_node` (callers must check
+/// [`file_uses_lombok`] first). Existing methods with the same name are
+/// never duplicated, mirroring Lombok's skip-if-present rule.
 pub(crate) fn synthesize(class_node: Node, source: &str) -> Vec<SyntheticMember> {
-    let Some(td) = TypeDecl::from_node(class_node, source, 0) else {
+    let Some(td) = TypeDecl::from_node(class_node, source, 0, None) else {
         return Vec::new();
     };
     if td.kind != crate::model::TypeKind::Class {
@@ -282,10 +271,9 @@ pub(crate) fn synthesize(class_node: Node, source: &str) -> Vec<SyntheticMember>
     out
 }
 
-/// The synthesized `@Builder` companion class for `outer` (an
-/// `ExternalClass` for `Outer$OuterBuilder`): one fluent setter per instance
-/// field returning the builder itself, plus `build()` returning the outer
-/// type. `None` when `outer` isn't `@Builder`-annotated.
+/// The synthesized `@Builder` companion class for `outer`: a fluent setter
+/// per instance field plus `build()` returning the outer type. `None` when
+/// `outer` isn't `@Builder`-annotated.
 pub(crate) fn builder_class(outer: &TypeDecl, source: &str) -> Option<ExternalClass> {
     if !marks_on(outer.node, source).builder {
         return None;
@@ -307,6 +295,7 @@ pub(crate) fn builder_class(outer: &TypeDecl, source: &str) -> Option<ExternalCl
             is_static: false,
             ret_fqn: Some(builder_fqn.clone()),
             ret_display: Some(builder_simple.clone()),
+            metadata: None,
         })
         .collect();
     members.push(ExternalMember {
@@ -317,12 +306,14 @@ pub(crate) fn builder_class(outer: &TypeDecl, source: &str) -> Option<ExternalCl
         is_static: false,
         ret_fqn: Some(outer_fqn),
         ret_display: Some(outer.name.to_string()),
+        metadata: None,
     });
 
     Some(ExternalClass {
         supers: vec!["java.lang.Object".to_string()],
         type_params: Vec::new(),
         members,
+        metadata: None,
     })
 }
 
@@ -444,7 +435,7 @@ mod tests {
             .into_iter()
             .find(|n| n.kind() == "class_declaration")
             .unwrap();
-        let td = TypeDecl::from_node(class, src, 0).unwrap();
+        let td = TypeDecl::from_node(class, src, 0, None).unwrap();
         let builder_class = builder_class(&td, src).expect("@Builder class");
         let fluent = builder_class
             .members

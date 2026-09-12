@@ -3,15 +3,17 @@
 //! unresolved query yields `None`, never a panic, even on tree-sitter
 //! ERROR/MISSING recovery nodes.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use tree_sitter::{Node, Tree};
 
+use jvl_types::{Access, ClassKind, ClassMetadata, PrimitiveType, TypeId, TypeRef, TypeVariableId};
+
 use crate::external::{ExternalMember, ExternalMemberKind, SymbolSource};
 use crate::imports::Imports;
-use crate::model::{
-    base_type_name, named_children, DeclSite, Member, MemberKind, TypeDecl, TypeTable,
-};
+use crate::model::{named_children, DeclSite, Member, MemberKind, TypeDecl, TypeKind, TypeTable};
 use crate::{node_text, OpenDoc};
 
 /// Depth cap for receiver/path resolution — real receiver chains are a handful
@@ -23,14 +25,40 @@ const MAX_RESOLVE_DEPTH: usize = 64;
 /// the file's imports, and the external symbol source (JDK/deps).
 pub(crate) struct Ctx<'a, 't> {
     pub doc: &'a OpenDoc<'t>,
-    /// Index of `doc` in the `&[OpenDoc]` slice `table` was built from — needed
-    /// to stamp a [`DeclSite`] on bindings/types declared in `doc` itself (e.g.
-    /// the enclosing type via `this`/`super`), whose site isn't otherwise
-    /// recorded on the node.
+    /// Index of `doc` in the `&[OpenDoc]` slice `table` was built from.
+    /// Needed to stamp a [`DeclSite`] on bindings/types declared in `doc`
+    /// itself (e.g. the enclosing type via `this`/`super`).
     pub current: usize,
     pub table: &'a TypeTable<'t>,
     pub imports: &'a Imports,
     pub symbols: &'a dyn SymbolSource,
+    /// The same `&[OpenDoc]` slice `table` was built from. Used by
+    /// [`Ctx::for_document`] to resolve a member's or supertype's declared
+    /// type against the document that actually declares it.
+    pub docs: &'a [OpenDoc<'t>],
+    /// Per-request memo of [`class_facts`], shared across every `Ctx` view
+    /// from [`Ctx::for_document`] so a class reached through several
+    /// hierarchy steps is only ever extracted once.
+    pub facts: &'a FactsCache,
+}
+
+impl<'a, 't> Ctx<'a, 't> {
+    /// Views the same table/symbols/facts from another document's own
+    /// imports/package — for resolving a member's or supertype's declared
+    /// type where it's actually declared. `None` only when `doc` is out of
+    /// range for `table`/`docs`.
+    pub(crate) fn for_document(&self, doc: usize) -> Option<Ctx<'a, 't>> {
+        let dc = self.table.doc_context(doc)?;
+        Some(Ctx {
+            doc: self.docs.get(doc)?,
+            current: doc,
+            table: self.table,
+            imports: &dc.imports,
+            symbols: self.symbols,
+            docs: self.docs,
+            facts: self.facts,
+        })
+    }
 }
 
 /// A binding visible at the cursor (local, parameter, for-variable, or field).
@@ -43,10 +71,9 @@ pub(crate) struct Binding<'t> {
     /// Declaration node, used to render hover signatures.
     pub decl_node: Node<'t>,
     pub source: &'t str,
-    /// Index (into the `&[OpenDoc]` slice `collect_bindings` was called with) of
-    /// the document this binding is declared in. A field binding can name a
-    /// different document than the usage site (inherited from a supertype
-    /// declared elsewhere); locals/params/for-vars are always the current doc.
+    /// Index into the `&[OpenDoc]` slice of the document this binding is
+    /// declared in. An inherited field may point elsewhere; locals/params/
+    /// for-vars are always the current doc.
     pub doc: usize,
 }
 
@@ -58,11 +85,9 @@ impl<'t> Binding<'t> {
     }
 }
 
-/// The name-identifier node of a binding's declaration node. Most binding decl
-/// nodes carry a `name` field (`variable_declarator`, `formal_parameter`,
-/// `enhanced_for_statement`, and the field-origin `Member` node kinds); a bare
-/// lambda parameter's decl node *is* its name (`identifier`); a varargs
-/// parameter's name lives on its nested `variable_declarator`.
+/// The name-identifier node of a binding's declaration node. Most decl nodes
+/// carry a `name` field; a bare lambda parameter's decl node *is* its name,
+/// and a varargs parameter's name lives on its nested `variable_declarator`.
 fn binding_name_node(decl_node: Node) -> Option<Node> {
     match decl_node.kind() {
         "identifier" => Some(decl_node),
@@ -79,35 +104,230 @@ pub(crate) enum BindingKind {
     Field,
 }
 
-/// One of Java's eight primitive value types.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PrimitiveType {
-    Boolean,
-    Byte,
-    Short,
-    Int,
-    Long,
-    Char,
-    Float,
-    Double,
-}
-
-/// A conservatively resolved Java value type. Reference types retain their
-/// source/classpath identity; primitives, `void`, `null`, and arrays remain
-/// distinct so callers never have to reconstruct value semantics from text.
+/// A conservatively resolved Java value type. Reference types keep structured
+/// [`TypeRef`]s, never rendered strings, so [`assignable_refs`] can compare
+/// them directly; primitives, `void`, `null`, and arrays stay distinct so
+/// callers never reconstruct value semantics from text.
 pub(crate) enum ResolvedType<'t> {
-    InProject(TypeDecl<'t>),
+    InProject {
+        decl: TypeDecl<'t>,
+        args: Vec<TypeRef>,
+    },
     External {
         fqn: String,
-        args: Vec<String>,
+        args: Vec<TypeRef>,
     },
     Primitive(PrimitiveType),
     Void,
     Null,
     Array {
-        /// The declared display text (`String[]`).
-        display: String,
+        /// The array's element type, one level peeled (`String[][]`'s
+        /// element is itself `Array(String)`).
+        element: TypeRef,
     },
+}
+
+impl<'t> ResolvedType<'t> {
+    /// This resolved type's identity as a structured [`TypeRef`] — the sole
+    /// bridge into the subtype engine ([`assignable_refs`]/[`is_subtype`]),
+    /// which never touches `TypeDecl`/`ExternalClass` directly.
+    pub(crate) fn type_ref(&self) -> TypeRef {
+        match self {
+            ResolvedType::InProject { decl, args } => TypeRef::Named {
+                id: decl.type_id.clone(),
+                args: args.clone(),
+            },
+            ResolvedType::External { fqn, args } => TypeRef::Named {
+                id: TypeId::named(fqn),
+                args: args.clone(),
+            },
+            ResolvedType::Primitive(p) => TypeRef::Primitive(*p),
+            ResolvedType::Void => TypeRef::Void,
+            ResolvedType::Null => TypeRef::Null,
+            ResolvedType::Array { element } => TypeRef::Array(Box::new(element.clone())),
+        }
+    }
+
+    /// Structured `TypeRef` -> resolved type: looks up a `Named` declaration
+    /// in `ctx.table` first, then falls back to the external symbol source,
+    /// never guessing across an ambiguous in-project name. `None` for a
+    /// type variable/wildcard/unknown — none name a concrete receiver.
+    pub(crate) fn from_type_ref(ty: &TypeRef, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
+        Some(match ty {
+            TypeRef::Primitive(p) => ResolvedType::Primitive(*p),
+            TypeRef::Void => ResolvedType::Void,
+            TypeRef::Null => ResolvedType::Null,
+            TypeRef::Array(e) => ResolvedType::Array {
+                element: (**e).clone(),
+            },
+            TypeRef::Named {
+                id: TypeId::Named(b),
+                args,
+            } => match ctx.table.get_named(b) {
+                Some(d) => ResolvedType::InProject {
+                    decl: d.clone(),
+                    args: args.clone(),
+                },
+                None if ctx.table.is_duplicate(b) => return None,
+                None => {
+                    ctx.symbols.class(b)?;
+                    ResolvedType::External {
+                        fqn: b.clone(),
+                        args: args.clone(),
+                    }
+                }
+            },
+            TypeRef::Named {
+                id:
+                    TypeId::Local {
+                        document,
+                        declaration,
+                    },
+                args,
+            } => ResolvedType::InProject {
+                decl: ctx.table.by_node(*document, *declaration)?.clone(),
+                args: args.clone(),
+            },
+            TypeRef::Variable(_) | TypeRef::Wildcard { .. } | TypeRef::Unknown => return None,
+        })
+    }
+}
+
+/// Render a structured [`TypeRef`] as it would read in a signature: simple
+/// name, `<args>` for generics, `[]` per array level, `?`/`? extends X`/
+/// `? super X` for wildcards. Display only — never fed back into the
+/// subtype engine.
+pub(crate) fn render_type_ref(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Primitive(p) => p.name().to_string(),
+        TypeRef::Void => "void".to_string(),
+        TypeRef::Null => "null".to_string(),
+        TypeRef::Named { id, args } => {
+            let simple = match id {
+                TypeId::Named(b) => b
+                    .rsplit('.')
+                    .next()
+                    .and_then(|s| s.rsplit('$').next())
+                    .unwrap_or(b)
+                    .to_string(),
+                TypeId::Local { .. } => "?".to_string(),
+            };
+            if args.is_empty() {
+                simple
+            } else {
+                let rendered: Vec<String> = args.iter().map(render_type_ref).collect();
+                format!("{simple}<{}>", rendered.join(", "))
+            }
+        }
+        TypeRef::Array(element) => format!("{}[]", render_type_ref(element)),
+        TypeRef::Wildcard { upper: Some(u), .. } => format!("? extends {}", render_type_ref(u)),
+        TypeRef::Wildcard { lower: Some(l), .. } => format!("? super {}", render_type_ref(l)),
+        TypeRef::Wildcard { .. } | TypeRef::Variable(_) | TypeRef::Unknown => "?".to_string(),
+    }
+}
+
+/// Render a structured type for a source-aware UI surface. Unlike
+/// [`render_type_ref`], this preserves class type-variable names when their
+/// declaration is available in the current project or symbol source.
+pub(crate) fn render_type_ref_in(ty: &TypeRef, ctx: &Ctx<'_, '_>) -> String {
+    render_type_ref_with(ty, &|variable| type_variable_name(variable, ctx))
+}
+
+fn render_type_ref_with(
+    ty: &TypeRef,
+    variable_name: &dyn Fn(&TypeVariableId) -> Option<String>,
+) -> String {
+    match ty {
+        TypeRef::Primitive(p) => p.name().to_string(),
+        TypeRef::Void => "void".to_string(),
+        TypeRef::Null => "null".to_string(),
+        TypeRef::Named { id, args } => {
+            let simple = match id {
+                TypeId::Named(b) => b
+                    .rsplit('.')
+                    .next()
+                    .and_then(|s| s.rsplit('$').next())
+                    .unwrap_or(b)
+                    .to_string(),
+                TypeId::Local { .. } => "?".to_string(),
+            };
+            if args.is_empty() {
+                simple
+            } else {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|arg| render_type_ref_with(arg, variable_name))
+                    .collect();
+                format!("{simple}<{}>", rendered.join(", "))
+            }
+        }
+        TypeRef::Array(element) => {
+            format!("{}[]", render_type_ref_with(element, variable_name))
+        }
+        TypeRef::Variable(variable) => variable_name(variable).unwrap_or_else(|| "?".to_string()),
+        TypeRef::Wildcard { upper: Some(u), .. } => {
+            format!("? extends {}", render_type_ref_with(u, variable_name))
+        }
+        TypeRef::Wildcard { lower: Some(l), .. } => {
+            format!("? super {}", render_type_ref_with(l, variable_name))
+        }
+        TypeRef::Wildcard { .. } | TypeRef::Unknown => "?".to_string(),
+    }
+}
+
+fn type_variable_name(variable: &TypeVariableId, ctx: &Ctx<'_, '_>) -> Option<String> {
+    if let Some((class_owner, _)) = variable.owner.split_once('#') {
+        let decl = ctx.table.get_named(class_owner)?;
+        for member in decl.own_members() {
+            if !matches!(
+                member.node.kind(),
+                "method_declaration" | "constructor_declaration"
+            ) {
+                continue;
+            }
+            let name = node_text(member.node.child_by_field_name("name")?, member.source);
+            let params = member
+                .node
+                .child_by_field_name("parameters")
+                .map(|node| node_text(node, member.source))
+                .unwrap_or("()");
+            let source_owner = format!("{class_owner}#{name}{params}");
+            let constructor_owner = format!("{class_owner}#<init>{params}");
+            if variable.owner == source_owner || variable.owner == constructor_owner {
+                return type_parameter_name(
+                    member.node.child_by_field_name("type_parameters")?,
+                    variable.index,
+                    member.source,
+                );
+            }
+        }
+        return None;
+    }
+    if let Some(decl) = ctx.table.get_named(&variable.owner) {
+        return type_parameter_name(
+            decl.node.child_by_field_name("type_parameters")?,
+            variable.index,
+            decl.source,
+        );
+    }
+    ctx.symbols
+        .class(&variable.owner)?
+        .type_params
+        .get(variable.index)
+        .cloned()
+}
+
+fn type_parameter_name(params: Node, index: usize, source: &str) -> Option<String> {
+    named_children(params)
+        .into_iter()
+        .filter(|node| node.kind() == "type_parameter")
+        .nth(index)
+        .and_then(|param| {
+            named_children(param)
+                .into_iter()
+                .find(|node| node.kind() == "type_identifier")
+        })
+        .map(|name| node_text(name, source).to_string())
 }
 
 /// A resolved receiver type plus whether the access is static (the receiver was
@@ -133,9 +353,8 @@ pub(crate) fn node_at<'t>(tree: &'t Tree, byte: usize) -> Node<'t> {
 }
 
 /// Whether a tree-sitter node kind is one of Java's five type-declaration
-/// shapes. `pub(crate)` so `rename.rs` can walk past a nested type's
-/// immediate declaration to find its *outer* enclosing type, the same way
-/// [`enclosing_type_node`] finds the innermost one.
+/// shapes. `pub(crate)`: `rename.rs` uses it to walk past a nested type's
+/// own declaration to find its *outer* enclosing type.
 pub(crate) fn is_type_decl(kind: &str) -> bool {
     matches!(
         kind,
@@ -159,13 +378,36 @@ pub(crate) fn enclosing_type_node<'t>(node: Node<'t>) -> Option<Node<'t>> {
     None
 }
 
-/// The [`TypeDecl`] for the type enclosing `node`, declared in document `doc`.
+/// The [`TypeDecl`] for the type enclosing `node`, declared in document
+/// `doc` — looked up directly in `table` (never re-parsed), so it always
+/// carries the same qualified identity `table` indexed it under.
 pub(crate) fn enclosing_typedecl<'t>(
     node: Node<'t>,
-    source: &'t str,
+    table: &TypeTable<'t>,
     doc: usize,
 ) -> Option<TypeDecl<'t>> {
-    TypeDecl::from_node(enclosing_type_node(node)?, source, doc)
+    table.by_node(doc, enclosing_type_node(node)?.id()).cloned()
+}
+
+/// Binary names of every type declaration enclosing `node`, in `ctx`'s own
+/// document, innermost first. Used by constructor accessibility (visible
+/// from any nesting level of its own top-level type) and enclosing-instance
+/// checks.
+pub(crate) fn enclosing_binary_names(node: Node, ctx: &Ctx<'_, '_>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        let Some(type_node) = enclosing_type_node(n) else {
+            break;
+        };
+        if let Some(td) = ctx.table.by_node(ctx.current, type_node.id()) {
+            if let Some(b) = &td.binary_name {
+                out.push(b.clone());
+            }
+        }
+        cur = type_node.parent();
+    }
+    out
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -220,6 +462,16 @@ pub(crate) fn resolve_receiver_type<'t>(recv: Node<'t>, ctx: &Ctx<'_, 't>) -> Op
     resolve_receiver_depth(recv, ctx, 0, MethodLookup::First)
 }
 
+/// The receiver of a call being semantically checked: same as
+/// [`resolve_receiver_type`] but with argument-aware (`Unique`) lookup, so an
+/// unknown generic call in the chain stays unknown instead of being guessed.
+pub(crate) fn resolve_checked_receiver<'t>(
+    recv: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+) -> Option<Resolved<'t>> {
+    resolve_receiver_depth(recv, ctx, 0, MethodLookup::Unique)
+}
+
 /// Resolve the value type of an expression for conservative semantic checks.
 /// An overloaded same-name call is unknown because this layer does not perform
 /// Java overload selection.
@@ -240,13 +492,18 @@ fn resolve_receiver_depth<'t>(
     if depth > MAX_RESOLVE_DEPTH {
         return None;
     }
+    let _nesting = ctx.facts.enter()?;
     match recv.kind() {
-        "this" => enclosing_typedecl(recv, ctx.doc.source, ctx.current)
-            .map(|td| instance(ResolvedType::InProject(td))),
+        "this" => enclosing_typedecl(recv, ctx.table, ctx.current).map(|td| {
+            instance(ResolvedType::InProject {
+                decl: td,
+                args: Vec::new(),
+            })
+        }),
         "super" => {
-            let td = enclosing_typedecl(recv, ctx.doc.source, ctx.current)?;
-            let sup = td.supers.first()?;
-            resolve_super(sup, ctx).map(instance)
+            let td = enclosing_typedecl(recv, ctx.table, ctx.current)?;
+            let sup_node = *td.super_nodes.first()?;
+            resolve_type_node(sup_node, td.source, ctx).map(instance)
         }
         "identifier" | "type_identifier" => resolve_name_depth(
             node_text(recv, ctx.doc.source),
@@ -255,24 +512,35 @@ fn resolve_receiver_depth<'t>(
             depth + 1,
             method_lookup,
         ),
-        "method_invocation" => {
-            let name = recv.child_by_field_name("name")?;
-            let recv_ty = match recv.child_by_field_name("object") {
-                Some(obj) => resolve_receiver_depth(obj, ctx, depth + 1, method_lookup)?,
-                None => instance(ResolvedType::InProject(enclosing_typedecl(
-                    recv,
-                    ctx.doc.source,
-                    ctx.current,
-                )?)),
-            };
-            let member = find_method(
-                &recv_ty,
-                ctx,
-                node_text(name, ctx.doc.source),
-                method_lookup,
-            )?;
-            member_result_type(&member, &recv_ty, ctx, method_lookup)
-        }
+        "method_invocation" => match method_lookup {
+            // The arity-aware applicability engine — the only mode
+            // semantic checks (`resolve_expression_type`) use.
+            MethodLookup::Unique => match crate::call::resolve_method_call(recv, ctx) {
+                crate::call::CallResolution::Selected { result, .. } => {
+                    ResolvedType::from_type_ref(&result, ctx).map(instance)
+                }
+                _ => None,
+            },
+            // Completion/hover's historical first-name lookup: ignores
+            // argument types entirely, so any name match resolves.
+            MethodLookup::First => {
+                let name = recv.child_by_field_name("name")?;
+                let recv_ty = match recv.child_by_field_name("object") {
+                    Some(obj) => resolve_receiver_depth(obj, ctx, depth + 1, method_lookup)?,
+                    None => instance(ResolvedType::InProject {
+                        decl: enclosing_typedecl(recv, ctx.table, ctx.current)?,
+                        args: Vec::new(),
+                    }),
+                };
+                let member = find_method(
+                    &recv_ty,
+                    ctx,
+                    node_text(name, ctx.doc.source),
+                    method_lookup,
+                )?;
+                member_result_type(&member, &recv_ty, ctx, method_lookup)
+            }
+        },
         "cast_expression" => {
             let ty = recv.child_by_field_name("type")?;
             resolve_type_node(ty, ctx.doc.source, ctx).map(instance)
@@ -281,7 +549,7 @@ fn resolve_receiver_depth<'t>(
             let arr = recv.child_by_field_name("array")?;
             let a = resolve_receiver_depth(arr, ctx, depth + 1, method_lookup)?;
             match &a.ty {
-                ResolvedType::Array { display } => array_element_type(display, ctx),
+                ResolvedType::Array { element } => array_element_type(element, ctx),
                 _ => None,
             }
         }
@@ -326,12 +594,89 @@ fn resolve_receiver_depth<'t>(
             }
             resolve_scoped_path(recv, ctx, method_lookup)
         }
-        "object_creation_expression" => resolve_object_creation_type(recv, ctx).map(instance),
+        "object_creation_expression" => match method_lookup {
+            // The created type comes from actual constructor selection
+            // (arity, diamond inference), not just the written name; an
+            // inapplicable `new` resolves to nothing.
+            MethodLookup::Unique => match crate::call::resolve_constructor_call(recv, ctx) {
+                Ok(crate::call::CallResolution::Selected { result, .. }) => {
+                    ResolvedType::from_type_ref(&result, ctx).map(instance)
+                }
+                _ => None,
+            },
+            // Completion/hover's lookup: the written type name alone,
+            // regardless of constructor applicability, so a chain off
+            // `new Foo(...)` keeps resolving.
+            MethodLookup::First => resolve_object_creation_type(recv, ctx).map(instance),
+        },
         "scoped_type_identifier" | "scoped_identifier" => {
             resolve_scoped_path(recv, ctx, method_lookup)
         }
         "parenthesized_expression" => {
             resolve_receiver_depth(recv.named_child(0)?, ctx, depth + 1, method_lookup)
+        }
+        // A ternary's value is whichever branch's type the other widens to
+        // (full JLS 15.25 numeric-promotion/lub is out of scope). Two
+        // unrelated branches, neither assignable to the other, stay unknown
+        // rather than guessing a common supertype.
+        "ternary_expression" => {
+            let consequence = recv.child_by_field_name("consequence")?;
+            let alternative = recv.child_by_field_name("alternative")?;
+            let c = resolve_receiver_depth(consequence, ctx, depth + 1, method_lookup)?;
+            let a = resolve_receiver_depth(alternative, ctx, depth + 1, method_lookup)?;
+            if assignable_refs(&c.ty.type_ref(), &a.ty.type_ref(), ctx) == Some(true) {
+                Some(a)
+            } else if assignable_refs(&a.ty.type_ref(), &c.ty.type_ref(), ctx) == Some(true) {
+                Some(c)
+            } else {
+                None
+            }
+        }
+        // An assignment expression's own value is the (possibly narrowed)
+        // type of its target — resolve `left` the same way any other
+        // receiver would be.
+        "assignment_expression" => {
+            let left = recv.child_by_field_name("left")?;
+            resolve_receiver_depth(left, ctx, depth + 1, method_lookup)
+        }
+        // Only `+` with a `String` operand is typed (concatenation);
+        // comparison/logical operators always yield `boolean`. Other
+        // operators (arithmetic/bitwise) are out of scope here.
+        "binary_expression" => {
+            let operator = node_text(recv.child_by_field_name("operator")?, ctx.doc.source);
+            match operator {
+                "+" => {
+                    let left = recv.child_by_field_name("left")?;
+                    let right = recv.child_by_field_name("right")?;
+                    let is_string = |n: Node<'t>| {
+                        resolve_receiver_depth(n, ctx, depth + 1, method_lookup).is_some_and(|r| {
+                            matches!(&r.ty, ResolvedType::External { fqn, .. } if fqn == "java.lang.String")
+                        })
+                    };
+                    if is_string(left) || is_string(right) {
+                        Some(instance(ResolvedType::External {
+                            fqn: "java.lang.String".to_string(),
+                            args: Vec::new(),
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" => {
+                    Some(instance(ResolvedType::Primitive(PrimitiveType::Boolean)))
+                }
+                _ => None,
+            }
+        }
+        // `x instanceof Type` (and its pattern form) is always `boolean`, a
+        // distinct node kind from `binary_expression` in this grammar.
+        "instanceof_expression" => Some(instance(ResolvedType::Primitive(PrimitiveType::Boolean))),
+        // `!` is the only `unary_expression` operator typed here; `+`/`-`/`~`
+        // need numeric-promotion typing (out of scope). Increment/decrement
+        // are a distinct `update_expression` node, never reaching here.
+        "unary_expression" => {
+            let operator = node_text(recv.child_by_field_name("operator")?, ctx.doc.source);
+            (operator == "!").then(|| instance(ResolvedType::Primitive(PrimitiveType::Boolean)))
         }
         _ => None,
     }
@@ -357,208 +702,466 @@ fn find_method<'t>(
     }
 }
 
-/// Whether `actual` can be returned where `expected` is declared. `None`
-/// means this conservative layer cannot prove either answer.
+/// Depth cap for the subtype engine's hierarchy walk, distinct from
+/// [`MAX_RESOLVE_DEPTH`] since the two walks are unrelated.
+const MAX_SUBTYPE_DEPTH: usize = 64;
+
+/// Per-request memo of [`class_facts`] results — the subtype engine calls it
+/// repeatedly for the same handful of classes, so each is extracted once.
+/// One instance per top-level request; never persisted, so no invalidation
+/// is needed.
+#[derive(Default)]
+pub(crate) struct FactsCache {
+    facts: RefCell<HashMap<TypeId, Option<Rc<ClassFacts>>>>,
+    /// Current nesting of semantic resolutions in this request. Shared
+    /// across `resolve_receiver_depth` ↔ `call::resolve_method_call`
+    /// re-entry, which restarts the per-call `depth` counter.
+    nesting: std::cell::Cell<u32>,
+}
+
+/// Ceiling on nested expression resolutions. Real code stays below 20;
+/// pathological nesting hits the cap and resolves to Unknown (silent).
+const MAX_NESTING: u32 = 64;
+
+/// RAII token: decrements the nesting level when dropped.
+pub(crate) struct NestingGuard<'a>(&'a std::cell::Cell<u32>);
+
+impl Drop for NestingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+impl FactsCache {
+    /// Enter one nesting level; `None` when the cap is reached (caller must
+    /// return "unknown"). Hold the guard for the whole resolution.
+    pub(crate) fn enter(&self) -> Option<NestingGuard<'_>> {
+        let n = self.nesting.get();
+        if n >= MAX_NESTING {
+            return None;
+        }
+        self.nesting.set(n + 1);
+        Some(NestingGuard(&self.nesting))
+    }
+}
+
+/// The metadata + member set the subtype/applicability engines need for one
+/// class-like type, in-project or external, addressed by [`TypeId`] alone —
+/// never re-derived from a `TypeDecl`/`ExternalClass` at each hierarchy step.
+pub(crate) struct ClassFacts {
+    pub meta: ClassMetadata,
+    #[allow(dead_code)] // consumed by the method/constructor-applicability engine
+    pub members: Vec<ExternalMember>,
+}
+
+/// Facts for `id`, memoized in `ctx.facts` for the lifetime of this request.
+/// `None` when `id` is unresolvable, ambiguous (a duplicated in-project
+/// binary name), or the source that would supply it carries no structured
+/// metadata (a test stub, a synthetic lombok/array class) — every caller
+/// must treat that identically to "unknown", never guess.
+pub(crate) fn class_facts(id: &TypeId, ctx: &Ctx<'_, '_>) -> Option<Rc<ClassFacts>> {
+    if let Some(hit) = ctx.facts.facts.borrow().get(id) {
+        return hit.clone();
+    }
+    let computed = compute_class_facts(id, ctx).map(Rc::new);
+    ctx.facts
+        .facts
+        .borrow_mut()
+        .insert(id.clone(), computed.clone());
+    computed
+}
+
+fn compute_class_facts(id: &TypeId, ctx: &Ctx<'_, '_>) -> Option<ClassFacts> {
+    let source_decl = match id {
+        TypeId::Named(b) => {
+            if ctx.table.is_duplicate(b) {
+                return None;
+            }
+            ctx.table.get_named(b)
+        }
+        TypeId::Local {
+            document,
+            declaration,
+        } => ctx.table.by_node(*document, *declaration),
+    };
+    if let Some(d) = source_decl {
+        let dctx = ctx.for_document(d.doc)?;
+        let pick = |cands: &[String]| -> Option<String> {
+            cands
+                .iter()
+                .find(|c| ctx.table.get_named(c).is_some() || ctx.symbols.class(c).is_some())
+                .cloned()
+        };
+        let ext = crate::srcclass::to_external_class(d, d.source, dctx.imports, &pick);
+        return Some(ClassFacts {
+            meta: ext.metadata?,
+            members: ext.members,
+        });
+    }
+    let b = id.as_named()?;
+    if b == "java.lang.Object" && ctx.symbols.class(b).is_none() {
+        // Intrinsic terminal: every reference type is an Object even with no
+        // JDK on the classpath. No members are invented — only the
+        // subtype-proof-relevant metadata (an empty, complete hierarchy).
+        return Some(ClassFacts {
+            meta: ClassMetadata {
+                id: id.clone(),
+                kind: ClassKind::Class,
+                access: Access::Public,
+                is_abstract: false,
+                is_static: true,
+                enclosing_class: None,
+                type_parameters: Vec::new(),
+                supertypes: Vec::new(),
+                hierarchy_complete: true,
+                constructors_complete: false,
+            },
+            members: Vec::new(),
+        });
+    }
+    let ext = ctx.symbols.class(b)?;
+    Some(ClassFacts {
+        meta: ext.metadata?,
+        members: ext.members,
+    })
+}
+
+/// Whether `actual` can be assigned/returned where `expected` is declared.
+/// `None` means this conservative layer cannot prove either answer — never a
+/// wrong guess.
 pub(crate) fn is_assignable<'t>(
     actual: &ResolvedType<'t>,
     expected: &ResolvedType<'t>,
     ctx: &Ctx<'_, 't>,
 ) -> Option<bool> {
+    assignable_refs(&actual.type_ref(), &expected.type_ref(), ctx)
+}
+
+/// The structured subtype/assignability engine: JLS 5.2/5.1.2 conversions
+/// (identity, widening, boxing/unboxing) plus [`is_subtype`]'s hierarchy walk
+/// for reference types, covering in-project, external, and mixed
+/// hierarchies alike through [`class_facts`].
+pub(crate) fn assignable_refs(
+    actual: &TypeRef,
+    expected: &TypeRef,
+    ctx: &Ctx<'_, '_>,
+) -> Option<bool> {
+    use TypeRef::*;
     match (actual, expected) {
-        (
-            ResolvedType::Null,
-            ResolvedType::InProject(_) | ResolvedType::External { .. } | ResolvedType::Array { .. },
-        ) => Some(true),
-        (ResolvedType::Null, ResolvedType::Null) => Some(true),
-        (ResolvedType::Null, _) | (_, ResolvedType::Null) => Some(false),
-        (ResolvedType::Void, ResolvedType::Void) => Some(true),
-        (ResolvedType::Void, _) | (_, ResolvedType::Void) => Some(false),
-        (ResolvedType::Primitive(actual), ResolvedType::Primitive(expected)) => {
-            primitive_assignable(*actual, *expected, true)
+        (Unknown, _) | (_, Unknown) => None,
+        (Null, e) if e.is_reference() => Some(true),
+        (Null, _) | (_, Null) => Some(false),
+        (Void, Void) => Some(true),
+        (Void, _) | (_, Void) => Some(false),
+        // Variable/wildcard cases are handled before any primitive/array
+        // catch-all below so neither side's "is a wildcard/variable"
+        // question is ever pre-empted by a broader arm.
+        (Variable(v), e) => {
+            let bounds = variable_bounds(v, ctx)?;
+            let bounds = if bounds.is_empty() {
+                vec![TypeRef::named("java.lang.Object")]
+            } else {
+                bounds
+            };
+            any_proved(bounds.iter().map(|b| assignable_refs(b, e, ctx)))
         }
-        (ResolvedType::Primitive(actual), ResolvedType::External { fqn: expected, .. }) => {
-            match boxed_primitive(expected) {
-                Some(expected) if *actual == expected => Some(true),
-                Some(expected) => primitive_assignable(*actual, expected, true).map(|_| false),
-                None => external_subtype(primitive_box_fqn(*actual), expected, ctx.symbols),
-            }
-        }
-        (ResolvedType::External { fqn: actual, .. }, ResolvedType::Primitive(expected)) => {
-            match boxed_primitive(actual) {
-                Some(actual) => primitive_assignable(actual, *expected, false),
-                None => Some(false),
-            }
-        }
-        (ResolvedType::Primitive(_), _) | (_, ResolvedType::Primitive(_)) => Some(false),
-        (ResolvedType::Array { display: actual }, ResolvedType::Array { display: expected }) => {
-            (actual == expected).then_some(true)
-        }
-        (ResolvedType::Array { .. }, _) | (_, ResolvedType::Array { .. }) => None,
-        (ResolvedType::InProject(actual), ResolvedType::InProject(expected)) => {
-            if actual.doc != ctx.current || expected.doc != ctx.current {
-                return None;
-            }
-            if actual.node.id() == expected.node.id() {
+        (_, Variable(_)) => None,
+        (Wildcard { upper, .. }, e) => match upper {
+            Some(u) => assignable_refs(u, e, ctx),
+            None => assignable_refs(&TypeRef::named("java.lang.Object"), e, ctx),
+        },
+        (_, Wildcard { .. }) => None,
+        (Primitive(a), Primitive(e)) => {
+            if a == e || a.widens_to(*e) {
                 Some(true)
             } else {
-                None
+                constant_narrowing(*a, *e)
             }
         }
-        (ResolvedType::InProject(_), _) | (_, ResolvedType::InProject(_)) => None,
+        // Boxing to a different primitive's box type is never a combined
+        // box+widen — decided by primitive rules alone (including JLS 5.2's
+        // constant-narrowing-then-boxing allowance). An in-project/local
+        // class name is never a primitive's box type, so it's provably
+        // false without any classpath lookup.
         (
-            ResolvedType::External {
-                fqn: actual,
-                args: actual_args,
+            Primitive(_),
+            Named {
+                id: TypeId::Local { .. },
+                ..
             },
-            ResolvedType::External {
-                fqn: expected,
-                args: expected_args,
+        ) => Some(false),
+        (
+            Primitive(_),
+            Named {
+                id: TypeId::Named(eb),
+                ..
             },
-        ) => {
-            if type_args_unknown(actual_args) || type_args_unknown(expected_args) {
-                return None;
-            }
-            if actual == expected {
-                return if actual_args == expected_args {
-                    Some(true)
-                } else {
-                    None
-                };
-            }
-            external_subtype(actual, expected, ctx.symbols)
-        }
+        ) if ctx.table.get_named(eb).is_some() => Some(false),
+        (
+            Primitive(a),
+            Named {
+                id: TypeId::Named(eb),
+                ..
+            },
+        ) => match PrimitiveType::from_box_fqn(eb) {
+            Some(ep) if *a == ep => Some(true),
+            Some(ep) => constant_narrowing(*a, ep),
+            None => assignable_refs(&TypeRef::named(a.box_fqn()), expected, ctx),
+        },
+        (Primitive(_), _) => Some(false),
+        (
+            Named {
+                id: TypeId::Named(b),
+                ..
+            },
+            Primitive(e),
+        ) => PrimitiveType::from_box_fqn(b)
+            .map(|p| p == *e || p.widens_to(*e))
+            .or(Some(false)),
+        (_, Primitive(_)) => Some(false),
+        (Array(a), Array(e)) => match (&**a, &**e) {
+            (Primitive(x), Primitive(y)) => Some(x == y),
+            (Primitive(_), _) | (_, Primitive(_)) => Some(false),
+            (x, y) => assignable_refs(x, y, ctx),
+        },
+        (
+            Array(_),
+            Named {
+                id: TypeId::Named(b),
+                ..
+            },
+        ) => Some(matches!(
+            b.as_str(),
+            "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+        )),
+        (Array(_), _) | (_, Array(_)) => Some(false),
+        (
+            Named { .. },
+            Named {
+                id: eid,
+                args: eargs,
+            },
+        ) => is_subtype(actual, eid, eargs, ctx, 0, &mut HashSet::new()),
     }
 }
 
-fn primitive_assignable(
-    actual: PrimitiveType,
-    expected: PrimitiveType,
-    constant_narrowing_unknown: bool,
-) -> Option<bool> {
-    if actual == expected {
-        return Some(true);
-    }
-    let widening = matches!(
-        (actual, expected),
-        (PrimitiveType::Byte, PrimitiveType::Short)
-            | (PrimitiveType::Byte, PrimitiveType::Int)
-            | (PrimitiveType::Byte, PrimitiveType::Long)
-            | (PrimitiveType::Byte, PrimitiveType::Float)
-            | (PrimitiveType::Byte, PrimitiveType::Double)
-            | (PrimitiveType::Short, PrimitiveType::Int)
-            | (PrimitiveType::Short, PrimitiveType::Long)
-            | (PrimitiveType::Short, PrimitiveType::Float)
-            | (PrimitiveType::Short, PrimitiveType::Double)
-            | (PrimitiveType::Char, PrimitiveType::Int)
-            | (PrimitiveType::Char, PrimitiveType::Long)
-            | (PrimitiveType::Char, PrimitiveType::Float)
-            | (PrimitiveType::Char, PrimitiveType::Double)
-            | (PrimitiveType::Int, PrimitiveType::Long)
-            | (PrimitiveType::Int, PrimitiveType::Float)
-            | (PrimitiveType::Int, PrimitiveType::Double)
-            | (PrimitiveType::Long, PrimitiveType::Float)
-            | (PrimitiveType::Long, PrimitiveType::Double)
-            | (PrimitiveType::Float, PrimitiveType::Double)
-    );
-    if widening {
-        return Some(true);
-    }
-    if constant_narrowing_unknown
-        && matches!(
-            actual,
-            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char | PrimitiveType::Int
-        )
-        && matches!(
-            expected,
-            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
-        )
-    {
-        return None;
-    }
-    Some(false)
-}
-
-fn boxed_primitive(fqn: &str) -> Option<PrimitiveType> {
-    Some(match fqn {
-        "java.lang.Boolean" => PrimitiveType::Boolean,
-        "java.lang.Byte" => PrimitiveType::Byte,
-        "java.lang.Short" => PrimitiveType::Short,
-        "java.lang.Integer" => PrimitiveType::Int,
-        "java.lang.Long" => PrimitiveType::Long,
-        "java.lang.Character" => PrimitiveType::Char,
-        "java.lang.Float" => PrimitiveType::Float,
-        "java.lang.Double" => PrimitiveType::Double,
-        _ => return None,
-    })
-}
-
-fn primitive_box_fqn(primitive: PrimitiveType) -> &'static str {
-    match primitive {
-        PrimitiveType::Boolean => "java.lang.Boolean",
-        PrimitiveType::Byte => "java.lang.Byte",
-        PrimitiveType::Short => "java.lang.Short",
-        PrimitiveType::Int => "java.lang.Integer",
-        PrimitiveType::Long => "java.lang.Long",
-        PrimitiveType::Char => "java.lang.Character",
-        PrimitiveType::Float => "java.lang.Float",
-        PrimitiveType::Double => "java.lang.Double",
-    }
-}
-
-fn type_args_unknown(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        (arg.contains('?') || arg.contains('{') || arg.contains('}'))
-            || arg
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
-                .any(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_uppercase())
-    })
-}
-
-fn external_subtype(actual: &str, expected: &str, symbols: &dyn SymbolSource) -> Option<bool> {
-    symbols.class(expected)?;
-    let mut path = HashSet::new();
-    external_subtype_walk(actual, expected, symbols, &mut path, 0)
-}
-
-fn external_subtype_walk(
-    actual: &str,
-    expected: &str,
-    symbols: &dyn SymbolSource,
-    path: &mut HashSet<String>,
+/// Prove the substituted subtype path: `Some(false)` requires every path to
+/// be complete, while any unresolved hierarchy returns `None`.
+fn is_subtype(
+    actual: &TypeRef,
+    target: &TypeId,
+    target_args: &[TypeRef],
+    ctx: &Ctx<'_, '_>,
     depth: usize,
+    seen: &mut HashSet<TypeRef>,
 ) -> Option<bool> {
-    if actual == expected {
-        return Some(true);
-    }
-    if depth > MAX_RESOLVE_DEPTH || !path.insert(actual.to_string()) {
+    let TypeRef::Named { id, args } = actual else {
+        return None;
+    };
+    if depth > MAX_SUBTYPE_DEPTH || !seen.insert(actual.clone()) {
         return None;
     }
-    let result = match symbols.class(actual) {
-        None => None,
-        Some(class) => {
-            let mut complete = true;
-            let mut found = false;
-            for supertype in class.supers {
-                match external_subtype_walk(&supertype, expected, symbols, path, depth + 1) {
-                    Some(true) => {
-                        found = true;
-                        break;
-                    }
-                    Some(false) => {}
-                    None => complete = false,
-                }
-            }
-            if found {
-                Some(true)
-            } else if complete {
-                Some(false)
+    // `seen` guards only the current path (cyclic `extends`), never a
+    // diamond — two supertypes converging on a common ancestor must each
+    // independently re-walk it. Removed on every exit so a sibling branch
+    // isn't starved by an earlier visit.
+    let result = (|| {
+        if id == target {
+            return type_args_contain(args, target_args, ctx);
+        }
+        if target.as_named() == Some("java.lang.Object") {
+            return Some(true);
+        }
+        // A "not a subtype" answer needs a real target class; an opaque or
+        // unresolvable name can never be proven unrelated.
+        if depth == 0 && class_facts(target, ctx).is_none() {
+            return None;
+        }
+        let facts = class_facts(id, ctx)?;
+        let env: Vec<(TypeVariableId, TypeRef)> = facts
+            .meta
+            .type_parameters
+            .iter()
+            .map(|p| p.id.clone())
+            .zip(args.iter().cloned())
+            .collect();
+        let raw = args.is_empty() && !facts.meta.type_parameters.is_empty();
+        let mut complete = facts.meta.hierarchy_complete;
+        for sup in &facts.meta.supertypes {
+            let sup = if raw {
+                erase(sup)
             } else {
-                None
+                sup.substitute(&env)
+            };
+            match is_subtype(&sup, target, target_args, ctx, depth + 1, seen) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => complete = false,
             }
         }
-    };
-    path.remove(actual);
+        if complete {
+            Some(false)
+        } else {
+            None
+        }
+    })();
+    seen.remove(actual);
     result
+}
+
+/// JLS 4.5.1 expected-side containment: `?` contains anything,
+/// `? extends B` accepts a concrete/sub-wildcard upper bounded by `B`, and
+/// `? super B` accepts a concrete/super-wildcard lower-bounding `B`.
+/// Raw expected accepts unconditionally; raw actual into parameterized
+/// expected is unknown.
+fn type_args_contain(actual: &[TypeRef], expected: &[TypeRef], ctx: &Ctx<'_, '_>) -> Option<bool> {
+    if expected.is_empty() {
+        return Some(true);
+    }
+    if actual.is_empty() || actual.len() != expected.len() {
+        return None;
+    }
+    let mut unknown = false;
+    for (actual, expected) in actual.iter().zip(expected) {
+        let contains = match (actual, expected) {
+            (
+                _,
+                TypeRef::Wildcard {
+                    upper: None,
+                    lower: None,
+                },
+            ) => Some(true),
+            (TypeRef::Unknown, _) | (_, TypeRef::Unknown) => None,
+            (TypeRef::Variable(_), _) | (_, TypeRef::Variable(_)) => None,
+            (
+                TypeRef::Wildcard {
+                    upper: actual_upper,
+                    lower: None,
+                },
+                TypeRef::Wildcard {
+                    upper: Some(expected_upper),
+                    lower: None,
+                },
+            ) => match actual_upper {
+                Some(actual_upper) => assignable_refs(actual_upper, expected_upper, ctx),
+                None => assignable_refs(&TypeRef::named("java.lang.Object"), expected_upper, ctx),
+            },
+            (
+                TypeRef::Wildcard {
+                    lower: Some(actual_lower),
+                    ..
+                },
+                TypeRef::Wildcard {
+                    lower: Some(expected_lower),
+                    ..
+                },
+            ) => assignable_refs(expected_lower, actual_lower, ctx),
+            (
+                TypeRef::Wildcard { .. },
+                TypeRef::Wildcard {
+                    upper: Some(_),
+                    lower: None,
+                },
+            )
+            | (
+                TypeRef::Wildcard { .. },
+                TypeRef::Wildcard {
+                    lower: Some(_),
+                    upper: None,
+                },
+            ) => None,
+            (
+                actual,
+                TypeRef::Wildcard {
+                    upper: Some(expected_upper),
+                    lower: None,
+                },
+            ) => assignable_refs(actual, expected_upper, ctx),
+            (
+                actual,
+                TypeRef::Wildcard {
+                    lower: Some(expected_lower),
+                    upper: None,
+                },
+            ) => assignable_refs(expected_lower, actual, ctx),
+            (TypeRef::Wildcard { .. }, _) => Some(false),
+            (actual, expected) => Some(actual == expected),
+        };
+        match contains {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+/// Erase a `TypeRef` to its raw form (drop generic arguments at every
+/// level). `pub(crate)`: shared by the method/constructor-applicability
+/// engine.
+pub(crate) fn erase(t: &TypeRef) -> TypeRef {
+    match t {
+        TypeRef::Named { id, .. } => TypeRef::Named {
+            id: id.clone(),
+            args: Vec::new(),
+        },
+        TypeRef::Array(e) => TypeRef::Array(Box::new(erase(e))),
+        other => other.clone(),
+    }
+}
+
+/// `Some(true)` on the first proved path; `Some(false)` only when every path
+/// is proved false; `None` when at least one path is unknown and none is
+/// proved true.
+fn any_proved(results: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut unknown = false;
+    for r in results {
+        match r {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// The bounds of type variable `v` — its declaring class's own
+/// `type_parameters` entry. Method/constructor-owned variables aren't
+/// looked up this way (their owner string doesn't name a class), so any
+/// reference to one stays `None` (unknown) here — conservative, never wrong.
+fn variable_bounds(v: &TypeVariableId, ctx: &Ctx<'_, '_>) -> Option<Vec<TypeRef>> {
+    let facts = class_facts(&TypeId::Named(v.owner.clone()), ctx)?;
+    facts
+        .meta
+        .type_parameters
+        .get(v.index)
+        .map(|p| p.bounds.clone())
+}
+
+/// JLS 5.2: an `int`-family constant may still narrow-fit a smaller target
+/// (`byte b = 5;`, even boxed `Byte b = 5;`), so that direction stays
+/// unknown rather than a wrong `false`. Every other primitive narrowing is
+/// proven incompatible.
+fn constant_narrowing(actual: PrimitiveType, expected: PrimitiveType) -> Option<bool> {
+    if matches!(
+        actual,
+        PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char | PrimitiveType::Int
+    ) && matches!(
+        expected,
+        PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
+    ) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Resolve a simple name at a position: a scope binding gives an instance type;
@@ -594,13 +1197,18 @@ fn resolve_name_depth<'t>(
                 return resolve_type_node(type_node, binding.source, ctx).map(instance);
             }
         }
+        if matches!(binding.kind, BindingKind::Param) {
+            if let Some(inferred) =
+                crate::call::inferred_lambda_parameter_type(binding.decl_node, ctx)
+            {
+                return receiver_type_ref(&inferred, ctx, depth + 1).map(instance);
+            }
+        }
         // A `var` (or typeless) binding infers its type from the
-        // declarator's initializer, resolved like any receiver expression
-        // (`var v = new ArrayList<String>()`, `var t = s.trim()`, …).
-        // Depth-capped: ERROR-recovery trees can produce self-referential
-        // shapes legal Java can't. The result is always an instance —
-        // whatever static-ness the initializer expression had does not
-        // transfer to the value it produced.
+        // declarator's initializer, resolved like any receiver expression.
+        // Depth-capped since ERROR-recovery trees can produce
+        // self-referential shapes; the result is always an instance
+        // regardless of the initializer's static-ness.
         let value = binding.decl_node.child_by_field_name("value")?;
         // A `var` in an enhanced-for binds the *element* type of the iterable,
         // not the iterable's own type: `for (var s : List<String>)` → `s` is a
@@ -613,9 +1221,17 @@ fn resolve_name_depth<'t>(
         return resolve_receiver_depth(value, ctx, depth + 1, method_lookup)
             .map(|r| instance(r.ty));
     }
-    if let Some(td) = ctx.table.get(name) {
+    if let Some(td) = ctx.table.resolve_type_name_node(
+        node_at(ctx.doc.tree, byte),
+        ctx.doc.source,
+        ctx.current,
+        ctx.imports,
+    ) {
         return Some(Resolved {
-            ty: ResolvedType::InProject(td.clone()),
+            ty: ResolvedType::InProject {
+                decl: td.clone(),
+                args: Vec::new(),
+            },
             static_only: true,
         });
     }
@@ -629,61 +1245,32 @@ fn resolve_name_depth<'t>(
     })
 }
 
-fn primitive_name(primitive: PrimitiveType) -> &'static str {
-    match primitive {
-        PrimitiveType::Boolean => "boolean",
-        PrimitiveType::Byte => "byte",
-        PrimitiveType::Short => "short",
-        PrimitiveType::Int => "int",
-        PrimitiveType::Long => "long",
-        PrimitiveType::Char => "char",
-        PrimitiveType::Float => "float",
-        PrimitiveType::Double => "double",
-    }
-}
-
-fn primitive_type(name: &str) -> Option<PrimitiveType> {
-    Some(match name.trim() {
-        "boolean" => PrimitiveType::Boolean,
-        "byte" => PrimitiveType::Byte,
-        "short" => PrimitiveType::Short,
-        "int" => PrimitiveType::Int,
-        "long" => PrimitiveType::Long,
-        "char" => PrimitiveType::Char,
-        "float" => PrimitiveType::Float,
-        "double" => PrimitiveType::Double,
-        _ => return None,
-    })
-}
-
 /// Display name for a resolved type, as it would read in a signature
-/// (`ArrayList<String>`, an in-project `Widget`, `String[]`). External FQNs are
-/// shown by their simple name plus any use-site type arguments. Used to render
-/// an inferred `var` type on hover.
+/// (`ArrayList<String>`, `Widget`, `String[]`). Used to render an inferred
+/// `var` type on hover.
 pub(crate) fn type_display(ty: &ResolvedType) -> String {
     match ty {
-        ResolvedType::InProject(td) => td.name.to_string(),
+        ResolvedType::InProject { decl, .. } => decl.name.to_string(),
         ResolvedType::External { fqn, args } => {
             let simple = fqn.rsplit('.').next().unwrap_or(fqn);
             if args.is_empty() {
                 simple.to_string()
             } else {
-                format!("{simple}<{}>", args.join(", "))
+                let rendered: Vec<String> = args.iter().map(render_type_ref).collect();
+                format!("{simple}<{}>", rendered.join(", "))
             }
         }
-        ResolvedType::Primitive(primitive) => primitive_name(*primitive).to_string(),
+        ResolvedType::Primitive(primitive) => primitive.name().to_string(),
         ResolvedType::Void => "void".to_string(),
         ResolvedType::Null => "null".to_string(),
-        ResolvedType::Array { display } => display.clone(),
+        ResolvedType::Array { element } => format!("{}[]", render_type_ref(element)),
     }
 }
 
-/// If the binding named `name` visible at `byte` is a `var` local, the display
-/// string of its *inferred* type (from the declarator's initializer); `None`
-/// for an explicitly-typed binding — render its declaration normally — or when
-/// inference fails. Mirrors the `var` inference in [`resolve_name_depth`], but
-/// stays silent unless the declared type is literally `var` so it never
-/// overrides an explicit type. Used to render hover on a `var` local.
+/// The display string of a `var` local's *inferred* type (from its
+/// initializer); `None` for an explicitly-typed binding or failed
+/// inference. Mirrors [`resolve_name_depth`]'s `var` inference; used to
+/// render hover on a `var` local.
 pub(crate) fn inferred_var_type_display(name: &str, byte: usize, ctx: &Ctx) -> Option<String> {
     let binding = lookup_binding(
         ctx.doc.tree,
@@ -698,15 +1285,62 @@ pub(crate) fn inferred_var_type_display(name: &str, byte: usize, ctx: &Ctx) -> O
         return None;
     }
     let value = binding.decl_node.child_by_field_name("value")?;
-    let resolved = resolve_receiver_depth(value, ctx, 0, MethodLookup::First)?;
-    Some(type_display(&resolved.ty))
+    // A complete initializer needs the same overload selection used by
+    // semantic checks; the historical first-name hover lookup drops generic
+    // method inference (`var xs = List.of(value)` became `List<?>`). Keep the
+    // permissive lookup only as a fallback for half-typed code.
+    let resolved = resolve_receiver_depth(value, ctx, 0, MethodLookup::Unique)
+        .or_else(|| resolve_receiver_depth(value, ctx, 0, MethodLookup::First))?;
+    let display = match &resolved.ty {
+        ResolvedType::InProject { decl, args } if !args.is_empty() => format!(
+            "{}<{}>",
+            decl.name,
+            args.iter()
+                .map(|arg| render_type_ref_in(arg, ctx))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ResolvedType::External { fqn, args } if !args.is_empty() => format!(
+            "{}<{}>",
+            fqn.rsplit('.').next().unwrap_or(fqn),
+            args.iter()
+                .map(|arg| render_type_ref_in(arg, ctx))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => type_display(&resolved.ty),
+    };
+    Some(display)
 }
 
-/// If the binding named `name` visible at `byte` is a Java 21 pattern binding
-/// (`case Type name`, a record-deconstruction component, or `instanceof Type
-/// name`), the display string of its declared type; `None` for any other
-/// binding (rendered from its declaration node instead). A type that doesn't
-/// resolve to a class (a primitive like `int`) falls back to its written text.
+pub(crate) fn inferred_lambda_parameter_type_display(
+    name: &str,
+    byte: usize,
+    ctx: &Ctx,
+) -> Option<String> {
+    let binding = lookup_binding(
+        ctx.doc.tree,
+        ctx.doc.source,
+        byte,
+        name,
+        ctx.table,
+        ctx.current,
+    )?;
+    if !matches!(binding.kind, BindingKind::Param)
+        || binding
+            .type_node
+            .is_some_and(|node| node_text(node, binding.source) != "var")
+    {
+        return None;
+    }
+    let inferred = crate::call::inferred_lambda_parameter_type(binding.decl_node, ctx)?;
+    Some(render_type_ref_in(&inferred, ctx))
+}
+
+/// If the binding is a Java 21 pattern binding (`case Type name`, a
+/// record-deconstruction component, or `instanceof Type name`), the display
+/// string of its declared type; `None` for any other binding. A type that
+/// doesn't resolve to a class falls back to its written text.
 pub(crate) fn pattern_binding_type_display(name: &str, byte: usize, ctx: &Ctx) -> Option<String> {
     let binding = lookup_binding(
         ctx.doc.tree,
@@ -729,11 +1363,10 @@ pub(crate) fn pattern_binding_type_display(name: &str, byte: usize, ctx: &Ctx) -
     Some(display)
 }
 
-/// Resolve a `new Type(...)` expression's type reference to the receiver type
-/// it constructs — in-project or external, same as any other declared-type
-/// resolution. Shared by ordinary receiver resolution (`new Foo().x`),
-/// hover on the type name inside `new Foo(...)`, and constructor signature
-/// help, so all three agree on what `new Foo` refers to.
+/// Resolve a `new Type(...)` expression to the receiver type it constructs,
+/// same as any other declared-type resolution. Shared by receiver
+/// resolution, hover, and constructor signature help, so all three agree on
+/// what `new Foo` refers to.
 pub(crate) fn resolve_object_creation_type<'t>(
     call: Node<'t>,
     ctx: &Ctx<'_, 't>,
@@ -742,97 +1375,119 @@ pub(crate) fn resolve_object_creation_type<'t>(
     resolve_type_node(ty, ctx.doc.source, ctx)
 }
 
-/// Resolve a declared-type node to a receiver type: in-project if the open docs
-/// declare it, else an external FQN (fully-qualified use, or a simple name
-/// resolved through imports + the symbol source).
+/// Resolve a declared-type node to a receiver type: in-project if the given
+/// documents declare it (JLS 6.4/7.5 qualified resolution — see
+/// [`crate::model::TypeTable::resolve_type_name_node`]), else an external
+/// FQN via imports/symbol source.
 pub(crate) fn resolve_type_node<'t>(
     type_node: Node<'t>,
     source: &'t str,
     ctx: &Ctx<'_, 't>,
 ) -> Option<ResolvedType<'t>> {
-    let display = node_text(type_node, source).trim();
-    if display == "void" {
-        return Some(ResolvedType::Void);
-    }
-    if let Some(primitive) = primitive_type(display) {
-        return Some(ResolvedType::Primitive(primitive));
-    }
-    // An array's members are `length`/`clone()`/Object's — never the
-    // element type's (an earlier behavior offered `String`'s members on a
-    // `String[]` receiver).
-    if type_node.kind() == "array_type" {
-        return Some(ResolvedType::Array {
-            display: node_text(type_node, source).to_string(),
-        });
-    }
-    let args = extract_type_args(type_node, source);
-    if let Some(fqn) = dotted_type_name(type_node, source) {
-        let simple = fqn.rsplit('.').next().unwrap_or(&fqn);
-        if let Some(td) = ctx.table.get(simple) {
-            return Some(ResolvedType::InProject(td.clone()));
-        }
-        return ctx
-            .symbols
-            .class(&fqn)
-            .is_some()
-            .then_some(ResolvedType::External { fqn, args });
-    }
-    let simple = base_type_name(type_node, source)?;
-    if let Some(td) = ctx.table.get(simple) {
-        return Some(ResolvedType::InProject(td.clone()));
-    }
-    let fqn = resolve_simple_to_fqn(simple, ctx)?;
-    Some(ResolvedType::External { fqn, args })
+    let vars = vars_in_scope(type_node, ctx);
+    let resolve_named = |name: &str, dotted: bool| named_resolver(name, dotted, type_node, ctx);
+    let ty = crate::typeref::lower_type_node(type_node, source, &vars, &resolve_named);
+    ResolvedType::from_type_ref(&ty, ctx)
 }
 
-/// Type arguments of a declared type (`ArrayList<String>` → `["String"]`),
-/// erased to simple names; wildcards render as `?`. Empty for raw/non-generic.
-fn extract_type_args(type_node: Node, source: &str) -> Vec<String> {
-    if type_node.kind() != "generic_type" {
-        return Vec::new();
-    }
-    let Some(targs) = named_children(type_node)
-        .into_iter()
-        .find(|c| c.kind() == "type_arguments")
-    else {
-        return Vec::new();
+/// Map a declared type node's base name to a binary name:
+/// [`crate::model::TypeTable::resolve_type_name_at`] first (lexical scope,
+/// explicit import, package, qualified text, on-demand imports — the one
+/// JLS-ordered rule), then the external/import-based fallback.
+///
+/// Keyed by `name`, not `type_node`'s own base, so the same resolver also
+/// serves each type argument nested inside `type_node`.
+fn named_resolver(name: &str, dotted: bool, type_node: Node, ctx: &Ctx<'_, '_>) -> Option<String> {
+    let simple = if dotted {
+        name.rsplit('.').next().unwrap_or(name)
+    } else {
+        name
     };
-    named_children(targs)
-        .into_iter()
-        .filter(|a| a.kind() != "annotation" && a.kind() != "marker_annotation")
-        .map(|arg| match arg.kind() {
-            "wildcard" => "?".to_string(),
-            _ => base_type_name(arg, source)
-                .map(str::to_string)
-                .unwrap_or_else(|| "?".to_string()),
-        })
-        .collect()
-}
-
-/// A supertype simple name → in-project decl or external FQN (type args of a
-/// parameterized super are not tracked yet — members render erased).
-fn resolve_super<'t>(simple: &str, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
-    if let Some(td) = ctx.table.get(simple) {
-        return Some(ResolvedType::InProject(td.clone()));
+    if let Some(td) = ctx.table.resolve_type_name_at(
+        type_node,
+        simple,
+        dotted.then(|| name.to_string()),
+        ctx.current,
+        ctx.imports,
+    ) {
+        return td.binary_name.clone();
     }
-    resolve_simple_to_fqn(simple, ctx).map(|fqn| ResolvedType::External {
-        fqn,
-        args: Vec::new(),
-    })
+    if dotted {
+        return ctx.symbols.class(name).is_some().then(|| name.to_string());
+    }
+    resolve_simple_to_fqn(simple, ctx)
 }
 
-/// First import candidate FQN that the symbol source can actually resolve.
-/// An import path (`java.util.Map.Entry`) to the binary FQN
-/// (`java.util.Map$Entry`) — replace trailing dots with `$` until the symbol
-/// source recognizes the name. Shared by import completion and
-/// hover-on-import.
-pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
+/// Type variables in scope at `type_node`, innermost last. Owner strings
+/// must match the ones srcclass.rs builds, or variable identity breaks.
+fn vars_in_scope(type_node: Node, ctx: &Ctx<'_, '_>) -> Vec<(String, TypeVariableId)> {
+    let mut levels: Vec<Node> = Vec::new();
+    let mut anc = type_node.parent();
+    while let Some(a) = anc {
+        if TypeKind::from_kind(a.kind()).is_some()
+            || matches!(a.kind(), "method_declaration" | "constructor_declaration")
+        {
+            levels.push(a);
+        }
+        anc = a.parent();
+    }
+    let mut vars: Vec<(String, TypeVariableId)> = Vec::new();
+    for level in levels.into_iter().rev() {
+        let resolve_named = |name: &str, dotted: bool| named_resolver(name, dotted, type_node, ctx);
+        if TypeKind::from_kind(level.kind()).is_some() {
+            let Some(td) = ctx.table.by_node(ctx.current, level.id()) else {
+                continue;
+            };
+            let Some(binary) = &td.binary_name else {
+                continue;
+            };
+            let (names, _) = crate::typeref::lower_type_parameters(
+                level.child_by_field_name("type_parameters"),
+                ctx.doc.source,
+                binary,
+                &[],
+                &resolve_named,
+            );
+            vars.extend(names);
+        } else {
+            let Some(owner_td) = enclosing_typedecl(level, ctx.table, ctx.current) else {
+                continue;
+            };
+            let Some(binary) = &owner_td.binary_name else {
+                continue;
+            };
+            let Some(name_node) = level.child_by_field_name("name") else {
+                continue;
+            };
+            let name = node_text(name_node, ctx.doc.source);
+            let owner = match level.child_by_field_name("parameters") {
+                Some(p) => format!("{binary}#{name}{}", node_text(p, ctx.doc.source)),
+                None => format!("{binary}#{name}()"),
+            };
+            let (names, _) = crate::typeref::lower_type_parameters(
+                level.child_by_field_name("type_parameters"),
+                ctx.doc.source,
+                &owner,
+                &[],
+                &resolve_named,
+            );
+            vars.extend(names);
+        }
+    }
+    vars
+}
+
+/// Replace trailing dots with `$` until `exists` accepts the candidate, or
+/// attempts run out. Shared core of [`import_path_to_fqn`] and
+/// [`crate::model::TypeTable::resolve_type_name_node`]'s explicit-import
+/// step.
+pub(crate) fn import_path_to_binary(path: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
     if path.is_empty() {
         return None;
     }
     let mut candidate = path.to_string();
     for _ in 0..8 {
-        if ctx.symbols.class(&candidate).is_some() {
+        if exists(&candidate) {
             return Some(candidate);
         }
         let dot = candidate.rfind('.')?;
@@ -841,9 +1496,16 @@ pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
     None
 }
 
-/// `pub(crate)`: also used by hover's inherited-Javadoc walk, which
-/// resolves a supertype simple name to ask the symbol source for the
-/// super's member doc.
+/// An import path (`java.util.Map.Entry`) to the binary FQN the symbol
+/// source recognizes (`java.util.Map$Entry`), by replacing trailing dots
+/// with `$`. Shared by import completion and hover-on-import.
+pub(crate) fn import_path_to_fqn(path: &str, ctx: &Ctx) -> Option<String> {
+    import_path_to_binary(path, |b| ctx.symbols.class(b).is_some())
+}
+
+/// Resolve a simple type name to an external FQN — the first import/
+/// package/wildcard/`java.lang` candidate the classpath symbol source
+/// recognizes.
 pub(crate) fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
     ctx.imports
         .candidates(simple)
@@ -851,13 +1513,38 @@ pub(crate) fn resolve_simple_to_fqn(simple: &str, ctx: &Ctx) -> Option<String> {
         .find(|fqn| ctx.symbols.class(fqn).is_some())
 }
 
-/// The full dotted name of a fully-qualified type node (`java.util.List`), or
-/// `None` for a simple (unqualified) type.
-///
-/// `pub(crate)`: also used by `implementation.rs`'s per-supertype
-/// confirm, which must match a fully-qualified `extends`/`implements` entry
-/// against the target's real FQN rather than through the scanned file's
-/// imports (a qualified reference bypasses imports entirely).
+/// A bare simple name -> the open-document declaration it names, used when
+/// no real type-reference node drives full lexical resolution. Prefers the
+/// current document, else the candidate this document's imports/package/
+/// wildcards resolve `simple` to; not a substitute for
+/// [`crate::model::TypeTable::resolve_type_name_node`], which also honors
+/// lexical scoping.
+pub(crate) fn resolve_simple_in_project<'t>(
+    simple: &str,
+    ctx: &Ctx<'_, 't>,
+) -> Option<TypeDecl<'t>> {
+    if let Some(td) = ctx
+        .table
+        .candidates(simple)
+        .find(|td| td.doc == ctx.current)
+    {
+        return Some(td.clone());
+    }
+    let candidate_fqns = ctx.imports.candidates(simple);
+    ctx.table
+        .candidates(simple)
+        .find(|td| {
+            td.binary_name
+                .as_deref()
+                .is_some_and(|b| candidate_fqns.iter().any(|c| c == b))
+        })
+        .cloned()
+}
+
+/// The full dotted name of a fully-qualified type node (`java.util.List`),
+/// or `None` for a simple type. `pub(crate)`: used by `implementation.rs`
+/// to match a qualified `extends`/`implements` entry against the target's
+/// real FQN, bypassing imports.
 pub(crate) fn dotted_type_name(type_node: Node, source: &str) -> Option<String> {
     match type_node.kind() {
         "scoped_type_identifier" => {
@@ -886,12 +1573,11 @@ fn field_type_node<'t>(declarator: Node<'t>) -> Option<Node<'t>> {
     declarator.parent()?.child_by_field_name("type")
 }
 
-/// Resolve a dotted path (`a.b.c`): walk it segment by segment from
-/// a resolvable head (binding → in-project type → imported/`java.lang`
-/// external type), stepping through fields, nested types, and enum constants
-/// in either world; failing that, try the longest prefix of the path as a
-/// fully-qualified external type (`java.util.List`) and walk any remaining
-/// segments from there.
+/// Resolve a dotted path (`a.b.c`) segment by segment from a resolvable
+/// head (binding → in-project type → imported/`java.lang` type), stepping
+/// through fields, nested types, and enum constants. Failing that, try the
+/// longest prefix as a fully-qualified external type and walk any
+/// remaining segments from there.
 fn resolve_scoped_path<'t>(
     node: Node<'t>,
     ctx: &Ctx<'_, 't>,
@@ -965,12 +1651,15 @@ fn resolve_member_segment<'t>(
         HierMember::InProject(m)
             if m.name == name && matches!(m.kind, MemberKind::NestedType(_)) =>
         {
-            TypeDecl::from_node(m.node, m.source, m.doc)
+            ctx.table.by_node(m.doc, m.node.id()).cloned()
         }
         _ => None,
     }) {
         return Some(Resolved {
-            ty: ResolvedType::InProject(td),
+            ty: ResolvedType::InProject {
+                decl: td,
+                args: Vec::new(),
+            },
             static_only: true,
         });
     }
@@ -980,10 +1669,8 @@ fn resolve_member_segment<'t>(
     member_result_type(&member, current, ctx, method_lookup)
 }
 
-/// The type a member access *evaluates to* — a method call's return type
-/// or a field/enum-constant's declared type — which becomes the next
-/// receiver in a chain. `None` for primitives/void/arrays-of-unknown and
-/// whatever else can't be re-resolved (the chain just stops, never errors).
+/// Resolve a member's result as the next receiver in a chain.
+/// In-project declarations use their own document imports; unresolved results stop quietly.
 fn member_result_type<'t>(
     member: &HierMember<'t>,
     recv: &Resolved<'t>,
@@ -992,33 +1679,64 @@ fn member_result_type<'t>(
 ) -> Option<Resolved<'t>> {
     match member {
         HierMember::InProject(m) => {
-            let ty_node = match m.kind {
-                MemberKind::Method => m.node.child_by_field_name("type")?,
-                MemberKind::Field => field_type_node(m.node)?,
+            let (ty_node, kind) = match m.kind {
+                MemberKind::Method => (
+                    m.node.child_by_field_name("type")?,
+                    ExternalMemberKind::Method,
+                ),
+                MemberKind::Field => (field_type_node(m.node)?, ExternalMemberKind::Field),
                 // An enum constant's type is its declaring enum.
                 MemberKind::EnumConstant => {
-                    let td = TypeDecl::from_node(enclosing_type_node(m.node)?, m.source, m.doc)?;
-                    return Some(instance(ResolvedType::InProject(td)));
+                    let td = ctx
+                        .table
+                        .by_node(m.doc, enclosing_type_node(m.node)?.id())?
+                        .clone();
+                    return Some(instance(ResolvedType::InProject {
+                        decl: td,
+                        args: Vec::new(),
+                    }));
                 }
                 MemberKind::NestedType(_) => return None, // handled as a segment, not a value
             };
-            resolve_type_node(ty_node, m.source, ctx).map(instance)
+            // A generic member's declared type (`T item`, `T first()`) only
+            // means something through the receiver's type arguments; the
+            // source node alone names a variable no chain can continue from.
+            if let Some(declaring) = enclosing_type_node(m.node)
+                .and_then(|type_node| ctx.table.by_node(m.doc, type_node.id()))
+            {
+                if let Some(ty) = crate::call::member_type_through(
+                    &recv.ty.type_ref(),
+                    &declaring.type_id,
+                    m.name,
+                    kind,
+                    ctx,
+                ) {
+                    return receiver_type_ref(&ty, ctx, 0).map(instance);
+                }
+            }
+            let dctx = ctx.for_document(m.doc)?;
+            resolve_type_node(ty_node, m.source, &dctx).map(instance)
         }
         HierMember::External(m) => external_result_type(m, recv, ctx, method_lookup).map(instance),
     }
 }
 
 /// An external member's result type. Prefers the generic `ret_display`
-/// template substituted with the receiver's use-site type arguments (so
-/// `List<String>.get(int)` chains as `String`, `stream()` as
-/// `Stream<String>`). First-name receiver lookup may fall back to the erased
-/// `ret_fqn`; unique semantic lookup must not infer a value type from erasure.
+/// template substituted with the receiver's use-site type arguments
+/// (`List<String>.get(int)` chains as `String`); first-name lookup may fall
+/// back to the erased `ret_fqn`, but unique lookup must not infer a value
+/// type from erasure.
 fn external_result_type<'t>(
     m: &ExternalMember,
     recv: &Resolved<'_>,
     ctx: &Ctx<'_, 't>,
     method_lookup: MethodLookup,
 ) -> Option<ResolvedType<'t>> {
+    if let Some(meta) = &m.metadata {
+        if let Some(resolved) = receiver_type_ref(&meta.result, ctx, 0) {
+            return Some(resolved);
+        }
+    }
     if let Some(display) = &m.ret_display {
         let (args, type_params) = match &recv.ty {
             ResolvedType::External { fqn, args } => {
@@ -1027,7 +1745,11 @@ fn external_result_type<'t>(
                     .class(fqn)
                     .map(|c| c.type_params)
                     .unwrap_or_default();
-                (args.clone(), params)
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|arg| render_type_ref_in(arg, ctx))
+                    .collect();
+                (args, params)
             }
             _ => (Vec::new(), Vec::new()),
         };
@@ -1037,13 +1759,12 @@ fn external_result_type<'t>(
             return None;
         }
         let substituted = substitute_template(display, &args, &type_params);
-        // A type variable the receiver did not pin down is not a concrete
-        // value type. Semantic resolution must stay unknown so diagnostics do
-        // not infer from its erased bound; historical receiver resolution may
-        // still use the declared result to keep completion/hover chains alive.
-        if (substituted.contains('{') || type_args_unknown(std::slice::from_ref(&substituted)))
-            && matches!(method_lookup, MethodLookup::Unique)
-        {
+        // A type variable the receiver didn't pin down isn't a concrete
+        // value type — semantic resolution stays unknown rather than
+        // inferring from its erased bound. Historical receiver resolution
+        // may still use the declared result to keep completion/hover chains
+        // alive.
+        if display_looks_unresolved(&substituted) && matches!(method_lookup, MethodLookup::Unique) {
             return None;
         }
         if let Some(resolved) = resolve_display_type(&substituted, m.ret_fqn.as_deref(), ctx) {
@@ -1059,6 +1780,48 @@ fn external_result_type<'t>(
         args: Vec::new(),
     })
 }
+
+fn receiver_type_ref<'t>(
+    ty: &TypeRef,
+    ctx: &Ctx<'_, 't>,
+    depth: usize,
+) -> Option<ResolvedType<'t>> {
+    if depth > MAX_RESOLVE_DEPTH {
+        return None;
+    }
+    match ty {
+        TypeRef::Variable(variable) => {
+            let bounds = variable_bounds(variable, ctx)?;
+            let bound = bounds
+                .into_iter()
+                .find(|bound| !bound.contains_unknown())
+                .unwrap_or_else(|| TypeRef::named("java.lang.Object"));
+            receiver_type_ref(&bound, ctx, depth + 1)
+        }
+        TypeRef::Wildcard {
+            upper: Some(upper), ..
+        } => receiver_type_ref(upper, ctx, depth + 1),
+        TypeRef::Wildcard { .. } => {
+            receiver_type_ref(&TypeRef::named("java.lang.Object"), ctx, depth + 1)
+        }
+        TypeRef::Unknown => None,
+        other => ResolvedType::from_type_ref(other, ctx),
+    }
+}
+
+/// Whether a rendered display string still looks unresolved — a leftover
+/// `{i}` placeholder, or a bare single uppercase letter (`T`/`E`/`K`) rather
+/// than a concrete type. Used only by [`external_result_type`]'s display
+/// chain; semantic proofs use [`jvl_types::TypeRef::contains_unknown`]
+/// instead.
+fn display_looks_unresolved(s: &str) -> bool {
+    s.contains('?')
+        || s.contains('{')
+        || s.contains('}')
+        || s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+            .any(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_uppercase())
+}
+
 fn template_has_missing_arg(template: &str, arg_count: usize) -> bool {
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -1077,29 +1840,51 @@ fn template_has_missing_arg(template: &str, arg_count: usize) -> bool {
     false
 }
 
-/// Resolve a rendered display type (`Stream<String>`, `String`,
-/// `MyType`) back to a receiver type: the in-project table first, then the
-/// erased FQN when its simple name agrees with the display's base (the
-/// common generic-class case), then the file's imports/`java.lang` (the
-/// type-variable case, where erasure and display genuinely differ).
+/// A display-string type argument -> best-effort `TypeRef` for this
+/// display-oriented chain only: `?` as a wildcard, a primitive by name, an
+/// array suffix peeled recursively, otherwise an opaque `Named` wrapping the
+/// raw text. That wrapping is never a real binary name and must never be
+/// looked up via `class_facts` or fed into the subtype engine.
+fn opaque_type_ref(s: &str) -> TypeRef {
+    let s = s.trim();
+    if s == "?" {
+        return TypeRef::Wildcard {
+            upper: None,
+            lower: None,
+        };
+    }
+    if let Some(element) = s.strip_suffix("[]") {
+        return TypeRef::Array(Box::new(opaque_type_ref(element)));
+    }
+    if let Some(p) = PrimitiveType::from_name(s) {
+        return TypeRef::Primitive(p);
+    }
+    TypeRef::named(s)
+}
+
+/// Resolve a rendered display type (`Stream<String>`, `String`, `MyType`)
+/// back to a receiver type: in-project table first, then the erased FQN
+/// when its simple name matches the display's base, then the file's
+/// imports/`java.lang` for the type-variable case.
 fn resolve_display_type<'t>(
     display: &str,
     erased_fqn: Option<&str>,
     ctx: &Ctx<'_, 't>,
 ) -> Option<ResolvedType<'t>> {
     let display = display.trim();
-    if display.ends_with("[]") {
+    if let Some(element) = display.strip_suffix("[]") {
         return Some(ResolvedType::Array {
-            display: display.to_string(),
+            element: opaque_type_ref(element.trim_end()),
         });
     }
     if display == "void" {
         return Some(ResolvedType::Void);
     }
-    if let Some(primitive) = primitive_type(display) {
+    if let Some(primitive) = PrimitiveType::from_name(display) {
         return Some(ResolvedType::Primitive(primitive));
     }
-    let (base, args) = parse_display_type(display)?;
+    let (base, raw_args) = parse_display_type(display)?;
+    let args: Vec<TypeRef> = raw_args.iter().map(|a| opaque_type_ref(a)).collect();
     if base.contains('.') && ctx.symbols.class(base).is_some() {
         return Some(ResolvedType::External {
             fqn: base.to_string(),
@@ -1107,8 +1892,8 @@ fn resolve_display_type<'t>(
         });
     }
     let simple = base.rsplit('.').next().unwrap_or(base);
-    if let Some(td) = ctx.table.get(simple) {
-        return Some(ResolvedType::InProject(td.clone()));
+    if let Some(td) = resolve_simple_in_project(simple, ctx) {
+        return Some(ResolvedType::InProject { decl: td, args });
     }
     if let Some(fqn) = erased_fqn {
         let erased_simple = fqn.rsplit(['.', '$']).next().unwrap_or(fqn);
@@ -1165,6 +1950,7 @@ fn array_members(display: &str) -> [ExternalMember; 2] {
             is_static: false,
             ret_fqn: None,
             ret_display: Some("int".to_string()),
+            metadata: None,
         },
         ExternalMember {
             name: "clone".to_string(),
@@ -1174,41 +1960,90 @@ fn array_members(display: &str) -> [ExternalMember; 2] {
             is_static: false,
             ret_fqn: None,
             ret_display: Some(display.to_string()),
+            metadata: None,
         },
     ]
 }
 
 /// The element type of an array receiver (`arr[i].`), resolved from the
-/// array's declared display text. Multi-dimensional arrays peel one level.
-fn array_element_type<'t>(display: &str, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
-    let element = display.trim().strip_suffix("[]")?.trim_end();
-    resolve_display_type(element, None, ctx).map(instance)
+/// array's structured element type. Multi-dimensional arrays peel one level
+/// (the element of `String[][]` is itself `Array(String)`).
+fn array_element_type<'t>(element: &TypeRef, ctx: &Ctx<'_, 't>) -> Option<Resolved<'t>> {
+    ResolvedType::from_type_ref(element, ctx).map(instance)
 }
 
-/// The element type produced by iterating `ty` — an array's element
-/// (`String[]` → `String`) or a generic collection's first type argument
-/// (`List<Foo>`/`Set<Foo>`/`Iterable<Foo>` → `Foo`). Returns `None` (never the
-/// iterable's own type) when it can't be determined — a raw collection, an
-/// unparameterized project type, an unresolvable argument — so an enhanced-for
-/// `var` with an unknown element resolves to nothing rather than to the
-/// collection itself (which would mis-resolve every access on the loop var).
+/// The element type produced by iterating `ty`: an array's element, or a
+/// generic collection's first type argument (`List<Foo>`/`Set<Foo>`/
+/// `Iterable<Foo>` → `Foo`). Returns `None`, never the iterable's own type,
+/// when it can't be determined — so an unknown-element enhanced-for `var`
+/// resolves to nothing rather than mis-resolving every loop-var access.
 fn iterable_element_type<'t>(ty: &ResolvedType<'t>, ctx: &Ctx<'_, 't>) -> Option<ResolvedType<'t>> {
     match ty {
-        ResolvedType::Array { display } => array_element_type(display, ctx).map(|r| r.ty),
+        ResolvedType::Array { element } => array_element_type(element, ctx).map(|r| r.ty),
         ResolvedType::External { args, .. } => {
-            let first = args.first()?.trim();
-            if first.is_empty() || first.contains('?') {
+            let first = args.first()?;
+            if matches!(first, TypeRef::Wildcard { .. } | TypeRef::Unknown) {
                 return None;
             }
-            resolve_display_type(first, None, ctx)
+            // Try the structured `TypeRef` first; fall back to the
+            // display-string pipeline for a use-site argument that only
+            // ever existed as rendered text (see `opaque_type_ref`).
+            ResolvedType::from_type_ref(first, ctx)
+                .or_else(|| resolve_display_type(&render_type_ref(first), None, ctx))
         }
-        // A project collection type's element isn't tracked (no generics from
-        // source); non-reference values are not iterable here.
-        ResolvedType::InProject(_)
-        | ResolvedType::Primitive(_)
-        | ResolvedType::Void
-        | ResolvedType::Null => None,
+        ResolvedType::InProject { .. } => {
+            let elem = iterable_argument(&ty.type_ref(), ctx, 0, &mut HashSet::new())?;
+            if !matches!(elem, TypeRef::Named { .. } | TypeRef::Array(_)) || elem.contains_unknown()
+            {
+                return None;
+            }
+            ResolvedType::from_type_ref(&elem, ctx)
+        }
+        ResolvedType::Primitive(_) | ResolvedType::Void | ResolvedType::Null => None,
     }
+}
+
+/// The `T` in the `java.lang.Iterable<T>` (or `java.util.Collection<T>`)
+/// supertype reachable from `ty`, with class type variables substituted
+/// through each `extends`/`implements` hop. `None` when the hierarchy is
+/// incomplete, raw, or never reaches `Iterable`.
+fn iterable_argument(
+    ty: &TypeRef,
+    ctx: &Ctx<'_, '_>,
+    depth: usize,
+    seen: &mut HashSet<TypeRef>,
+) -> Option<TypeRef> {
+    let TypeRef::Named { id, args } = ty else {
+        return None;
+    };
+    if depth > MAX_SUBTYPE_DEPTH || !seen.insert(ty.clone()) {
+        return None;
+    }
+    if matches!(
+        id.as_named(),
+        Some("java.lang.Iterable") | Some("java.util.Collection")
+    ) {
+        return args.first().cloned();
+    }
+    let facts = class_facts(id, ctx)?;
+    if !facts.meta.hierarchy_complete {
+        return None;
+    }
+    if args.is_empty() && !facts.meta.type_parameters.is_empty() {
+        return None; // raw use: element type is erased
+    }
+    let env: Vec<(TypeVariableId, TypeRef)> = facts
+        .meta
+        .type_parameters
+        .iter()
+        .map(|p| p.id.clone())
+        .zip(args.iter().cloned())
+        .collect();
+    facts
+        .meta
+        .supertypes
+        .iter()
+        .find_map(|sup| iterable_argument(&sup.substitute(&env), ctx, depth + 1, seen))
 }
 
 /// A member of a resolved type — declared in an open document or external.
@@ -1266,14 +2101,12 @@ pub(crate) fn find_member_hier<'t>(
         .find(|m| m.name() == name)
 }
 
-/// Which Java member namespace a reference occupies. Java resolves fields
-/// and methods in *separate* namespaces (JLS §6.5): `recv.foo()` can only
-/// mean a method; `recv.foo` / a bare `foo` in expression position can only
-/// mean a field (or enum constant). [`find_member_hier`] is namespace-blind
-/// (first name match wins), which is fine for hover/completion's
-/// display-oriented lookups; reference confirmation must not conflate a
-/// field with a same-named method, so it goes through
-/// [`find_member_hier_of_kind`] instead.
+/// Which Java member namespace a reference occupies (JLS §6.5): fields and
+/// methods live in separate namespaces, so `recv.foo()` can only mean a
+/// method and `recv.foo` can only mean a field. [`find_member_hier`] is
+/// namespace-blind and fine for display-oriented lookups; reference
+/// confirmation must use [`find_member_hier_of_kind`] instead to avoid
+/// conflating a field with a same-named method.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MemberNamespace {
     Method,
@@ -1298,10 +2131,8 @@ impl MemberNamespace {
 }
 
 /// The member named `name` in the given [`MemberNamespace`], on a resolved
-/// type or any supertype. A kind-aware variant of [`find_member_hier`] — a
-/// deliberately separate function rather than a behavior change to that one,
-/// which hover/completion consume and whose name-only semantics must not
-/// shift underneath them.
+/// type or any supertype. A kind-aware variant of [`find_member_hier`], kept
+/// separate since hover/completion depend on that one's name-only semantics.
 pub(crate) fn find_member_hier_of_kind<'t>(
     resolved: &Resolved<'t>,
     ctx: &Ctx<'_, 't>,
@@ -1324,7 +2155,7 @@ fn walk_members<'t>(
         return;
     }
     match ty {
-        ResolvedType::InProject(td) => {
+        ResolvedType::InProject { decl: td, .. } => {
             if !acc.visited_node.insert(td.node.id()) {
                 return;
             }
@@ -1338,10 +2169,10 @@ fn walk_members<'t>(
                     acc.out.push(HierMember::InProject(m));
                 }
             }
-            // Lombok-generated accessors join the class's declared
-            // members. Synthesized, not declared — no AST node to point at —
-            // so they travel as External members; their result types resolve
-            // through `ret_display`/`ret_fqn` like any bytecode member's.
+            // Lombok-generated accessors join the class's declared members.
+            // They're synthesized (no AST node), so they travel as External
+            // members and resolve through `ret_display`/`ret_fqn` like a
+            // bytecode member.
             if crate::lombok::file_uses_lombok(td.node, td.source) {
                 for sm in crate::lombok::synthesize(td.node, td.source) {
                     if static_only && !sm.is_static {
@@ -1353,26 +2184,11 @@ fn walk_members<'t>(
                     }
                 }
             }
-            for sup in &td.supers {
-                if let Some(sd) = ctx.table.get(sup) {
-                    walk_members(
-                        &ResolvedType::InProject(sd.clone()),
-                        ctx,
-                        static_only,
-                        acc,
-                        depth + 1,
-                    );
-                } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
-                    walk_members(
-                        &ResolvedType::External {
-                            fqn,
-                            args: Vec::new(),
-                        },
-                        ctx,
-                        static_only,
-                        acc,
-                        depth + 1,
-                    );
+            if let Some(dctx) = ctx.for_document(td.doc) {
+                for sup_node in &td.super_nodes {
+                    if let Some(resolved) = resolve_type_node(*sup_node, td.source, &dctx) {
+                        walk_members(&resolved, ctx, static_only, acc, depth + 1);
+                    }
                 }
             }
             // An in-project enum implicitly extends `java.lang.Enum` — the
@@ -1392,8 +2208,9 @@ fn walk_members<'t>(
             }
         }
         // Arrays expose exactly `length`, `clone()`, and Object's members.
-        ResolvedType::Array { display } => {
-            for m in array_members(display) {
+        ResolvedType::Array { element } => {
+            let display = format!("{}[]", render_type_ref(element));
+            for m in array_members(&display) {
                 if static_only {
                     continue; // arrays have no static members
                 }
@@ -1419,56 +2236,84 @@ fn walk_members<'t>(
             let Some(class) = ctx.symbols.class(fqn) else {
                 return;
             };
-            for m in class.members {
-                // Constructors are never ordinary members — same as an
-                // in-project type's constructors, which `own_members()`
-                // never lists either (see `TypeDecl::constructors`). A
-                // dedicated lookup (hover on `new Foo(...)`, constructor
-                // signature help) fetches them straight from `SymbolSource`
-                // instead.
-                if m.kind == ExternalMemberKind::Constructor {
+            let arg_strings: Vec<String> = args
+                .iter()
+                .map(|arg| render_type_ref_in(arg, ctx))
+                .collect();
+            let env: Vec<(TypeVariableId, TypeRef)> = class
+                .metadata
+                .as_ref()
+                .filter(|meta| meta.type_parameters.len() == args.len())
+                .map(|meta| {
+                    meta.type_parameters
+                        .iter()
+                        .map(|param| param.id.clone())
+                        .zip(args.iter().cloned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let structured_supers = class.metadata.as_ref().and_then(|meta| {
+                meta.hierarchy_complete.then(|| {
+                    meta.supertypes
+                        .iter()
+                        .map(|supertype| supertype.substitute(&env))
+                        .collect::<Vec<_>>()
+                })
+            });
+            for mut member in class.members {
+                if member.kind == ExternalMemberKind::Constructor
+                    || (static_only && !member.is_static)
+                {
                     continue;
                 }
-                if static_only && !m.is_static {
+                let erased_signature = member.signature.clone();
+                if !acc.seen.insert(erased_signature) {
                     continue;
                 }
-                // Dedup on the erased signature (stable across declarations);
-                // display the generic signature substituted with the use-site
-                // type arguments (e.g. `add({0})` + `[String]` → `add(String)`).
-                if acc.seen.insert(m.signature.clone()) {
-                    let signature = display_signature(&m, args, &class.type_params);
-                    acc.out
-                        .push(HierMember::External(ExternalMember { signature, ..m }));
+                let signature = display_signature(&member, &arg_strings, &class.type_params);
+                if let Some(meta) = &mut member.metadata {
+                    meta.parameters = meta.parameters.as_ref().map(|parameters| {
+                        parameters
+                            .iter()
+                            .map(|parameter| parameter.substitute(&env))
+                            .collect()
+                    });
+                    meta.result = meta.result.substitute(&env);
+                    for parameter in &mut meta.type_parameters {
+                        parameter.bounds = parameter
+                            .bounds
+                            .iter()
+                            .map(|bound| bound.substitute(&env))
+                            .collect();
+                    }
                 }
+                member.signature = signature;
+                acc.out.push(HierMember::External(member));
             }
-            // Map this instantiation's type arguments through each supertype's
-            // own type-argument list (index-aligned with `class.supers`, same
-            // convention as `ClassInfo::super_type_args`) so an inherited
-            // member substitutes with the *use-site* concrete types rather
-            // than the supertype's raw type variables — e.g. `ArrayList<E>
-            // extends AbstractList<E>` with `args = ["String"]` maps
-            // `AbstractList`'s `["{0}"]` entry to `["String"]`. A raw
-            // (unparameterized) supertype, or one whose arguments aren't
-            // tracked (length mismatch against `supers`), degrades to no args
-            // — today's behavior.
+            if let Some(supertypes) = structured_supers {
+                for supertype in supertypes {
+                    if let Some(resolved) = ResolvedType::from_type_ref(&supertype, ctx) {
+                        walk_members(&resolved, ctx, static_only, acc, depth + 1);
+                    }
+                }
+                return;
+            }
             let super_type_args = ctx.symbols.super_type_args(fqn);
             let super_type_args = if super_type_args.len() == class.supers.len() {
                 super_type_args
             } else {
                 vec![Vec::new(); class.supers.len()]
             };
-            for (sup, sup_args) in class.supers.into_iter().zip(super_type_args) {
-                // Each raw arg string uses the same `{i}` placeholder
-                // convention as a member template, over the *current* class's
-                // `type_params` — so the same substitution helper composes
-                // directly, nested generics (`List<{0}>`) included.
-                let mapped_args: Vec<String> = sup_args
+            for (supertype, super_args) in class.supers.into_iter().zip(super_type_args) {
+                let mapped_args: Vec<TypeRef> = super_args
                     .iter()
-                    .map(|raw| substitute_template(raw, args, &class.type_params))
+                    .map(|raw| {
+                        opaque_type_ref(&substitute_template(raw, &arg_strings, &class.type_params))
+                    })
                     .collect();
                 walk_members(
                     &ResolvedType::External {
-                        fqn: sup,
+                        fqn: supertype,
                         args: mapped_args,
                     },
                     ctx,
@@ -1501,11 +2346,8 @@ fn flatten_scoped<'t>(node: Node<'t>, source: &'t str) -> Vec<&'t str> {
     out
 }
 
-/// Collect every member name of a resolved type (own + inherited, any kind),
-/// and whether the **entire** supertype hierarchy was resolvable. Used by
-/// unresolved-member diagnostics, which must stay silent unless the answer is
-/// complete (an unknown supertype could declare the member). `java.lang.Object`
-/// members are always included, since they are callable on any reference type.
+/// Collect member names and whether the full hierarchy resolved.
+/// Diagnostics stay silent for incomplete hierarchies that might contain the member.
 pub(crate) fn member_names(resolved: &Resolved<'_>, ctx: &Ctx<'_, '_>) -> (HashSet<String>, bool) {
     let mut names = HashSet::new();
     let mut complete = true;
@@ -1522,7 +2364,7 @@ pub(crate) fn member_names(resolved: &Resolved<'_>, ctx: &Ctx<'_, '_>) -> (HashS
     );
     if matches!(
         &resolved.ty,
-        ResolvedType::InProject(_) | ResolvedType::External { .. } | ResolvedType::Array { .. }
+        ResolvedType::InProject { .. } | ResolvedType::External { .. } | ResolvedType::Array { .. }
     ) {
         match ctx.symbols.class("java.lang.Object") {
             Some(object) => names.extend(object.members.into_iter().map(|m| m.name)),
@@ -1547,39 +2389,34 @@ fn diag_walk(
         return;
     }
     match ty {
-        ResolvedType::InProject(td) => {
+        ResolvedType::InProject { decl: td, .. } => {
             if !visited_node.insert(td.node.id()) {
                 return;
             }
             for m in td.own_members() {
                 names.insert(m.name.to_string());
             }
-            for sup in &td.supers {
-                if let Some(sd) = ctx.table.get(sup) {
-                    diag_walk(
-                        &ResolvedType::InProject(sd.clone()),
-                        ctx,
-                        names,
-                        complete,
-                        visited_node,
-                        visited_fqn,
-                        depth + 1,
-                    );
-                } else if let Some(fqn) = resolve_simple_to_fqn(sup, ctx) {
-                    diag_walk(
-                        &ResolvedType::External {
-                            fqn,
-                            args: Vec::new(),
-                        },
-                        ctx,
-                        names,
-                        complete,
-                        visited_node,
-                        visited_fqn,
-                        depth + 1,
-                    );
-                } else {
-                    *complete = false; // unknown supertype — give up flagging
+            match ctx.for_document(td.doc) {
+                Some(dctx) => {
+                    for sup_node in &td.super_nodes {
+                        match resolve_type_node(*sup_node, td.source, &dctx) {
+                            Some(resolved) => diag_walk(
+                                &resolved,
+                                ctx,
+                                names,
+                                complete,
+                                visited_node,
+                                visited_fqn,
+                                depth + 1,
+                            ),
+                            None => *complete = false, // unknown supertype — give up flagging
+                        }
+                    }
+                }
+                None => {
+                    if !td.super_nodes.is_empty() {
+                        *complete = false;
+                    }
                 }
             }
             // An in-project enum implicitly extends `java.lang.Enum`
@@ -1602,8 +2439,8 @@ fn diag_walk(
         }
         // An array's complete member set is `length` + `clone` (plus
         // Object's, appended globally by `member_names`).
-        ResolvedType::Array { display } => {
-            for m in array_members(display) {
+        ResolvedType::Array { element } => {
+            for m in array_members(&format!("{}[]", render_type_ref(element))) {
                 names.insert(m.name);
             }
         }
@@ -1644,12 +2481,9 @@ fn diag_walk(
 }
 
 /// The signature to show for an external member: its generic template
-/// substituted with the use-site type arguments when present, otherwise the
-/// erased signature. `pub(crate)`: also used directly by hover and
-/// signature help's dedicated constructor lookups, which bypass
-/// [`collect_members`] (constructors are filtered out of the ordinary member
-/// walk — see [`walk_members`]) but still want the same use-site generic
-/// substitution.
+/// substituted with use-site type arguments, or the erased signature
+/// otherwise. `pub(crate)`: hover and signature help's constructor lookups
+/// bypass [`collect_members`] but still want this substitution.
 pub(crate) fn display_signature(
     member: &ExternalMember,
     args: &[String],
@@ -1743,8 +2577,8 @@ pub(crate) fn collect_bindings<'t>(
     }
     if include_fields {
         if let Some(type_node) = enclosing_type {
-            if let Some(td) = TypeDecl::from_node(type_node, source, doc) {
-                push_fields(&td, table, &mut out);
+            if let Some(td) = table.by_node(doc, type_node.id()) {
+                push_fields(td, table, &mut out);
             }
         }
     }
@@ -1816,9 +2650,14 @@ fn push_pattern_bindings<'t>(
     }
 }
 
-/// Collect every `instanceof Type name` binding within a condition subtree
-/// (`f instanceof String s && s.length() > 0` nests the pattern in a
-/// `binary_expression`, so the whole subtree is walked).
+/// Collect every binding introduced within an `instanceof` condition
+/// subtree (`f instanceof String s && s.length() > 0` nests the pattern in a
+/// `binary_expression`, so the whole subtree is walked): a plain `Type name`
+/// binding on the `instanceof_expression` itself, plus every
+/// `record_pattern_component` reachable through a `pattern: record_pattern`
+/// — including components nested arbitrarily deep inside further
+/// `record_pattern`s (`Line(Point(int x, int y), Point b)` binds `x`, `y`,
+/// and `b`, all in scope for the guarded branch).
 fn push_instanceof_bindings<'t>(
     cond: Node<'t>,
     source: &'t str,
@@ -1827,17 +2666,32 @@ fn push_instanceof_bindings<'t>(
 ) {
     let mut stack = vec![cond];
     while let Some(n) = stack.pop() {
-        if n.kind() == "instanceof_expression" {
-            if let Some(name) = n.child_by_field_name("name") {
-                out.push(Binding {
-                    name: node_text(name, source),
-                    kind: BindingKind::Local,
-                    type_node: n.child_by_field_name("right"),
-                    decl_node: n,
-                    source,
-                    doc,
-                });
+        match n.kind() {
+            "instanceof_expression" => {
+                if let Some(name) = n.child_by_field_name("name") {
+                    out.push(Binding {
+                        name: node_text(name, source),
+                        kind: BindingKind::Local,
+                        type_node: n.child_by_field_name("right"),
+                        decl_node: n,
+                        source,
+                        doc,
+                    });
+                }
             }
+            "record_pattern_component" => {
+                if let Some((name, type_node)) = pattern_binding_parts(n) {
+                    out.push(Binding {
+                        name: node_text(name, source),
+                        kind: BindingKind::Local,
+                        type_node,
+                        decl_node: n,
+                        source,
+                        doc,
+                    });
+                }
+            }
+            _ => {}
         }
         for c in named_children(n) {
             stack.push(c);
@@ -1993,7 +2847,7 @@ mod decl_site_tests {
             },
         ];
         let table = TypeTable::build(&docs, 0);
-        let td = table.get("Foo").expect("Foo indexed");
+        let td = table.get_named("Foo").expect("Foo indexed");
         let site = td.decl_site().expect("decl site");
         assert_eq!(site.doc, 1);
         let expected = doc_a.find("Foo").unwrap();
@@ -2020,16 +2874,22 @@ mod decl_site_tests {
         ];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&tree_b, doc_b);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols: &NoSymbols,
+            docs: &docs,
+            facts: &facts,
         };
-        let td_b = table.get("B").expect("B indexed").clone();
+        let td_b = table.get_named("B").expect("B indexed").clone();
         let resolved = Resolved {
-            ty: ResolvedType::InProject(td_b),
+            ty: ResolvedType::InProject {
+                decl: td_b,
+                args: Vec::new(),
+            },
             static_only: false,
         };
         let member = find_member_hier(&resolved, &ctx, "methodFromA").expect("member found");
@@ -2057,7 +2917,9 @@ mod decl_site_tests {
                         is_static: false,
                         ret_fqn: None,
                         ret_display: None,
+                        metadata: None,
                     }],
+                    metadata: None,
                 })
             }
         }
@@ -2070,12 +2932,15 @@ mod decl_site_tests {
         }];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&t, src);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols: &StubSymbols,
+            docs: &docs,
+            facts: &facts,
         };
         let resolved = Resolved {
             ty: ResolvedType::External {
@@ -2112,6 +2977,7 @@ mod super_type_args_tests {
             is_static: false,
             ret_fqn: None,
             ret_display: None,
+            metadata: None,
         }
     }
 
@@ -2124,17 +2990,20 @@ mod super_type_args_tests {
         }];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&t, src);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols,
+            docs: &docs,
+            facts: &facts,
         };
         let resolved = Resolved {
             ty: ResolvedType::External {
                 fqn: fqn.to_string(),
-                args,
+                args: args.iter().map(|a| TypeRef::named(a)).collect(),
             },
             static_only: false,
         };
@@ -2156,11 +3025,13 @@ mod super_type_args_tests {
                     supers: vec!["test.AbstractList".to_string()],
                     type_params: vec!["E".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.AbstractList" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["E".to_string()],
                     members: vec![method("get", "Object get(int)", "{0} get(int)")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2194,16 +3065,19 @@ mod super_type_args_tests {
                     supers: vec!["test.B".to_string()],
                     type_params: vec!["T".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.B" => Some(ExternalClass {
                     supers: vec!["test.A".to_string()],
                     type_params: vec!["T".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.A" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["T".to_string()],
                     members: vec![method("id", "Object id(Object)", "{0} id({0})")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2233,11 +3107,13 @@ mod super_type_args_tests {
                     supers: vec!["test.Base".to_string()],
                     type_params: vec!["K".to_string(), "V".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.Base" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["K".to_string(), "V".to_string()],
                     members: vec![method("first", "Object first()", "{0} first()")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2272,11 +3148,13 @@ mod super_type_args_tests {
                     supers: vec!["test.Box".to_string()],
                     type_params: Vec::new(),
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.Box" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["T".to_string()],
                     members: vec![method("unwrap", "Object unwrap()", "{0} unwrap()")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2305,11 +3183,13 @@ mod super_type_args_tests {
                     supers: vec!["test.Generic".to_string()],
                     type_params: Vec::new(),
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.Generic" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["T".to_string()],
                     members: vec![method("get", "Object get()", "{0} get()")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2320,9 +3200,8 @@ mod super_type_args_tests {
 
     #[test]
     fn raw_supertype_falls_back_to_erased_rendering_without_panicking() {
-        // No type args flow through an untracked supertype (`RawStub` never
-        // overrides `super_type_args`), so the inherited member keeps
-        // rendering its today's-behavior erased signature — no panic, no
+        // No type args flow through an untracked supertype, so the
+        // inherited member keeps its erased signature — no panic, no
         // spurious substitution.
         let sig = find("test.RawUser", Vec::new(), &RawStub, "get");
         assert_eq!(sig, "Object get()");
@@ -2341,11 +3220,13 @@ mod super_type_args_tests {
                     supers: vec!["test.Base".to_string()],
                     type_params: vec!["T".to_string()],
                     members: Vec::new(),
+                    metadata: None,
                 }),
                 "test.Base" => Some(ExternalClass {
                     supers: Vec::new(),
                     type_params: vec!["T".to_string()],
                     members: vec![method("head", "Object head()", "{0} head()")],
+                    metadata: None,
                 }),
                 _ => None,
             }
@@ -2372,6 +3253,7 @@ mod value_type_tests {
         ExternalClass, ExternalMember, ExternalMemberKind, NoSymbols, SymbolSource,
     };
     use crate::{new_parser, parse};
+    use jvl_types::TypeParameter;
 
     fn tree(src: &str) -> Tree {
         parse(&mut new_parser(), src, None).expect("parse")
@@ -2396,12 +3278,15 @@ mod value_type_tests {
         }];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&tree, src);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols,
+            docs: &docs,
+            facts: &facts,
         };
         resolve_expression_type(returned_expression(&tree), &ctx).map(|ty| type_display(&ty))
     }
@@ -2414,12 +3299,15 @@ mod value_type_tests {
         }];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&tree, src);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols,
+            docs: &docs,
+            facts: &facts,
         };
         resolve_receiver_type(returned_expression(&tree), &ctx)
             .map(|resolved| type_display(&resolved.ty))
@@ -2429,16 +3317,22 @@ mod value_type_tests {
         ResolvedType::Primitive(ty)
     }
 
+    /// `"?"` becomes a bare wildcard; everything else an opaque `Named` (see
+    /// [`opaque_type_ref`]) — good enough identity for these hand-authored
+    /// fixture args, which only ever get compared for equality/containment.
     fn external(fqn: &str, args: &[&str]) -> ResolvedType<'static> {
         ResolvedType::External {
             fqn: fqn.to_string(),
-            args: args.iter().map(|arg| arg.to_string()).collect(),
+            args: args.iter().map(|arg| opaque_type_ref(arg)).collect(),
         }
     }
 
     fn array(display: &str) -> ResolvedType<'static> {
+        let element = display
+            .strip_suffix("[]")
+            .expect("array display ends with []");
         ResolvedType::Array {
-            display: display.to_string(),
+            element: opaque_type_ref(element),
         }
     }
 
@@ -2455,12 +3349,15 @@ mod value_type_tests {
         }];
         let table = TypeTable::build(&docs, 0);
         let imports = Imports::parse(&tree, src);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[0],
             current: 0,
             table: &table,
             imports: &imports,
             symbols,
+            docs: &docs,
+            facts: &facts,
         };
         is_assignable(&actual, &expected, &ctx)
     }
@@ -2479,15 +3376,24 @@ mod value_type_tests {
             .collect();
         let table = TypeTable::build(&docs, current);
         let imports = Imports::parse(docs[current].tree, docs[current].source);
+        let facts = FactsCache::default();
         let ctx = Ctx {
             doc: &docs[current],
             current,
             table: &table,
             imports: &imports,
             symbols: &NoSymbols,
+            docs: &docs,
+            facts: &facts,
         };
-        let actual = ResolvedType::InProject(table.get(actual).expect("actual type").clone());
-        let expected = ResolvedType::InProject(table.get(expected).expect("expected type").clone());
+        let actual = ResolvedType::InProject {
+            decl: table.get_named(actual).expect("actual type").clone(),
+            args: Vec::new(),
+        };
+        let expected = ResolvedType::InProject {
+            decl: table.get_named(expected).expect("expected type").clone(),
+            args: Vec::new(),
+        };
         is_assignable(&actual, &expected, &ctx)
     }
 
@@ -2505,6 +3411,7 @@ mod value_type_tests {
             is_static: false,
             ret_fqn: ret_fqn.map(str::to_string),
             ret_display: Some(ret_display.to_string()),
+            metadata: None,
         }
     }
 
@@ -2512,13 +3419,54 @@ mod value_type_tests {
 
     impl SymbolSource for ValueSymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            // Structured metadata is attached only to members whose result
+            // type the Unique-lookup engine must resolve (`size`/`clear`/
+            // `values`). `pick`/`unknown`/`static_unknown`/`unknown_result`
+            // stay `metadata: None` on purpose — tests below assert Unique
+            // lookup stays unknown for those overload/generic cases.
+            let structured =
+                |name: &str, sig: &str, display: &str, result: TypeRef| ExternalMember {
+                    metadata: Some(jvl_types::MemberMetadata {
+                        declaring_class: TypeId::named("test.Values"),
+                        access: Access::Public,
+                        is_static: false,
+                        is_abstract: false,
+                        parameters: Some(Vec::new()),
+                        result,
+                        type_parameters: Vec::new(),
+                        is_varargs: false,
+                    }),
+                    ..result_member(name, sig, None, display)
+                };
             (fqn == "test.Values").then(|| ExternalClass {
                 supers: Vec::new(),
                 type_params: vec!["T".to_string()],
+                metadata: Some(ClassMetadata {
+                    id: TypeId::named("test.Values"),
+                    kind: ClassKind::Class,
+                    access: Access::Public,
+                    is_abstract: false,
+                    is_static: true,
+                    enclosing_class: None,
+                    type_parameters: Vec::new(),
+                    supertypes: Vec::new(),
+                    hierarchy_complete: true,
+                    constructors_complete: true,
+                }),
                 members: vec![
-                    result_member("size", "int size()", None, "int"),
-                    result_member("clear", "void clear()", None, "void"),
-                    result_member("values", "Object[] values()", None, "Object[]"),
+                    structured(
+                        "size",
+                        "int size()",
+                        "int",
+                        TypeRef::Primitive(PrimitiveType::Int),
+                    ),
+                    structured("clear", "void clear()", "void", TypeRef::Void),
+                    structured(
+                        "values",
+                        "Object[] values()",
+                        "Object[]",
+                        TypeRef::Array(Box::new(TypeRef::named("java.lang.Object"))),
+                    ),
                     result_member("pick", "String pick()", Some("java.lang.String"), "String"),
                     result_member(
                         "pick",
@@ -2872,25 +3820,74 @@ mod value_type_tests {
     }
 
     #[test]
-    fn arrays_are_assignable_only_when_their_displays_match_exactly() {
+    fn arrays_are_assignable_only_when_provably_related() {
         assert_eq!(
             assign(array("Object[]"), array("Object[]"), &NoSymbols),
             Some(true)
         );
-        assert_eq!(assign(array("int[]"), array("long[]"), &NoSymbols), None);
         assert_eq!(
-            assign(array("String[]"), array("Object[]"), &NoSymbols),
-            None,
-            "array covariance is outside the conservative native proof"
+            assign(array("int[]"), array("long[]"), &NoSymbols),
+            Some(false),
+            "primitive arrays are invariant, never widen"
+        );
+        assert_eq!(
+            assign(
+                array("java.lang.String[]"),
+                array("java.lang.Object[]"),
+                &NoSymbols
+            ),
+            Some(true),
+            "reference arrays are covariant and are now provable via the structured element type"
         );
     }
 
-    fn class(supers: &[&str], type_params: &[&str]) -> ExternalClass {
+    /// A minimal but *real* `ClassMetadata`-carrying fixture: `own_fqn`'s
+    /// own type parameters (identified by `(own_fqn, index)`, never by
+    /// letter) plus direct, unparameterized supertypes. Every
+    /// hierarchy-walk test here links supertypes by raw reference only;
+    /// use-site argument flow is exercised by `srcclass.rs`'s/
+    /// `class_info.rs`'s own tests.
+    fn class_with_supertypes(
+        own_fqn: &str,
+        supertypes: Vec<TypeRef>,
+        type_params: &[&str],
+    ) -> ExternalClass {
+        let type_parameters: Vec<TypeParameter> = type_params
+            .iter()
+            .enumerate()
+            .map(|(index, _)| TypeParameter {
+                id: TypeVariableId {
+                    owner: own_fqn.to_string(),
+                    index,
+                },
+                bounds: Vec::new(),
+            })
+            .collect();
         ExternalClass {
-            supers: supers.iter().map(|value| value.to_string()).collect(),
+            supers: supertypes.iter().map(render_type_ref).collect(),
             type_params: type_params.iter().map(|value| value.to_string()).collect(),
             members: Vec::new(),
+            metadata: Some(ClassMetadata {
+                id: TypeId::named(own_fqn),
+                kind: ClassKind::Class,
+                access: Access::Public,
+                is_abstract: false,
+                is_static: true,
+                enclosing_class: None,
+                type_parameters,
+                supertypes,
+                hierarchy_complete: true,
+                constructors_complete: true,
+            }),
         }
+    }
+
+    fn class(own_fqn: &str, supers: &[&str], type_params: &[&str]) -> ExternalClass {
+        class_with_supertypes(
+            own_fqn,
+            supers.iter().map(|s| TypeRef::named(s)).collect(),
+            type_params,
+        )
     }
 
     struct BoxingHierarchySymbols;
@@ -2898,13 +3895,25 @@ mod value_type_tests {
     impl SymbolSource for BoxingHierarchySymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             match fqn {
-                "java.lang.Integer" | "java.lang.Long" => {
-                    Some(class(&["java.lang.Number", "java.lang.Comparable"], &[]))
-                }
-                "java.lang.Number" => {
-                    Some(class(&["java.lang.Object", "java.io.Serializable"], &[]))
-                }
+                // The real JDK declaration is `Integer implements
+                // Comparable<Integer>` — a parameterized supertype — so the
+                // fixture must carry that argument for the
+                // `Comparable<Integer>` case below to be provable.
+                "java.lang.Integer" | "java.lang.Long" => Some(class_with_supertypes(
+                    fqn,
+                    vec![
+                        TypeRef::named("java.lang.Number"),
+                        TypeRef::named_with("java.lang.Comparable", vec![TypeRef::named(fqn)]),
+                    ],
+                    &[],
+                )),
+                "java.lang.Number" => Some(class(
+                    fqn,
+                    &["java.lang.Object", "java.io.Serializable"],
+                    &[],
+                )),
                 "java.lang.String" => Some(class(
+                    fqn,
                     &[
                         "java.lang.Object",
                         "java.lang.Comparable",
@@ -2912,8 +3921,8 @@ mod value_type_tests {
                     ],
                     &[],
                 )),
-                "java.lang.Comparable" => Some(class(&[], &["T"])),
-                "java.io.Serializable" | "java.lang.Object" => Some(class(&[], &[])),
+                "java.lang.Comparable" => Some(class(fqn, &[], &["T"])),
+                "java.io.Serializable" | "java.lang.Object" => Some(class(fqn, &[], &[])),
                 _ => None,
             }
         }
@@ -2953,13 +3962,13 @@ mod value_type_tests {
     impl SymbolSource for HierarchySymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             match fqn {
-                "test.Leaf" => Some(class(&["test.Middle"], &["T"])),
-                "test.Middle" => Some(class(&["test.Root", "test.Marker"], &[])),
+                "test.Leaf" => Some(class(fqn, &["test.Middle"], &["T"])),
+                "test.Middle" => Some(class(fqn, &["test.Root", "test.Marker"], &[])),
                 "test.Root" | "test.Marker" | "test.Other" => {
-                    Some(class(&["java.lang.Object"], &["T"]))
+                    Some(class(fqn, &["java.lang.Object"], &["T"]))
                 }
-                "java.util.List" => Some(class(&["java.lang.Object"], &["E"])),
-                "java.lang.Object" => Some(class(&[], &[])),
+                "java.util.List" => Some(class(fqn, &["java.lang.Object"], &["E"])),
+                "java.lang.Object" => Some(class(fqn, &[], &[])),
                 _ => None,
             }
         }
@@ -3009,7 +4018,8 @@ mod value_type_tests {
                 external("java.util.List", &["Integer"]),
                 &HierarchySymbols,
             ),
-            None
+            Some(false),
+            "invariant generics: differing concrete arguments are now a proved mismatch"
         );
         assert_eq!(
             assign(
@@ -3017,8 +4027,8 @@ mod value_type_tests {
                 external("java.util.List", &["?"]),
                 &HierarchySymbols,
             ),
-            None,
-            "wildcard equality is not a proof"
+            Some(true),
+            "a bare wildcard target contains anything, including another bare wildcard"
         );
         assert_eq!(
             assign(
@@ -3026,8 +4036,8 @@ mod value_type_tests {
                 external("test.Root", &["Integer"]),
                 &HierarchySymbols,
             ),
-            Some(true),
-            "different raw types use only the erased hierarchy"
+            None,
+            "a raw (untracked-args) intermediate link into a parameterized target is an unchecked conversion, not a proof"
         );
     }
 
@@ -3036,9 +4046,9 @@ mod value_type_tests {
     impl SymbolSource for IncompleteHierarchySymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             match fqn {
-                "test.Broken" => Some(class(&["test.Missing"], &[])),
-                "test.Other" => Some(class(&["java.lang.Object"], &[])),
-                "java.lang.Object" => Some(class(&[], &[])),
+                "test.Broken" => Some(class(fqn, &["test.Missing"], &[])),
+                "test.Other" => Some(class(fqn, &["java.lang.Object"], &[])),
+                "java.lang.Object" => Some(class(fqn, &[], &[])),
                 _ => None,
             }
         }
@@ -3049,10 +4059,10 @@ mod value_type_tests {
     impl SymbolSource for CyclicHierarchySymbols {
         fn class(&self, fqn: &str) -> Option<ExternalClass> {
             match fqn {
-                "test.A" => Some(class(&["test.B"], &[])),
-                "test.B" => Some(class(&["test.A"], &[])),
-                "test.Other" => Some(class(&["java.lang.Object"], &[])),
-                "java.lang.Object" => Some(class(&[], &[])),
+                "test.A" => Some(class(fqn, &["test.B"], &[])),
+                "test.B" => Some(class(fqn, &["test.A"], &[])),
+                "test.Other" => Some(class(fqn, &["java.lang.Object"], &[])),
+                "java.lang.Object" => Some(class(fqn, &[], &[])),
                 _ => None,
             }
         }
@@ -3067,18 +4077,15 @@ mod value_type_tests {
                 .and_then(|value| value.parse::<usize>().ok())
             {
                 return Some(if depth < 70 {
-                    ExternalClass {
-                        supers: vec![format!("test.Depth{}", depth + 1)],
-                        type_params: Vec::new(),
-                        members: Vec::new(),
-                    }
+                    let next = format!("test.Depth{}", depth + 1);
+                    class_with_supertypes(fqn, vec![TypeRef::named(&next)], &[])
                 } else {
-                    class(&["java.lang.Object"], &[])
+                    class(fqn, &["java.lang.Object"], &[])
                 });
             }
             match fqn {
-                "test.Other" => Some(class(&["java.lang.Object"], &[])),
-                "java.lang.Object" => Some(class(&[], &[])),
+                "test.Other" => Some(class(fqn, &["java.lang.Object"], &[])),
+                "java.lang.Object" => Some(class(fqn, &[], &[])),
                 _ => None,
             }
         }
@@ -3102,15 +4109,20 @@ mod value_type_tests {
         }
     }
 
+    /// `InProject` identity is proved through qualified `TypeId`s, not node
+    /// identity plus `ctx.current`. Two different declarations sharing only
+    /// an implicit `Object` ancestor prove `Some(false)`; the same
+    /// declaration reached via another open document proves `Some(true)`.
     #[test]
-    fn only_current_document_project_type_identity_is_proven() {
+    fn is_assignable_proves_identity_and_inequality_regardless_of_document() {
         assert_eq!(
             in_project_assign(&["class A {} class B {}"], 0, "A", "A"),
             Some(true)
         );
         assert_eq!(
             in_project_assign(&["class A {} class B {}"], 0, "A", "B"),
-            None
+            Some(false),
+            "two unrelated classes with only an implicit Object ancestor are now provably incompatible"
         );
         assert_eq!(
             in_project_assign(
@@ -3119,8 +4131,638 @@ mod value_type_tests {
                 "Foreign",
                 "Foreign"
             ),
-            None,
-            "another open document must not influence current diagnostics"
+            Some(true),
+            "the same declaration, reached via another open document, is now provably identical"
         );
+    }
+
+    /// The `type` field of the sole `method_declaration` in `tree`.
+    fn method_return_type_node(tree: &Tree) -> Node<'_> {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "method_declaration" {
+                return node.child_by_field_name("type").expect("return type");
+            }
+            stack.extend(named_children(node));
+        }
+        panic!("method declaration not found");
+    }
+
+    /// The `type` field of the sole `object_creation_expression` in `tree`.
+    fn object_creation_type_node(tree: &Tree) -> Node<'_> {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "object_creation_expression" {
+                return node.child_by_field_name("type").expect("creation type");
+            }
+            stack.extend(named_children(node));
+        }
+        panic!("object creation expression not found");
+    }
+
+    /// The `type` field of the sole `field_declaration` in `tree`.
+    fn field_declaration_type_node(tree: &Tree) -> Node<'_> {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "field_declaration" {
+                return node.child_by_field_name("type").expect("field type");
+            }
+            stack.extend(named_children(node));
+        }
+        panic!("field declaration not found");
+    }
+
+    /// `import a.User;` resolves the declared return type to `a.User`; a
+    /// fully-qualified `new b.User()` resolves to the distinct `b.User`
+    /// declaration in the other package.
+    #[test]
+    fn qualified_identity_distinguishes_same_simple_name_across_packages() {
+        let doc_a = "package a; public class User {}\n";
+        let doc_b = "package b; public class User {}\n";
+        let doc_c = "package c; import a.User; class C { User f() { return new b.User(); } }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let tree_c = tree(doc_c);
+        let docs = [
+            OpenDoc {
+                source: doc_c,
+                tree: &tree_c,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&tree_c, doc_c);
+
+        let declared = table
+            .resolve_type_name_node(method_return_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("declared return type resolves through the explicit import");
+        assert_eq!(declared.binary_name.as_deref(), Some("a.User"));
+
+        let actual = table
+            .resolve_type_name_node(object_creation_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("dotted `b.User` resolves via qualified nesting");
+        assert_eq!(actual.binary_name.as_deref(), Some("b.User"));
+        assert_ne!(
+            declared.node.id(),
+            actual.node.id(),
+            "a.User and b.User must be distinct declarations"
+        );
+    }
+
+    /// The same scenario but `return new a.User();` — the actual and
+    /// declared return types resolve to the SAME declaration.
+    #[test]
+    fn qualified_identity_resolves_same_binary_name_to_identical_declaration() {
+        let doc_a = "package a; public class User {}\n";
+        let doc_b = "package b; public class User {}\n";
+        let doc_c = "package c; import a.User; class C { User f() { return new a.User(); } }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let tree_c = tree(doc_c);
+        let docs = [
+            OpenDoc {
+                source: doc_c,
+                tree: &tree_c,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&tree_c, doc_c);
+
+        let declared = table
+            .resolve_type_name_node(method_return_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("declared return type resolves");
+        let actual = table
+            .resolve_type_name_node(object_creation_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("dotted actual type resolves");
+        assert_eq!(declared.node.id(), actual.node.id());
+        assert_eq!(declared.binary_name.as_deref(), Some("a.User"));
+    }
+
+    /// A member's declared type resolves through its own declaring
+    /// document's imports, never the caller's: `Api` (package `p`) imports
+    /// `x.Result`; the caller (package `q`) imports a distinct `y.Result`.
+    /// Resolving `Api::r`'s return type via `Ctx::for_document` must land on
+    /// `x.Result`.
+    #[test]
+    fn member_return_type_resolves_in_declaring_documents_imports() {
+        let doc_x = "package x; public class Result {}\n";
+        let doc_y = "package y; public class Result {}\n";
+        let doc_a = "package p; import x.Result; class Api { Result r() { return null; } }\n";
+        let doc_b = "package q; import y.Result; import p.Api; class C { }\n";
+        let tree_x = tree(doc_x);
+        let tree_y = tree(doc_y);
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let docs = [
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+            OpenDoc {
+                source: doc_x,
+                tree: &tree_x,
+            },
+            OpenDoc {
+                source: doc_y,
+                tree: &tree_y,
+            },
+        ];
+        let current = 0;
+        let table = TypeTable::build(&docs, current);
+        let imports = Imports::parse(&tree_b, doc_b);
+        let facts = FactsCache::default();
+        let ctx = Ctx {
+            doc: &docs[current],
+            current,
+            table: &table,
+            imports: &imports,
+            symbols: &NoSymbols,
+            docs: &docs,
+            facts: &facts,
+        };
+
+        let api = table.get_named("p.Api").expect("Api indexed");
+        let dctx = ctx
+            .for_document(api.doc)
+            .expect("Api's own document context");
+        let resolved = resolve_type_node(method_return_type_node(&tree_a), api.source, &dctx)
+            .expect("resolves through the declaring document's own imports");
+        match resolved {
+            ResolvedType::InProject { decl: td, .. } => {
+                assert_eq!(td.binary_name.as_deref(), Some("x.Result"))
+            }
+            _ => panic!("expected an in-project resolution"),
+        }
+    }
+
+    /// Two wildcard imports both offering `User` (in different packages,
+    /// neither an explicit single-type import, no same-package candidate)
+    /// leave a bare `User` reference ambiguous — never guessed.
+    #[test]
+    fn wildcard_ambiguity_is_unresolved() {
+        let doc_a = "package a; public class User {}\n";
+        let doc_b = "package b; public class User {}\n";
+        let doc_c = "package c; import a.*; import b.*; class C { User u; }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let tree_c = tree(doc_c);
+        let docs = [
+            OpenDoc {
+                source: doc_c,
+                tree: &tree_c,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&tree_c, doc_c);
+        assert!(table
+            .resolve_type_name_node(field_declaration_type_node(&tree_c), doc_c, 0, &imports)
+            .is_none());
+    }
+
+    /// Opening an unrelated third `User` (package `d`, not imported/
+    /// wildcarded) must not change either resolution from the qualified-
+    /// identity scenario above.
+    #[test]
+    fn unrelated_open_document_does_not_affect_qualified_resolution() {
+        let doc_a = "package a; public class User {}\n";
+        let doc_b = "package b; public class User {}\n";
+        let doc_d = "package d; public class User {}\n";
+        let doc_c = "package c; import a.User; class C { User f() { return new b.User(); } }\n";
+        let tree_a = tree(doc_a);
+        let tree_b = tree(doc_b);
+        let tree_d = tree(doc_d);
+        let tree_c = tree(doc_c);
+        let docs = [
+            OpenDoc {
+                source: doc_c,
+                tree: &tree_c,
+            },
+            OpenDoc {
+                source: doc_a,
+                tree: &tree_a,
+            },
+            OpenDoc {
+                source: doc_b,
+                tree: &tree_b,
+            },
+            OpenDoc {
+                source: doc_d,
+                tree: &tree_d,
+            },
+        ];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&tree_c, doc_c);
+
+        let declared = table
+            .resolve_type_name_node(method_return_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("declared return type resolves");
+        assert_eq!(declared.binary_name.as_deref(), Some("a.User"));
+        let actual = table
+            .resolve_type_name_node(object_creation_type_node(&tree_c), doc_c, 0, &imports)
+            .expect("dotted actual type resolves");
+        assert_eq!(actual.binary_name.as_deref(), Some("b.User"));
+    }
+
+    /// An assignability table built from one small in-project corpus
+    /// (`Animal`/`Dog`/`Cat`/`Named`/`Order`/`User`/`Box<T>`/`UserBox`) plus
+    /// a few externally-fixtured cases needing a hierarchy no snippet can
+    /// express. `assign_in` resolves two bare simple names to `TypeRef`s and
+    /// runs them through [`assignable_refs`] directly, one level below
+    /// `is_assignable`'s `ResolvedType` wrapping.
+    const ASSIGN_CORPUS: &str = "\
+        package demo;\n\
+        class Animal {}\n\
+        class Dog extends Animal {}\n\
+        class Cat extends Animal {}\n\
+        interface Named {}\n\
+        class Order {}\n\
+        class User implements Named {}\n\
+        class Box<T> { T get() { return null; } }\n\
+        class UserBox extends Box<User> {}\n\
+        class Missing2 {}\n\
+        class Broken extends Missing {}\n\
+        class Cyc1 extends Cyc2 {}\n\
+        class Cyc2 extends Cyc1 {}\n\
+        class A {}\n\
+    ";
+
+    fn assign_in(source: &str, actual: TypeRef, expected: TypeRef) -> Option<bool> {
+        let t = tree(source);
+        let docs = [OpenDoc { source, tree: &t }];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&t, source);
+        let facts = FactsCache::default();
+        let ctx = Ctx {
+            doc: &docs[0],
+            current: 0,
+            table: &table,
+            imports: &imports,
+            symbols: &NoSymbols,
+            docs: &docs,
+            facts: &facts,
+        };
+        assignable_refs(&actual, &expected, &ctx)
+    }
+
+    #[test]
+    fn assign_dog_to_animal_is_true() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.Dog"),
+                TypeRef::named("demo.Animal")
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn assign_animal_to_dog_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.Animal"),
+                TypeRef::named("demo.Dog")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn assign_cat_to_dog_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.Cat"),
+                TypeRef::named("demo.Dog")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn assign_order_to_user_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.Order"),
+                TypeRef::named("demo.User")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn assign_user_to_named_is_true() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.User"),
+                TypeRef::named("demo.Named")
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn assign_boxed_user_to_boxed_order_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.User")]),
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.Order")]),
+            ),
+            Some(false),
+            "invariant generics: User <: Named does not make Box<User> a Box<Named>"
+        );
+    }
+
+    #[test]
+    fn assign_boxed_user_to_boxed_named_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.User")]),
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.Named")]),
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn assign_user_box_to_boxed_user_is_true() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.UserBox"),
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.User")]),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn assign_boxed_dog_to_boxed_bounded_wildcard_animal_is_true() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.Dog")]),
+                TypeRef::named_with(
+                    "demo.Box",
+                    vec![TypeRef::Wildcard {
+                        upper: Some(Box::new(TypeRef::named("demo.Animal"))),
+                        lower: None,
+                    }],
+                ),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bounded_wildcard_containment_respects_bound_direction() {
+        let box_of = |argument| TypeRef::named_with("demo.Box", vec![argument]);
+        let extends_dog = TypeRef::Wildcard {
+            upper: Some(Box::new(TypeRef::named("demo.Dog"))),
+            lower: None,
+        };
+        let super_animal = TypeRef::Wildcard {
+            upper: None,
+            lower: Some(Box::new(TypeRef::named("demo.Animal"))),
+        };
+        let super_dog = TypeRef::Wildcard {
+            upper: None,
+            lower: Some(Box::new(TypeRef::named("demo.Dog"))),
+        };
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                box_of(TypeRef::named("demo.Animal")),
+                box_of(super_dog),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                box_of(TypeRef::named("demo.Animal")),
+                box_of(extends_dog),
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                box_of(TypeRef::named("demo.Dog")),
+                box_of(super_animal),
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn assign_dog_array_to_animal_array_is_true() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::Array(Box::new(TypeRef::named("demo.Dog"))),
+                TypeRef::Array(Box::new(TypeRef::named("demo.Animal"))),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn assign_int_array_to_long_array_is_false() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::Array(Box::new(TypeRef::Primitive(PrimitiveType::Int))),
+                TypeRef::Array(Box::new(TypeRef::Primitive(PrimitiveType::Long))),
+            ),
+            Some(false),
+            "primitive arrays are invariant, never widen"
+        );
+    }
+
+    #[test]
+    fn assign_class_with_unresolvable_supertype_to_order_is_unknown() {
+        assert_eq!(
+            assign_in(ASSIGN_CORPUS, TypeRef::named("demo.Broken"), TypeRef::named("demo.Order")),
+            None,
+            "an unresolvable `extends Missing` makes the hierarchy incomplete, never a guessed false"
+        );
+    }
+
+    #[test]
+    fn assign_cyclic_hierarchy_is_unknown_without_hanging() {
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named("demo.Cyc1"),
+                TypeRef::named("demo.Order")
+            ),
+            None,
+            "the depth/seen-set guard must stop a cyclic `extends` without a stack overflow"
+        );
+    }
+
+    #[test]
+    fn class_named_a_as_a_type_argument_does_not_misfire_as_a_variable() {
+        // A class literally named `A` must never be mistaken for a type
+        // variable identified by that same letter.
+        assert_eq!(
+            assign_in(
+                ASSIGN_CORPUS,
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.A")]),
+                TypeRef::named_with("demo.Box", vec![TypeRef::named("demo.A")]),
+            ),
+            Some(true)
+        );
+    }
+
+    struct GSymbols;
+
+    impl SymbolSource for GSymbols {
+        fn class(&self, fqn: &str) -> Option<ExternalClass> {
+            (fqn == "test.G").then(|| {
+                let mut c = class("test.G", &[], &["T"]);
+                if let Some(meta) = &mut c.metadata {
+                    meta.type_parameters[0].bounds = vec![TypeRef::named("java.lang.Number")];
+                }
+                c
+            })
+        }
+    }
+
+    #[test]
+    fn declared_type_variable_is_assignable_to_its_own_bound() {
+        // `class G<T extends Number> { Animal f(T t){ return t; } }` —
+        // proved one level below `resolve_type_node`, without a full
+        // source round-trip.
+        let v = TypeRef::Variable(TypeVariableId {
+            owner: "test.G".to_string(),
+            index: 0,
+        });
+        assert_eq!(
+            assign_in("class C {}", v, TypeRef::named("java.lang.Number")),
+            None,
+            "NoSymbols alone cannot see test.G's bound"
+        );
+        let src = "class C {}";
+        let t = tree(src);
+        let docs = [OpenDoc {
+            source: src,
+            tree: &t,
+        }];
+        let table = TypeTable::build(&docs, 0);
+        let imports = Imports::parse(&t, src);
+        let facts = FactsCache::default();
+        let ctx = Ctx {
+            doc: &docs[0],
+            current: 0,
+            table: &table,
+            imports: &imports,
+            symbols: &GSymbols,
+            docs: &docs,
+            facts: &facts,
+        };
+        let v = TypeRef::Variable(TypeVariableId {
+            owner: "test.G".to_string(),
+            index: 0,
+        });
+        assert_eq!(
+            assignable_refs(&v, &TypeRef::named("java.lang.Number"), &ctx),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn ternary_expression_types_as_the_wider_provable_branch() {
+        let src = "package demo; class Animal {} class Dog extends Animal {} \
+                   class C { Object m(boolean b) { return b ? new Dog() : new Animal(); } }";
+        assert_eq!(
+            expression_display(src, &NoSymbols).as_deref(),
+            Some("Animal")
+        );
+    }
+
+    #[test]
+    fn ternary_expression_with_unrelated_branches_is_unknown() {
+        let src = "package demo; class Animal {} class Dog extends Animal {} class Cat extends Animal {} \
+                   class C { Object m(boolean b) { return b ? new Dog() : new Cat(); } }";
+        assert_eq!(expression_display(src, &NoSymbols), None);
+    }
+
+    #[test]
+    fn assignment_expression_types_as_its_targets_type() {
+        let src = "class C { int m() { int x = 1; return (x = 2); } }";
+        assert_eq!(expression_display(src, &NoSymbols).as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn string_concatenation_types_as_string() {
+        let src = "class C { String m() { return \"a\" + 1; } }";
+        assert_eq!(
+            expression_display(src, &NoSymbols).as_deref(),
+            Some("String")
+        );
+    }
+
+    #[test]
+    fn comparison_binary_expression_types_as_boolean() {
+        let src = "class C { boolean m() { return 1 == 2; } }";
+        assert_eq!(
+            expression_display(src, &NoSymbols).as_deref(),
+            Some("boolean")
+        );
+    }
+
+    #[test]
+    fn arithmetic_binary_expression_is_unknown() {
+        let src = "class C { int m() { return 1 + 2; } }";
+        assert_eq!(expression_display(src, &NoSymbols), None);
+    }
+
+    #[test]
+    fn logical_not_unary_expression_types_as_boolean() {
+        let src = "class C { boolean m() { return !true; } }";
+        assert_eq!(
+            expression_display(src, &NoSymbols).as_deref(),
+            Some("boolean")
+        );
+    }
+
+    #[test]
+    fn arithmetic_unary_expression_is_unknown() {
+        let src = "class C { int m() { return -1; } }";
+        assert_eq!(expression_display(src, &NoSymbols), None);
     }
 }

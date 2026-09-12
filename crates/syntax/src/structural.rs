@@ -1,21 +1,5 @@
-//! Structural, purely-syntactic Java-rule diagnostics (JLS file/type/
-//! member "shape" checks) — file naming, package-vs-directory, duplicate
-//! declarations, and a conservative set of illegal modifier combinations.
-//!
-//! **Zero false positives is a hard requirement**: every check here stays
-//! silent whenever the node(s) it inspects (or a node it must trust, like a
-//! `modifiers` list) contain a parse error — `Node::has_error()` already
-//! propagates from any `ERROR`/MISSING descendant up to its ancestors, so a
-//! single `node.has_error()` guard at the right granularity is enough; it
-//! never suppresses more than the damaged region (a broken method elsewhere
-//! in a class body doesn't mute a clean duplicate-field check in the same
-//! class).
-//!
-//! Single pass, no extra parsing: `structural_diagnostics` walks the tree
-//! once (plus one bounded pass over each type's own direct body children —
-//! never the whole tree again), matching the low-compute constraint the
-//! existing [`crate::syntax_diagnostics`]/[`crate::semantic_diagnostics`]
-//! already meet.
+//! Purely syntactic Java diagnostics for files, packages, duplicates, and modifiers.
+//! Checks with parse errors stay silent; one tree pass performs all rules.
 
 use std::collections::HashSet;
 
@@ -27,18 +11,8 @@ use crate::model::{
 };
 use crate::{diagnostic, node_text, LineIndex, MAX_DIAGNOSTICS};
 
-/// Structural diagnostics for one document's parse tree.
-///
-/// `filename` is the document's own file name (e.g. `"MavenDemo2.java"`,
-/// *not* a path) when known from a real `.java` file URI — `None` for an
-/// in-memory/untitled document skips rule (a)/(b) (filename-dependent)
-/// entirely. `expected_package` is the dotted package the file's location
-/// under a *confidently* discovered source root implies (possibly `""` for
-/// the unnamed/default package, when the file sits directly under the root)
-/// — `None` skips rule (c) entirely (no source root confidently contains the
-/// file, e.g. a lone file with no workspace). Both inputs are computed by the
-/// caller (the server owns the URI and source-root discovery); this crate
-/// never touches the filesystem.
+/// Run structural checks for one document.
+/// Optional filename and expected-package inputs independently enable location checks.
 pub fn structural_diagnostics(
     tree: &Tree,
     source: &str,
@@ -58,10 +32,8 @@ pub fn structural_diagnostics(
     check_duplicate_top_level(&top_level, source, index, &mut out);
     check_package(root, source, expected_package, index, &mut out);
 
-    // Rule (e)/(f): duplicate members and illegal modifier combinations,
-    // over every type declaration (top-level and nested) and every
-    // method/constructor/field declaration in the file — one bounded stack
-    // walk, no re-parsing.
+    // Rule (e)/(f): duplicate members and illegal modifiers, checked for
+    // every type/method/constructor/field via one stack walk.
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if out.len() >= MAX_DIAGNOSTICS {
@@ -120,10 +92,8 @@ pub fn structural_diagnostics(
     out
 }
 
-/// The nearest enclosing type declaration (of any kind) around `node`, or
-/// `None` if `node` isn't nested in one (never true for the callers here,
-/// which only ever call this on a `constructor_declaration`, always a direct
-/// or indirect child of some type's body).
+/// The nearest enclosing type declaration around `node`, or `None` if
+/// `node` isn't nested in one.
 fn enclosing_type(node: Node) -> Option<(Node, TypeKind)> {
     let mut cur = node.parent();
     while let Some(p) = cur {
@@ -135,9 +105,8 @@ fn enclosing_type(node: Node) -> Option<(Node, TypeKind)> {
     None
 }
 
-/// Rule (f): a modifier keyword repeated on one declaration — javac's exact
-/// (terse) wording is `"repeated modifier"`, pointing at the repeated
-/// occurrence.
+/// Rule (f): a modifier keyword repeated on one declaration. javac's
+/// message is the terse `"repeated modifier"`, pointed at the repeat.
 fn check_repeated_modifiers(decl: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) {
     if decl.has_error() {
         return; // the whole declaration is the relevant region, not just `modifiers`
@@ -159,12 +128,10 @@ fn check_repeated_modifiers(decl: Node, index: &LineIndex, out: &mut Vec<Diagnos
     }
 }
 
-/// Rule (f): a forbidden pair of modifier keywords both present on one
-/// declaration — javac's exact wording is `"illegal combination of
-/// modifiers: {first} and {second}"`, naming them in the order they appear
-/// in source (checked against a real `javac`). Pointed at the declaration's
-/// own name (matches this codebase's convention for where diagnostics land,
-/// rather than javac's own caret column — see the task report).
+/// Rule (f): a forbidden pair of modifier keywords on one declaration.
+/// javac's message is `"illegal combination of modifiers: {first} and
+/// {second}"`, naming them in source order; pointed at the declaration's
+/// name rather than javac's caret column.
 fn check_modifier_combo(
     decl: Node,
     a: &str,
@@ -198,11 +165,11 @@ fn check_modifier_combo(
     ));
 }
 
-/// Rule (f): a method body's legality given its modifiers and enclosing type
-/// — two distinct javac messages (checked against a real `javac`):
-/// - An interface method with a body but none of `default`/`static`/
-///   `private`: `"interface abstract methods cannot have body"`.
-/// - An explicitly `abstract` method (in a class/enum/record) with a body:
+/// Rule (f): a method body's legality given its modifiers and enclosing
+/// type — two distinct javac messages:
+/// - Interface method with a body but no `default`/`static`/`private`:
+///   `"interface abstract methods cannot have body"`.
+/// - Explicit `abstract` method (class/enum/record) with a body:
 ///   `"abstract methods cannot have a body"`.
 fn check_method_body_shape(
     method: Node,
@@ -243,30 +210,25 @@ fn check_method_body_shape(
 }
 
 /// Rule (e): duplicate same-name fields and duplicate method signatures
-/// among `ty`'s own directly-declared members (never nested types' members
-/// — those are checked independently when the stack walk visits them).
+/// among `ty`'s own directly-declared members; nested types are checked
+/// separately when the stack walk visits them.
 fn check_duplicate_members(ty: Node, source: &str, index: &LineIndex, out: &mut Vec<Diagnostic>) {
-    let Some(decl) = TypeDecl::from_node(ty, source, 0) else {
+    let Some(decl) = TypeDecl::from_node(ty, source, 0, None) else {
         return;
     };
     let owner_kw = member_owner_keyword(decl.kind);
     let owner_name = decl.name;
     let members = decl.own_members();
 
-    // Fields: only genuine body-declared fields (`variable_declarator`
-    // nodes) — record components share `MemberKind::Field` but are shaped as
-    // `formal_parameter` nodes and live in the record header, not the body;
-    // excluding them keeps this scoped to the brief's "same-name fields".
+    // Only genuine body-declared fields (`variable_declarator` nodes);
+    // record components are shaped as `formal_parameter` and excluded.
     let mut seen_fields: HashSet<&str> = HashSet::new();
     for m in members
         .iter()
         .filter(|m| m.kind == MemberKind::Field && m.node.kind() == "variable_declarator")
     {
-        // A malformed initializer (e.g. `int x = ;`) parses as an `ERROR`
-        // node that is a *sibling* of the `variable_declarator` under the
-        // enclosing `field_declaration`/`constant_declaration`, not a
-        // descendant of the declarator itself — check the parent too so
-        // that ambiguity isn't missed.
+        // A malformed initializer's `ERROR` node is a sibling of the
+        // `variable_declarator`, not a descendant — check the parent too.
         let field_ok = m.node.parent().map(|p| !p.has_error()).unwrap_or(true);
         if m.node.has_error() || !field_ok {
             continue;
@@ -285,13 +247,9 @@ fn check_duplicate_members(ty: Node, source: &str, index: &LineIndex, out: &mut 
         }
     }
 
-    // Methods: exact-duplicate signatures by textually-identical rendered
-    // parameter type names (conservative per the brief — varargs or any
-    // parameter shape other than a plain `formal_parameter` mutes the
-    // comparison for that method rather than risk a false match on erasure
-    // nuances). `annotation_type_element_declaration` shares `MemberKind::
-    // Method` but has no `parameters` field at all, so it's naturally
-    // excluded by `param_types_text` returning `None` for it.
+    // Methods: duplicate signatures by exact textual parameter-type
+    // match. Varargs or non-plain parameters silence the comparison for
+    // that method, staying conservative on ambiguous shapes.
     let mut seen_methods: HashSet<(&str, Vec<&str>)> = HashSet::new();
     for m in members
         .iter()
@@ -320,10 +278,10 @@ fn check_duplicate_members(ty: Node, source: &str, index: &LineIndex, out: &mut 
     }
 }
 
-/// The keyword javac uses in "already defined in {kw} {name}" messages —
-/// verified against a real `javac` per type kind. Notably `@interface`
-/// reports as `"class"` here (unlike the rule-(a) filename message, where it
-/// reports as `"interface"` — an internal javac inconsistency, not a typo).
+/// The keyword javac uses in "already defined in {kw} {name}" messages.
+/// `@interface` reports as `"class"` here, unlike the rule-(a) filename
+/// message where it reports as `"interface"` — a real javac
+/// inconsistency, not a bug here.
 fn member_owner_keyword(kind: TypeKind) -> &'static str {
     match kind {
         TypeKind::Class | TypeKind::Annotation => "class",
@@ -333,10 +291,9 @@ fn member_owner_keyword(kind: TypeKind) -> &'static str {
     }
 }
 
-/// The rendered type-reference text of each plain (non-vararg) parameter in
-/// `decl`'s `parameters` list, in order — `None` if `decl` has no parameter
-/// list, any parameter isn't a plain `formal_parameter` (varargs/receiver),
-/// or the parameter list carries a parse error.
+/// The rendered type text of each plain (non-vararg) parameter in
+/// `decl`'s parameter list, in order. `None` if any parameter isn't a
+/// plain `formal_parameter`, or the list has a parse error.
 fn param_types_text<'t>(decl: Node<'t>, source: &'t str) -> Option<Vec<&'t str>> {
     let params = decl.child_by_field_name("parameters")?;
     if params.has_error() {
@@ -390,13 +347,10 @@ fn check_duplicate_params(
     }
 }
 
-/// Rule (a)/(b) (JLS §7.6): every **public** top-level type whose name
-/// doesn't match `filename` is an error — javac's exact wording, checked
-/// against a real `javac` (see the task report). Applying this to *every*
-/// top-level type (not just the first) is what gives rule (b) "more than one
-/// public type per file" for free: at most one type can share the file's
-/// stem, so every other public type necessarily mismatches and is flagged by
-/// this same loop, with the same message javac itself uses there.
+/// Rule (a)/(b) (JLS §7.6): every public top-level type whose name
+/// doesn't match `filename` is an error. Checking every type, not just
+/// the first, also catches rule (b) ("more than one public type per
+/// file") for free, since at most one can match the file's stem.
 fn check_filename(
     top_level: &[Node],
     source: &str,
@@ -433,9 +387,9 @@ fn check_filename(
     }
 }
 
-/// The keyword javac uses in the rule-(a) "is public, should be declared..."
-/// message — verified against a real `javac` per type kind. Notably
-/// `record` reports as `"class"` and `@interface` reports as `"interface"`.
+/// The keyword javac uses in the rule-(a) "is public, should be
+/// declared..." message. `record` reports as `"class"`; `@interface`
+/// reports as `"interface"`.
 fn filename_keyword(kind: TypeKind) -> &'static str {
     match kind {
         TypeKind::Class | TypeKind::Record => "class",
@@ -472,13 +426,9 @@ fn check_duplicate_top_level(
 }
 
 /// Rule (c): the file's declared package vs. what its location under a
-/// discovered source root implies. **Not** verbatim `javac` output — a real
-/// `javac` batch/Maven-style invocation (source files passed explicitly,
-/// never resolved via `-sourcepath`) does not error on this at all (checked
-/// against a real `javac`; see the task report). This uses the IDE-style
-/// wording (Eclipse/IntelliJ) that real Java tooling emits for the same
-/// convention violation, since the brief's motivating case is exactly that
-/// tooling-level check, not a raw batch-`javac` diagnostic.
+/// discovered source root implies. Uses IDE-style (Eclipse/IntelliJ)
+/// wording, not javac's — a batch `javac` invocation never errors on
+/// this at all.
 fn check_package(
     root: Node,
     source: &str,
@@ -495,14 +445,11 @@ fn check_package(
         .filter(|c| c.kind() == "package_declaration")
         .collect();
     if decls.len() != 1 {
-        // 0 declarations is handled below via the "missing" branch; 2+ is
-        // rule "multiple package declarations" (deferred — see report) and
-        // ambiguous for this check, so stay silent rather than guess which
-        // one is authoritative.
+        // 2+ package declarations is ambiguous for this check: stay
+        // silent rather than guess which one is authoritative.
         if decls.is_empty() {
-            // No specific node to scope an error-guard to for an *absent*
-            // declaration, so fall back to the whole file: any parse error
-            // means we can't trust that there's really no package here.
+            // No node to scope an error-guard to for an absent
+            // declaration, so fall back to checking the whole file.
             if !expected.is_empty() && !root.has_error() {
                 out.push(diagnostic(
                     index.range(root.child(0).unwrap_or(root)),
@@ -532,10 +479,8 @@ fn check_package(
     }
 }
 
-/// The dotted package path text of a `package_declaration` node (its child
-/// identifier/scoped-identifier, verbatim from source — no need to
-/// reconstruct it token-by-token since a clean `package_declaration` always
-/// renders back to exactly its dotted path plus the `package`/`;` around it).
+/// The dotted package path text of a `package_declaration` node — its
+/// child identifier/scoped-identifier, taken verbatim from source.
 fn package_path<'t>(decl: Node<'t>, source: &'t str) -> Option<&'t str> {
     let mut cursor = decl.walk();
     let path_node = decl
@@ -652,10 +597,8 @@ mod tests {
 
     #[test]
     fn filename_check_stays_silent_when_the_type_itself_has_a_parse_error() {
-        // The class body is malformed (an incomplete expression), so the
-        // whole `class_declaration` node carries the error even though its
-        // name/modifiers are intact — must stay silent despite the genuine
-        // mismatch.
+        // The malformed body means the whole `class_declaration` carries
+        // the error, even though name/modifiers are intact.
         let msgs = diags(
             "public class Wrong {\n  int x = ;\n}\n",
             Some("Other.java"),
@@ -781,10 +724,8 @@ mod tests {
 
     #[test]
     fn duplicate_field_stays_silent_when_one_declarator_has_a_parse_error() {
-        // `int x = ;` parses as a `field_declaration` with a sibling `ERROR`
-        // node (the missing initializer) — the error lands on the enclosing
-        // `field_declaration`, not the `variable_declarator` itself, so the
-        // guard must check the right node.
+        // The missing initializer's `ERROR` node is a sibling under the
+        // `field_declaration`, not inside the `variable_declarator`.
         let msgs = structural("class C {\n    int x = ;\n    int x;\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
     }
@@ -836,18 +777,16 @@ mod tests {
 
     #[test]
     fn varargs_method_is_never_compared_conservatively() {
-        // Same textual "signature" modulo varargs shape — conservative per
-        // the brief: varargs mutes the comparison rather than risk a false
-        // match on erasure nuances.
+        // Same signature modulo varargs shape: varargs mutes the
+        // comparison rather than risk a false match.
         let msgs = structural("class C {\n    void m(int... a) {}\n    void m(int... a) {}\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
     }
 
     #[test]
     fn duplicate_method_stays_silent_when_one_declaration_has_a_parse_error() {
-        // `return }` (no semicolon) leaves an `ERROR` node inside the first
-        // method's own `block`, so its `method_declaration` node itself
-        // carries the error.
+        // The missing semicolon leaves an `ERROR` node inside the first
+        // method's `block`, so its `method_declaration` carries the error.
         let msgs = structural("class C {\n    void m(int a) { return }\n    void m(int a) {}\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
     }
@@ -932,10 +871,8 @@ mod tests {
 
     #[test]
     fn modifier_combo_stays_silent_when_the_declaration_has_a_parse_error() {
-        // `return }` (no semicolon) leaves an `ERROR` node inside this
-        // method's own `block`, so its `method_declaration` node — the
-        // relevant region for this check, not just its `modifiers` child —
-        // carries the error, despite `abstract final` itself being intact.
+        // The missing semicolon puts an `ERROR` node inside the method's
+        // `block`, so the whole `method_declaration` carries the error.
         let msgs =
             structural("abstract class C {\n    abstract final void m(int a) { return }\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
@@ -949,10 +886,8 @@ mod tests {
 
     #[test]
     fn repeated_modifier_stays_silent_when_the_declaration_has_a_parse_error() {
-        // The class body is malformed (an incomplete field initializer), so
-        // the whole `class_declaration` node — the relevant region for the
-        // repeated-modifier check — carries the error, despite the
-        // `public public` repetition itself being intact.
+        // The malformed field initializer means the whole
+        // `class_declaration` carries the error.
         let msgs = structural("public public class DupMod {\n    int x = ;\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
     }
@@ -974,10 +909,8 @@ mod tests {
 
     #[test]
     fn method_body_shape_stays_silent_when_the_declaration_has_a_parse_error() {
-        // `return }` (no semicolon) leaves an `ERROR` node inside the
-        // method's own `block`, so its `method_declaration` node carries the
-        // error — the body-shape check must not fire despite the genuine
-        // violation (a body on a plain interface method).
+        // The missing semicolon leaves an `ERROR` node inside the
+        // method's `block`, so the check must stay silent.
         let msgs = structural("interface I {\n    void m() { return }\n}\n");
         assert!(msgs.is_empty(), "{msgs:?}");
     }

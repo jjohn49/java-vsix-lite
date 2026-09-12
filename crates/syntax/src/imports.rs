@@ -64,6 +64,11 @@ impl Imports {
         self.wildcards.iter().any(|w| w == pkg)
     }
 
+    /// Package prefixes from wildcard (`a.b.*`) imports.
+    pub(crate) fn wildcard_packages(&self) -> impl Iterator<Item = &str> {
+        self.wildcards.iter().map(String::as_str)
+    }
+
     /// The file's own package, if declared.
     pub(crate) fn package(&self) -> Option<&str> {
         self.package.as_deref()
@@ -71,13 +76,20 @@ impl Imports {
 
     /// Candidate FQNs for a simple type name, in resolution-priority order:
     /// explicit import, same package, each wildcard package, then `java.lang`.
+    ///
+    /// A file with no `package` declaration is in the *unnamed* package
+    /// (JLS 7.4.2), whose members' binary names are their simple names — so
+    /// the bare name is that file's "same package" candidate. Without it,
+    /// sibling types in the default package resolve to nothing and every
+    /// consumer of this list silently degrades to Unknown.
     pub(crate) fn candidates(&self, simple: &str) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(fqn) = self.single.get(simple) {
             out.push(fqn.clone());
         }
-        if let Some(pkg) = &self.package {
-            out.push(format!("{pkg}.{simple}"));
+        match &self.package {
+            Some(pkg) => out.push(format!("{pkg}.{simple}")),
+            None => out.push(simple.to_string()),
         }
         for wildcard in &self.wildcards {
             out.push(format!("{wildcard}.{simple}"));
@@ -87,13 +99,10 @@ impl Imports {
     }
 }
 
-/// Extract the dotted path from a `package x.y;` / `import x.y.Z;` declaration:
-/// strip the keyword and the trailing `;`, and collapse any stray whitespace.
+/// Extract the dotted path from a `package x.y;` / `import x.y.Z;` declaration.
 ///
-/// `pub(crate)`: also used by `references.rs` to recover an arbitrary
-/// declaration's own *actual* package (from its declaring document's
-/// `package_declaration`, walked to independent of any particular `Imports`
-/// instance) for package-aware type-reference confirmation.
+/// Also used by `references.rs` to recover a declaration's actual package
+/// independent of any particular `Imports` instance.
 pub(crate) fn dotted_path(text: &str, keyword: &str) -> Option<String> {
     let rest = text.trim().strip_prefix(keyword)?;
     let path: String = rest

@@ -1,6 +1,5 @@
-//! Diagnostics and diagnostic publication: syntax/unresolved-member/
-//! structural diagnostics for a single document, republishing every open
-//! document's diagnostics after a classpath rebuild, and the `javac`
+//! Diagnostics for a single document (syntax, unresolved members, structural
+//! checks), republishing after classpath rebuilds, and the `javac`
 //! check-project orchestration that merges compiler diagnostics in.
 
 use std::collections::{HashMap, HashSet};
@@ -13,6 +12,7 @@ use tower_lsp_server::ls_types::*;
 
 use crate::backend::{Backend, Document};
 use crate::javac;
+use crate::project_symbols::{CombinedSymbols, ProjectSymbols};
 use crate::{filename_from_uri, infer_source_root, open_docs, ClasspathSymbols};
 
 /// RAII guard releasing `Backend::javac_running` on drop — see
@@ -23,6 +23,18 @@ impl Drop for JavacRunningGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Which stored `javac` diagnostics `Backend::refresh_open_diagnostics` must
+/// drop as stale before recomputing: a compiler result is only trustworthy
+/// against the exact source it came from.
+pub(crate) enum StaleJavac {
+    /// Nothing about any open document's own source changed (e.g. a
+    /// classpath rebuild) — every stored javac diagnostic is still valid.
+    None,
+    /// Every open document's stored javac diagnostics are stale and are
+    /// dropped before recomputation.
+    AllOpen,
 }
 
 /// The result of the shared javac-invocation machinery ([`Backend::execute_javac_check`]),
@@ -40,10 +52,8 @@ enum CheckExecution {
     },
 }
 
-/// Parse an LSP document URI into a `file:` filesystem path that ends in
-/// `.java`. Uses the URI type's own parser (never manual string surgery) so
-/// percent-encoding and platform path shapes are handled correctly. `None`
-/// for a non-`file:` URI or one that doesn't name a `.java` file.
+/// Parse an LSP document URI into a `file:` path ending in `.java`. Returns
+/// `None` for a non-`file:` URI or one that isn't a `.java` file.
 fn parse_java_file_uri(uri_str: &str) -> Option<PathBuf> {
     let uri: Uri = uri_str.parse().ok()?;
     let path = uri.to_file_path()?.into_owned();
@@ -53,11 +63,8 @@ fn parse_java_file_uri(uri_str: &str) -> Option<PathBuf> {
 }
 
 /// Whether `path` lives under any of `module_roots`. Checks the literal path
-/// first, then the canonicalized path — so a path keyed non-canonically (e.g.
-/// macOS `/var` vs the canonical `/private/var`, as a prior full-project run's
-/// stored diagnostics may be) is still recognized as belonging to a checked
-/// module. A missing/unreadable path falls back to the literal check only (it
-/// can't escape via a symlink if it doesn't resolve).
+/// first, then the canonicalized path, so a non-canonically keyed path (e.g.
+/// macOS `/var` vs `/private/var`) still matches.
 fn path_under_any_module(path: &Path, module_roots: &[PathBuf]) -> bool {
     if module_roots.iter().any(|m| path.starts_with(m)) {
         return true;
@@ -79,30 +86,64 @@ fn uri_is_under_module(uri_str: &str, module_roots: &[PathBuf]) -> bool {
     path_under_any_module(path.as_ref(), module_roots)
 }
 
-/// Native codes `javac` can independently confirm: the type-directed return
-/// and initializer checks and the unreachable-statement check. `jvl.unused`
-/// is deliberately absent — javac has no equivalent diagnostic, so an unused
-/// warning is never deduplicated.
-const JAVAC_CONFIRMABLE_CODES: [&str; 4] = [
+/// Native codes `javac` can independently confirm. `jvl.unused` is
+/// deliberately absent since javac has no equivalent diagnostic.
+const JAVAC_CONFIRMABLE_CODES: [&str; 6] = [
     jvl_syntax::INCOMPATIBLE_RETURN_CODE,
     jvl_syntax::INCOMPATIBLE_ASSIGNMENT_CODE,
     jvl_syntax::UNREACHABLE_CODE,
     jvl_syntax::CANNOT_FIND_SYMBOL_CODE,
+    jvl_syntax::INVALID_INVOCATION_CODE,
+    jvl_syntax::INVALID_INSTANTIATION_CODE,
 ];
 
-/// Whether two first message lines carry the same payload. javac folds
-/// `required:`/`found:` continuation lines into its message, so only the
-/// first line is comparable; the `incompatible types: ` prefix strips ONLY
-/// when present on BOTH sides — otherwise the lines compare verbatim (javac
-/// emits `unreachable statement` exactly, with no prefix).
+/// Whether two first message lines carry the same payload. Only the first
+/// line is compared since javac folds continuation lines in; the
+/// `incompatible types: ` prefix strips only when present on both sides.
 fn equivalent_payload(native: &str, javac: &str) -> bool {
     let native = native.lines().next().unwrap_or("");
     let javac = javac.lines().next().unwrap_or("");
-    // javac's message is exactly `cannot find symbol` (the `symbol: variable
-    // x` detail lives on folded continuation lines); the native message
-    // carries the name inline — prefix equivalence is the comparable part.
+    // javac's message is exactly `cannot find symbol`; the detail lives on
+    // folded continuation lines, so only the prefix is compared.
     if native.starts_with("cannot find symbol") && javac.starts_with("cannot find symbol") {
         return true;
+    }
+    // Invocation/instantiation families: javac says "no suitable method
+    // found for", "no suitable constructor found for", "is abstract; cannot be
+    // instantiated", "has private access in", "reference to X is ambiguous".
+    // Our range already overlaps on the same line (checked by the caller), so
+    // family agreement is enough.
+    let native_family = if native.starts_with("no applicable method")
+        || native.starts_with("ambiguous method call")
+    {
+        Some("method")
+    } else if native.starts_with("no applicable constructor")
+        || native.starts_with("ambiguous constructor call")
+        || native.starts_with("cannot instantiate")
+        || native.contains("is not accessible")
+        || native.contains("enclosing instance required")
+    {
+        Some("constructor")
+    } else {
+        None
+    };
+    let javac_family = if javac.starts_with("no suitable method found")
+        || (javac.contains("reference to") && javac.contains("is ambiguous"))
+        || (javac.starts_with("method ") && javac.contains("cannot be applied"))
+    {
+        Some("method")
+    } else if javac.starts_with("no suitable constructor found")
+        || javac.contains("cannot be instantiated")
+        || javac.contains("has private access")
+        || (javac.starts_with("constructor ") && javac.contains("cannot be applied"))
+        || javac.contains("an enclosing instance that contains")
+    {
+        Some("constructor")
+    } else {
+        None
+    };
+    if let (Some(n), Some(j)) = (native_family, javac_family) {
+        return n == j;
     }
     match (
         native.strip_prefix("incompatible types: "),
@@ -113,13 +154,9 @@ fn equivalent_payload(native: &str, javac: &str) -> bool {
     }
 }
 
-/// Whether `javac` confirms `native` as the same error. Deliberately narrow —
-/// ALL of: the native entry carries one of [`JAVAC_CONFIRMABLE_CODES`], both
-/// severities are ERROR, the ranges overlap on the same line, and the first
-/// message lines carry an equivalent payload ([`equivalent_payload`]).
-/// Anything less (a syntax/structural/member rule, an unused warning, a
-/// different line, a disjoint range, a different payload) is never treated
-/// as the same error.
+/// Whether `javac` confirms `native` as the same error: requires a
+/// confirmable code, both severities ERROR, overlapping ranges on the same
+/// line, and an equivalent payload ([`equivalent_payload`]).
 fn javac_confirms_native(native: &Diagnostic, javac: &Diagnostic) -> bool {
     matches!(
         &native.code,
@@ -132,16 +169,8 @@ fn javac_confirms_native(native: &Diagnostic, javac: &Diagnostic) -> bool {
         && equivalent_payload(&native.message, &javac.message)
 }
 
-/// Merge a file's stored `javac` diagnostics into its freshly computed
-/// native set, preferring the native entry for an equivalent current
-/// result: a native diagnostic some javac diagnostic confirms (see
-/// [`javac_confirms_native`]) is left exactly as it was — never swapped for
-/// javac's copy, so a save never flips its `source` field or otherwise
-/// changes what's already showing (equivalence already proves the payload
-/// is the same). Only javac diagnostics that confirm no existing native
-/// entry are appended, in their original order, after every native. Native
-/// order and content are otherwise untouched; unrelated diagnostics are
-/// never deduplicated.
+/// Keep native diagnostics that javac confirms, then append unmatched compiler
+/// diagnostics. Native entries always remain first and unchanged.
 fn merge_javac_diagnostics(diagnostics: &mut Vec<Diagnostic>, javac: Vec<Diagnostic>) {
     let unmatched: Vec<Diagnostic> = javac
         .into_iter()
@@ -155,30 +184,58 @@ fn merge_javac_diagnostics(diagnostics: &mut Vec<Diagnostic>, javac: Vec<Diagnos
 }
 
 impl Backend {
-    /// Recompute and republish diagnostics for every currently open
-    /// document — used after a classpath swap, since
-    /// unresolved-member diagnostics depend on it and may change once new
-    /// dependency types become resolvable.
-    ///
-    /// Locks `self.documents` exactly once: every open document's
-    /// diagnostics (unresolved-member diagnostics fully included — see
-    /// `compute_diagnostics`) are computed into an owned snapshot while the
-    /// lock is held, then the lock is dropped before the `publish_diagnostics`
-    /// `.await`s that follow, so it is never held across an `.await`.
+    /// Recompute and republish diagnostics for every open document, used
+    /// after a classpath swap since unresolved-member diagnostics depend on
+    /// it. A thin wrapper: no stored `javac` diagnostic is invalidated by a
+    /// classpath swap alone, so it never drops any.
     pub(crate) async fn republish_all_diagnostics(&self) {
-        let snapshot: Vec<(String, Vec<Diagnostic>, i32)> = {
+        self.refresh_open_diagnostics(StaleJavac::None).await;
+    }
+
+    /// Recompute open-document diagnostics from one symbol snapshot, aborting
+    /// publication if a newer semantic generation wins. The document lock is
+    /// released before awaiting client publishes.
+    pub(crate) async fn refresh_open_diagnostics(&self, stale_javac_for: StaleJavac) {
+        self.ensure_workspace_index().await;
+        let classpath = self.classpath();
+        let (snapshot, generation) = {
             let docs = self.documents.lock().await;
-            docs.iter()
-                .map(|(uri_str, doc)| {
+            if matches!(stale_javac_for, StaleJavac::AllOpen) {
+                let mut javac = self
+                    .javac_diagnostics
+                    .lock()
+                    .expect("javac diagnostics poisoned");
+                for uri in docs.keys() {
+                    javac.remove(uri);
+                }
+            }
+            let generation = self
+                .semantic_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let symbols = CombinedSymbols(
+                ProjectSymbols::new(self, &docs),
+                ClasspathSymbols(Arc::clone(&classpath)),
+            );
+            let snapshot: Vec<(String, Vec<Diagnostic>, i32)> = docs
+                .iter()
+                .map(|(uri, doc)| {
                     (
-                        uri_str.clone(),
-                        self.compute_diagnostics(&docs, uri_str),
+                        uri.clone(),
+                        self.compute_diagnostics(&docs, uri, &symbols),
                         doc.version,
                     )
                 })
-                .collect()
+                .collect();
+            (snapshot, generation)
         };
         for (uri_str, diagnostics, version) in snapshot {
+            if self
+                .semantic_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != generation
+            {
+                return;
+            }
             if let Ok(uri) = uri_str.parse::<Uri>() {
                 self.client
                     .publish_diagnostics(uri, diagnostics, Some(version))
@@ -187,42 +244,29 @@ impl Backend {
         }
     }
 
-    /// Syntax, immediate semantic, and structural diagnostics for a document
-    /// already stored under `uri`, plus any `javac` diagnostics still on file
-    /// for `uri` — merged in via [`merge_javac_diagnostics`], which removes a
-    /// native error that an equivalent compiler result confirms and
-    /// appends every javac entry, never clobbering anything unrelated.
-    /// Unlike the native
-    /// diagnostics, the `javac` diagnostics don't require `uri` to be an open
-    /// document: a checked file the editor never opened still gets its
-    /// diagnostics published (see `Backend::publish_javac_diagnostics`).
+    /// Compute native diagnostics for a stored document and merge saved javac
+    /// results. `symbols` is prebuilt, keeping this function synchronous and IO-free.
     pub(crate) fn compute_diagnostics(
         &self,
         docs: &HashMap<String, Document>,
         uri: &str,
+        symbols: &dyn jvl_syntax::SymbolSource,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = match docs.get(uri) {
             Some(doc) => {
                 let index = LineIndex::new(&doc.text, self.encoding());
                 let mut d = jvl_syntax::syntax_diagnostics(&doc.tree, &index);
                 let open = open_docs(docs, uri, doc);
-                // Classpath-only, not `CombinedSymbols` — this is a
-                // synchronous fn on the didOpen/didChange hot path, and
-                // `ProjectSymbols` needs an async `ensure_workspace_index`
-                // pass first. Conservative semantic checks stay silent when
-                // project/classpath resolution is incomplete, so a closed-file
-                // project type is a missed diagnosis, never a false positive.
-                let symbols = ClasspathSymbols(self.classpath());
-                // The stored key already round-tripped through the client's
-                // URI, so this parse cannot realistically fail; a failure
-                // would only skip the semantic pass, never panic.
+                // This parse cannot realistically fail since the key
+                // already round-tripped through the client's URI; a
+                // failure would only skip the semantic pass, never panic.
                 if let Ok(parsed_uri) = uri.parse::<Uri>() {
                     d.extend(jvl_syntax::semantic_diagnostics(
                         &open,
                         0,
                         &index,
                         &parsed_uri,
-                        &symbols,
+                        symbols,
                         self.unresolved_member_diagnostics
                             .get()
                             .copied()
@@ -259,20 +303,8 @@ impl Backend {
         Duration::from_secs(self.javac_timeout_secs.get().copied().unwrap_or(120))
     }
 
-    /// The check-project run (`jvl.checkProject.run`, forwarded by the
-    /// extension's trust-gated `java-vsix-lite.checkProject`) — see the module
-    /// doc comment on `javac` for the security invariants this must never
-    /// violate.
-    ///
-    /// `scope` selects the whole workspace (the manual command — unchanged
-    /// behavior, full diagnostic-map replacement) or a set of saved documents'
-    /// modules (the automatic on-save/on-load check — compiles only affected
-    /// modules with sibling sources reachable via `-sourcepath`, and replaces
-    /// diagnostics only within those modules). See [`javac::JavacCheckScope`].
-    ///
-    /// Concurrency (one run at a time) is enforced by the caller
-    /// (`execute_command`), which claims `javac_running` before calling this
-    /// and releases it afterward; this method assumes that's already done.
+    /// Run the javac check for the full project or selected saved-file modules.
+    /// The caller enforces single-flight execution and Workspace Trust.
     pub(crate) async fn run_check_project(
         &self,
         scope: javac::JavacCheckScope,
@@ -285,9 +317,8 @@ impl Backend {
         }
     }
 
-    /// The full-workspace check: every discovered source root compiled as one
-    /// explicit input set, replacing the entire javac diagnostic map. This is
-    /// the manual `Java: Check Project (javac)` behavior, unchanged.
+    /// The full-workspace check: every discovered source root compiled as
+    /// one explicit input set, replacing the entire javac diagnostic map.
     async fn run_check_full_project(&self) -> serde_json::Value {
         let Some(project_root) = self.project_root() else {
             return serde_json::json!({
@@ -296,10 +327,9 @@ impl Backend {
             });
         };
         let classpath = self.classpath();
-        // Snapshot every open document's version under the SAME lock hold
-        // that derives the source roots: this is the revision baseline the
-        // publication step compares against, so a result computed from these
-        // roots can never be attributed to a newer buffer state.
+        // Snapshot every open document's version under the same lock that
+        // derives the source roots, so results are never attributed to a
+        // newer buffer state.
         let (mut roots, start_versions) = {
             let docs = self.documents.lock().await;
             let mut roots = self.source_roots(&docs, &project_root);
@@ -310,13 +340,13 @@ impl Backend {
                 .collect();
             (roots, start_versions)
         };
-        // Cover every Maven/Gradle module in the workspace, not just the root
-        // module + currently-open files — so a full-workspace check is actually
-        // complete on a multi-module project (and the scoped-check fallback that
-        // routes here is authoritative). `collect_source_files` dedups roots.
-        // Uses the project root as-is (not canonicalized): the paths must stay
-        // in the same space as the client's document URIs so published
-        // diagnostics attach to the right files.
+        let start_generation = self
+            .provider_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Cover every Maven/Gradle module in the workspace, not just the
+        // root module, so a multi-module check is complete. Uses the
+        // project root as-is (not canonicalized), since paths must stay in
+        // the same space as client document URIs.
         roots.extend(javac::discover_workspace_source_roots(&project_root));
         match self
             .execute_javac_check(&project_root, roots, Vec::new())
@@ -328,6 +358,16 @@ impl Backend {
                 error_count,
                 warning_count,
             } => {
+                if self
+                    .provider_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != start_generation
+                {
+                    // A provider changed while javac ran: its output describes
+                    // a workspace that no longer exists. Drop it; the client
+                    // re-queues and the next run (≤30s) checks the new state.
+                    return serde_json::json!({ "status": "stale" });
+                }
                 // Whole-project run: the map is authoritative for every file.
                 self.publish_javac_diagnostics(grouped, &start_versions)
                     .await;
@@ -340,21 +380,9 @@ impl Backend {
         }
     }
 
-    /// The scoped (automatic) check: resolve each saved document to its
-    /// Maven/Gradle module, compile only those modules (with every workspace
-    /// source root on `-sourcepath` so sibling sources resolve without being
-    /// compiled eagerly), and replace javac diagnostics only within the
-    /// checked modules. A malformed/empty request, a non-`.java`/non-`file:`
-    /// URI, or a URI outside the workspace is a hard error for the whole
-    /// request — never silently widened into a project compile. A URI that
-    /// simply can't be resolved to any module/source root (`unsupported-
-    /// layout`) is different: it is silently left unchecked rather than
-    /// vetoing the rest of an otherwise-valid batch (a real editor session
-    /// routinely batches an unrelated stray document alongside legitimate
-    /// saves/opens) — the request only fails that way when EVERY uri in the
-    /// batch is unsupported. A compiler diagnostic against a file *outside*
-    /// the checked modules means the scoped view is incomplete, so the run
-    /// transparently falls back to one full-project check.
+    /// Compile modules containing the saved documents and replace only their
+    /// diagnostics. Invalid URIs fail; unsupported modules are skipped unless
+    /// none resolve, and diagnostics outside the scope trigger a full check.
     async fn run_check_scoped(&self, document_uris: Vec<String>) -> serde_json::Value {
         if document_uris.is_empty() {
             return serde_json::json!({
@@ -368,10 +396,9 @@ impl Backend {
                 "message": "no project root (open a workspace folder or a file under a Maven/Gradle project)",
             });
         };
-        // Canonicalized workspace root — used ONLY for the security containment
-        // check (which must resolve symlinks). Module resolution, source
-        // collection, and diagnostic keying all use the *original* path space
-        // so published diagnostics attach to the client's document URIs.
+        // Canonicalized workspace root, used only for the security
+        // containment check (must resolve symlinks); module resolution and
+        // diagnostic keying stay in the original path space.
         let Ok(workspace_canonical) = std::fs::canonicalize(&project_root) else {
             return serde_json::json!({
                 "status": "error",
@@ -379,11 +406,9 @@ impl Backend {
             });
         };
 
-        // Resolve every saved document to an in-workspace `.java` file and the
-        // module that owns it. A non-`.java`/non-`file:` URI or one outside
-        // the workspace is a hard error for the whole request (never silently
-        // widened into a project compile); a URI with no recognizable module
-        // is instead skipped (see `unsupported_layout` below).
+        // Resolve each saved document to an in-workspace `.java` file and
+        // its owning module; unsupported layouts are collected in
+        // `unsupported_layout` below.
         let mut module_roots: Vec<PathBuf> = Vec::new();
         let mut explicit_roots: Vec<PathBuf> = Vec::new();
         let mut unsupported_layout: Option<String> = None;
@@ -398,9 +423,9 @@ impl Backend {
                         "message": format!("not a file: .java URI: {uri_str}"),
                     });
                 };
-                // Security gate only: reject anything whose real (symlink-
-                // resolved) path escapes the workspace. The canonical result is
-                // deliberately NOT used for resolution below.
+                // Security gate only: reject any path whose symlink-resolved
+                // form escapes the workspace; the canonical result isn't
+                // used for resolution below.
                 if javac::canonical_within_workspace(&file, &workspace_canonical).is_none() {
                     return serde_json::json!({
                         "status": "error",
@@ -411,12 +436,10 @@ impl Backend {
                 let module_root = match javac::nearest_module_root(&file, &project_root) {
                     Some(root) => root,
                     None => {
-                        // No build marker up to the workspace root: fall back to
-                        // the workspace root only if the file sits under a
-                        // conventional source root there; otherwise this one
-                        // uri has an unsupported layout for a scoped check —
-                        // leave it unchecked and keep resolving the rest of
-                        // the batch (see the doc comment above).
+                        // No build marker up to the workspace root: fall
+                        // back to it only if the file sits under a
+                        // conventional source root there, otherwise mark
+                        // this URI unsupported and keep resolving the rest.
                         let src_roots = javac::conventional_source_roots(&project_root);
                         if src_roots.iter().any(|r| file.starts_with(r)) {
                             project_root.clone()
@@ -433,10 +456,9 @@ impl Backend {
                     module_roots.push(module_root.clone());
                     explicit_roots.extend(javac::conventional_source_roots(&module_root));
                 }
-                // A nonstandard-layout file may sit outside src/main|test/java:
-                // add its confidently inferred source root too, but only when it
-                // stays inside this module so a scoped compile can't pull in
-                // unrelated trees.
+                // Add a nonstandard-layout file's inferred source root too,
+                // but only if it stays inside this module, so a scoped
+                // compile can't pull in unrelated trees.
                 if let Some(doc) = docs.get(uri_str) {
                     if let Some(inferred) = infer_source_root(uri_str, &doc.tree, &doc.text) {
                         if inferred.starts_with(&module_root) && !explicit_roots.contains(&inferred)
@@ -447,8 +469,7 @@ impl Backend {
                 }
             }
             if module_roots.is_empty() {
-                // Every uri in the batch was unsupported — nothing to check,
-                // unlike a partial batch (see the doc comment above).
+                // Every uri in the batch was unsupported; nothing to check.
                 let uri_str = unsupported_layout.expect(
                     "non-empty document_uris with no resolved module roots implies at least one unsupported-layout uri",
                 );
@@ -463,6 +484,9 @@ impl Backend {
                 .map(|(uri_str, doc)| (uri_str.clone(), doc.version))
                 .collect()
         };
+        let start_generation = self
+            .provider_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         // Sibling-module sources on `-sourcepath`: a bounded, directory-only
         // scan for module source roots, plus any dependency source roots.
@@ -480,10 +504,19 @@ impl Backend {
                 error_count,
                 warning_count,
             } => {
-                // If javac flagged a source outside the checked modules (a
-                // sibling reached through -sourcepath), the scoped result is
-                // incomplete — never publish a partial/misleading result.
-                // Redo the run as a full project check instead.
+                if self
+                    .provider_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != start_generation
+                {
+                    // A provider changed while javac ran: its output describes
+                    // a workspace that no longer exists. Drop it; the client
+                    // re-queues and the next run (≤30s) checks the new state.
+                    return serde_json::json!({ "status": "stale" });
+                }
+                // If javac flagged a source outside the checked modules,
+                // the scoped result is incomplete, so redo the run as a
+                // full project check instead.
                 let external = grouped
                     .keys()
                     .any(|path| !path_under_any_module(Path::new(path), &module_roots));
@@ -502,11 +535,10 @@ impl Backend {
         }
     }
 
-    /// Shared javac-invocation core for both scopes: locate `javac`, collect
-    /// the explicit source files from `explicit_roots`, apply the JDK/project
-    /// source-level and jdk-too-old guard (keyed off `release_root`), run the
-    /// compiler with `sourcepath_roots` on `-sourcepath`, and parse the result.
-    /// Publishing is left to the caller (project- vs module-scoped).
+    /// Shared javac-invocation core for both scopes: locate `javac`,
+    /// collect explicit source files, apply the JDK/project source-level
+    /// guard, run the compiler, and parse the result. Publishing is left to
+    /// the caller.
     async fn execute_javac_check(
         &self,
         release_root: &Path,
@@ -533,9 +565,9 @@ impl Backend {
             }));
         }
 
-        // JDK level: the JDK home is `<home>/bin/javac`; read its feature
-        // version (no process spawn). Project level: read statically from the
-        // build files. Together they pick the language level below.
+        // JDK level is read from `<home>/bin/javac`'s feature version (no
+        // process spawn); project level is read statically from the build
+        // files. Together they pick the language level below.
         let jdk_release = javac_path
             .parent()
             .and_then(|bin| bin.parent())
@@ -543,9 +575,8 @@ impl Backend {
         let project_release = jvl_classpath::project_java_release(release_root);
 
         // If the project targets a newer Java than the newest detected JDK,
-        // javac can't compile it and would emit a flood of "not supported in
-        // -source N" noise. Publish one clear diagnostic on the build file and
-        // skip the run entirely.
+        // javac would emit a flood of "not supported in -source N" noise.
+        // Publish one clear diagnostic instead and skip the run entirely.
         if let (Some(proj), Some(jdk)) = (project_release, jdk_release) {
             if jdk < proj {
                 self.publish_jdk_too_old(release_root, proj, jdk).await;
@@ -558,10 +589,10 @@ impl Backend {
             }
         }
 
-        // Language level: compile faithfully at the project's declared release
-        // when known (validated against that release's API), enabling preview
-        // only when it matches the JDK's own version; else fall back to the
-        // JDK's level with preview on; or a bare compile when neither is known.
+        // Compile at the project's declared release when known, enabling
+        // preview only if it matches the JDK version; otherwise fall back
+        // to the JDK's level with preview on, or a bare compile if neither
+        // is known.
         let source_level = match (project_release, jdk_release) {
             (Some(release), Some(jdk)) => javac::SourceLevel::Release {
                 release,
@@ -613,11 +644,9 @@ impl Backend {
         }
     }
 
-    /// Publish a single diagnostic on the project's build file explaining that
-    /// the detected JDK is too old for the project's declared Java level and
-    /// the javac check was skipped. Routed through
-    /// [`Self::publish_javac_diagnostics`] so it clears on the next run like
-    /// any other javac diagnostic.
+    /// Publish a single diagnostic on the project's build file explaining
+    /// the JDK is too old and the javac check was skipped. Routed through
+    /// [`Self::publish_javac_diagnostics`] so it clears on the next run.
     async fn publish_jdk_too_old(&self, project_root: &Path, project: u32, jdk: u32) {
         let Some(build_file) = ["pom.xml", "build.gradle", "build.gradle.kts"]
             .iter()
@@ -660,35 +689,16 @@ impl Backend {
         self.publish_javac_diagnostics(map, &start_versions).await;
     }
 
-    /// Replace the javac-diagnostics set wholesale with `new_diags`
-    /// (keyed by filesystem path, as `javac` echoed it) and (re)publish
-    /// every affected URI — both newly (or still) diagnosed files and any
-    /// file that had javac diagnostics before this run but doesn't anymore
-    /// (which must be published empty-of-javac to actually clear in the
-    /// client's Problems panel; LSP has no "leave unchanged" — an omitted
-    /// publish just means "nothing changed", not "clear"). Merges with each
-    /// file's other diagnostics via `compute_diagnostics`, never clobbering.
-    ///
-    /// `start_versions` is the caller's open-document version snapshot,
-    /// taken under the documents lock before the compiler ran: a result for
-    /// a file that is open now is discarded unless its start version is
-    /// present and equal to the current `Document.version` (absent or
-    /// different means an edit raced the compile — the result is stale).
-    /// Closed files can't be edited in flight, so they always publish.
-    ///
-    /// Lock order: the revision filter, the javac-map swap, and the
-    /// republish snapshot all happen under ONE `documents` lock hold,
-    /// serializing them against `did_change` (which bumps the version and
-    /// removes the file's javac entry inside its own documents critical
-    /// section). The `javac_diagnostics` guard is scoped shut before
-    /// `compute_diagnostics` re-acquires it per URI, and the documents lock
-    /// is dropped before the publish `.await`s. Live buffers publish with
-    /// `Some(version)`; closed files with `None`.
+    /// Replace the full javac map and republish every affected URI, including
+    /// clean files that need an empty publish. Revision filtering, the map swap,
+    /// and snapshot happen under the document lock; publishing happens afterward.
     async fn publish_javac_diagnostics(
         &self,
         new_diags: HashMap<String, Vec<Diagnostic>>,
         start_versions: &HashMap<String, i32>,
     ) {
+        self.ensure_workspace_index().await;
+        let classpath = self.classpath();
         let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
             .into_iter()
             .filter_map(|(path, diags)| {
@@ -717,10 +727,14 @@ impl Backend {
                 affected.into_iter().collect()
             };
 
+            let symbols = CombinedSymbols(
+                ProjectSymbols::new(self, &docs),
+                ClasspathSymbols(Arc::clone(&classpath)),
+            );
             affected
                 .into_iter()
                 .map(|uri_str| {
-                    let diagnostics = self.compute_diagnostics(&docs, &uri_str);
+                    let diagnostics = self.compute_diagnostics(&docs, &uri_str, &symbols);
                     let version = docs.get(&uri_str).map(|doc| doc.version);
                     (uri_str, diagnostics, version)
                 })
@@ -736,23 +750,16 @@ impl Backend {
         }
     }
 
-    /// Scoped counterpart to [`Self::publish_javac_diagnostics`]: replace the
-    /// javac diagnostics only for files **beneath `module_roots`**, preserving
-    /// every other module's diagnostics untouched. The same revision filter,
-    /// single documents-lock hold, and versioned publication apply — see the
-    /// project-wide function's doc comment for the lock-order reasoning.
-    ///
-    /// Existing entries under a checked module root are dropped (this run is
-    /// authoritative for them); `new_diags` are inserted; any dropped file not
-    /// re-added was clean this run and is republished empty-of-javac so it
-    /// clears in Problems. Only files inside the checked modules are ever
-    /// republished — no diagnostics are touched outside the requested scope.
+    /// Replace javac diagnostics only beneath `module_roots`, preserving other
+    /// modules. Checked files absent from `new_diags` republish empty.
     async fn publish_javac_diagnostics_scoped(
         &self,
         new_diags: HashMap<String, Vec<Diagnostic>>,
         module_roots: &[PathBuf],
         start_versions: &HashMap<String, i32>,
     ) {
+        self.ensure_workspace_index().await;
+        let classpath = self.classpath();
         let new_map: HashMap<String, Vec<Diagnostic>> = new_diags
             .into_iter()
             .filter_map(|(path, diags)| {
@@ -777,9 +784,8 @@ impl Backend {
                     .lock()
                     .expect("javac diagnostics poisoned");
                 let mut affected: HashSet<String> = HashSet::new();
-                // Drop prior diagnostics for files inside the checked modules —
-                // recording each as affected so a now-clean file is republished
-                // (and thereby cleared). Other modules' entries are retained.
+                // Drop prior diagnostics for checked-module files, marking
+                // each affected so a now-clean file republishes empty.
                 map.retain(|uri_str, _| {
                     if uri_is_under_module(uri_str, module_roots) {
                         affected.insert(uri_str.clone());
@@ -796,10 +802,14 @@ impl Backend {
                 affected.into_iter().collect()
             };
 
+            let symbols = CombinedSymbols(
+                ProjectSymbols::new(self, &docs),
+                ClasspathSymbols(Arc::clone(&classpath)),
+            );
             affected
                 .into_iter()
                 .map(|uri_str| {
-                    let diagnostics = self.compute_diagnostics(&docs, &uri_str);
+                    let diagnostics = self.compute_diagnostics(&docs, &uri_str, &symbols);
                     let version = docs.get(&uri_str).map(|doc| doc.version);
                     (uri_str, diagnostics, version)
                 })
@@ -820,8 +830,8 @@ impl Backend {
 mod tests {
     use super::*;
 
-    /// The Task 2 native return contract's message for the canonical
-    /// wrong-return fixture (`int code() { return "bad"; }`).
+    /// Native return diagnostic message for the canonical wrong-return
+    /// fixture (`int code() { return "bad"; }`).
     const RETURN_MESSAGE: &str = "incompatible types: String cannot be converted to int";
 
     /// A native diagnostic exactly as the syntax crate emits it for `code`:
@@ -847,9 +857,8 @@ mod tests {
     }
 
     /// A native return diagnostic exactly as `jvl_syntax`'s return check
-    /// emits it (Task 2 contract): code `jvl.incompatibleReturn`, severity
-    /// ERROR, source `java-vsix-lite`, single-line range on the returned
-    /// expression.
+    /// emits it: code `jvl.incompatibleReturn`, severity ERROR, single-line
+    /// range on the returned expression.
     fn native_return(line: u32, start: u32, end: u32, message: &str) -> Diagnostic {
         native_coded(
             jvl_syntax::INCOMPATIBLE_RETURN_CODE,
@@ -908,10 +917,9 @@ mod tests {
         }
     }
 
-    /// An equivalent current javac result confirms the native return
-    /// diagnostic instead of replacing it: the native entry is left exactly
-    /// as it was (no source-field flip on save), and the now-redundant
-    /// javac diagnostic is dropped rather than appended as a duplicate.
+    /// An equivalent current javac result confirms the native diagnostic
+    /// instead of replacing it: the native entry is left unchanged and the
+    /// redundant javac diagnostic is dropped.
     #[test]
     fn merge_keeps_native_return_diagnostic_when_javac_confirms() {
         let mut merged = vec![native_return(4, 15, 20, RETURN_MESSAGE)];
@@ -934,11 +942,10 @@ mod tests {
         assert_eq!(merged[0].message, RETURN_MESSAGE);
     }
 
-    /// Equivalence compares only the FIRST message line, after stripping the
-    /// `incompatible types: ` prefix — javac folds `required:`/`found:`
-    /// continuation lines into its message and they must not defeat the
-    /// match. A line-wide javac range (no caret parsed → character 0 to
-    /// u32::MAX) still overlaps the native expression range on that line.
+    /// Equivalence compares only the first message line after stripping the
+    /// `incompatible types: ` prefix, since javac folds continuation lines
+    /// into its message. A line-wide javac range (no caret parsed) still
+    /// overlaps the native range on that line.
     #[test]
     fn merge_matches_first_message_line_and_line_wide_javac_range() {
         let folded = format!("{RETURN_MESSAGE}\n  required: int\n  found:    String");
@@ -1008,9 +1015,9 @@ mod tests {
         assert_eq!(merged[1].source.as_deref(), Some("javac"));
     }
 
-    /// Both severities must be ERROR: a javac WARNING never confirms (and so
-    /// never removes) a native return error, and a hypothetical non-ERROR
-    /// native entry is never removed by a javac error.
+    /// Both severities must be ERROR: a javac warning never confirms a
+    /// native error, and a non-ERROR native entry is never removed by a
+    /// javac error.
     #[test]
     fn merge_requires_error_severity_on_both_sides() {
         // (a) javac warning against a native error: both kept.
@@ -1095,10 +1102,9 @@ mod tests {
         );
     }
 
-    /// Unrelated native diagnostics sharing the line with a confirmed return
-    /// error are untouched, and the confirmed native entry itself is kept
-    /// (not swapped for javac's copy): only javac diagnostics with no
-    /// confirming native match are appended, after every surviving native.
+    /// Unrelated natives on the same line, and the confirmed native itself,
+    /// are kept unchanged; only unmatched javac diagnostics are appended
+    /// after all natives.
     #[test]
     fn merge_keeps_all_natives_and_appends_only_unmatched_javac() {
         let mut merged = vec![
@@ -1134,8 +1140,7 @@ mod tests {
         assert_eq!(merged[3].message, "cannot find symbol");
     }
 
-    /// With no equivalent native entry at all, merging is a plain append —
-    /// the pre-existing `compute_diagnostics` behavior is preserved.
+    /// With no equivalent native entry, merging is a plain append.
     #[test]
     fn merge_without_equivalent_is_plain_append() {
         let mut merged = vec![native_other(1, 0, 4, "Syntax error")];
@@ -1154,11 +1159,9 @@ mod tests {
         assert_eq!(merged[1].source.as_deref(), Some("javac"));
     }
 
-    /// javac confirms a native incompatible-initializer error exactly like a
-    /// return error: `jvl.incompatibleAssignment` is a dedupable code, the
-    /// folded `required:`/`found:` continuation lines are ignored, and the
-    /// `incompatible types: ` prefix strips when present on BOTH first
-    /// lines. The native entry is kept; its confirming javac copy is dropped.
+    /// javac confirms a native incompatible-assignment error the same way
+    /// as a return error. The native entry is kept; its confirming javac
+    /// copy is dropped.
     #[test]
     fn merge_keeps_native_assignment_diagnostic_when_javac_confirms() {
         let message = "incompatible types: int cannot be converted to boolean";
@@ -1188,10 +1191,9 @@ mod tests {
         assert_eq!(merged[0].source.as_deref(), Some("java-vsix-lite"));
     }
 
-    /// javac emits `unreachable statement` verbatim — no `incompatible
-    /// types: ` prefix on either side — so the first lines compare verbatim
-    /// and the native `jvl.unreachable` entry is kept (its confirming javac
-    /// copy is dropped rather than duplicated).
+    /// javac emits `unreachable statement` verbatim with no prefix, so the
+    /// lines compare as-is and the native entry is kept, its javac copy
+    /// dropped.
     #[test]
     fn merge_keeps_native_unreachable_diagnostic_when_javac_confirms() {
         let mut merged = vec![native_coded(
@@ -1248,9 +1250,8 @@ mod tests {
         );
     }
 
-    /// `jvl.unused` never merges — javac cannot emit it. Neither the real
-    /// shape (WARNING + Unnecessary tag) nor a hypothetical ERROR-severity
-    /// entry is in the dedupable-code list.
+    /// `jvl.unused` never merges since javac cannot emit it, regardless of
+    /// severity or tags.
     #[test]
     fn merge_never_dedupes_unused_diagnostics() {
         // (a) as actually emitted: WARNING severity, Unnecessary tag.
@@ -1298,5 +1299,138 @@ mod tests {
             2,
             "jvl.unused is never dedupable: {merged:#?}"
         );
+    }
+
+    /// `refresh_open_diagnostics(StaleJavac::AllOpen)` drops every open
+    /// document's stored javac diagnostics before recomputing. A closed
+    /// file's javac diagnostics are untouched, since only open documents
+    /// are recomputed by this pass.
+    #[tokio::test]
+    async fn refresh_open_diagnostics_all_open_drops_stale_javac_entries() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Backend::new);
+        let backend = service.inner();
+
+        let mut parser = jvl_syntax::new_parser();
+        let text = "class A {}\n".to_string();
+        let tree = jvl_syntax::parse(&mut parser, &text, None).expect("parse");
+        {
+            let mut docs = backend.documents.lock().await;
+            docs.insert(
+                "file:///A.java".to_string(),
+                Document {
+                    text,
+                    tree,
+                    version: 1,
+                },
+            );
+        }
+        {
+            let mut javac = backend
+                .javac_diagnostics
+                .lock()
+                .expect("javac diagnostics poisoned");
+            javac.insert(
+                "file:///A.java".to_string(),
+                vec![javac_diag(0, 0, 1, DiagnosticSeverity::ERROR, "stale")],
+            );
+            // Not a currently open document — its entry must survive.
+            javac.insert(
+                "file:///Closed.java".to_string(),
+                vec![javac_diag(0, 0, 1, DiagnosticSeverity::ERROR, "stale")],
+            );
+        }
+
+        backend.refresh_open_diagnostics(StaleJavac::AllOpen).await;
+
+        let javac = backend
+            .javac_diagnostics
+            .lock()
+            .expect("javac diagnostics poisoned");
+        assert!(
+            !javac.contains_key("file:///A.java"),
+            "an open document's stale javac diagnostics must be dropped"
+        );
+        assert!(
+            javac.contains_key("file:///Closed.java"),
+            "a closed file's javac diagnostics are untouched by an open-document refresh"
+        );
+    }
+
+    /// javac's wording for an inapplicable call differs from ours, so the
+    /// two are matched by family; one error must not show two squiggles.
+    #[test]
+    fn javac_confirms_native_invocation_error() {
+        let native = native_coded(
+            jvl_syntax::INVALID_INVOCATION_CODE,
+            3,
+            10,
+            14,
+            "no applicable method 'pick' for argument types (int); 2 candidate(s) considered",
+        );
+        let javac = javac_diag(
+            3,
+            8,
+            20,
+            DiagnosticSeverity::ERROR,
+            "no suitable method found for pick(int)",
+        );
+        assert!(javac_confirms_native(&native, &javac));
+    }
+
+    #[test]
+    fn javac_confirms_native_instantiation_error() {
+        let native = native_coded(
+            jvl_syntax::INVALID_INSTANTIATION_CODE,
+            5,
+            15,
+            20,
+            "cannot instantiate abstract class 'Shape'",
+        );
+        let javac = javac_diag(
+            5,
+            11,
+            22,
+            DiagnosticSeverity::ERROR,
+            "Shape is abstract; cannot be instantiated",
+        );
+        assert!(javac_confirms_native(&native, &javac));
+    }
+
+    #[test]
+    fn mismatched_families_do_not_confirm() {
+        let native = native_coded(
+            jvl_syntax::INVALID_INVOCATION_CODE,
+            3,
+            10,
+            14,
+            "no applicable method 'pick' for argument types (int); 2 candidate(s) considered",
+        );
+        let javac = javac_diag(
+            3,
+            8,
+            20,
+            DiagnosticSeverity::ERROR,
+            "no suitable constructor found for User(int)",
+        );
+        assert!(!javac_confirms_native(&native, &javac));
+    }
+
+    #[test]
+    fn different_line_never_confirms() {
+        let native = native_coded(
+            jvl_syntax::INVALID_INVOCATION_CODE,
+            3,
+            10,
+            14,
+            "no applicable method 'pick' for argument types (int); 2 candidate(s) considered",
+        );
+        let javac = javac_diag(
+            4,
+            8,
+            20,
+            DiagnosticSeverity::ERROR,
+            "no suitable method found for pick(int)",
+        );
+        assert!(!javac_confirms_native(&native, &javac));
     }
 }

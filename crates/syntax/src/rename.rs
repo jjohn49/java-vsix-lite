@@ -1,27 +1,5 @@
-//! Rename — conservative, refuse rather than corrupt.
-//!
-//! This module supplies the syntax-level primitives the server's
-//! `prepareRename`/`rename` handlers build on; the server owns the
-//! orchestration (scanning, WorkspaceEdit assembly, the file-rename
-//! resource op), same division of labor as find-references (see
-//! `references.rs`'s module doc).
-//!
-//! - [`prepare_rename`] answers `textDocument/prepareRename`: `Some` only
-//!   when the cursor is on an identifier that [`crate::reference_target`]
-//!   resolves to an in-project declaration — which already refuses external
-//!   (JDK/dependency) symbols, keywords, literals, and `this`/`super` for
-//!   free (`identifier_at` only matches `identifier`/`type_identifier` node
-//!   kinds; keywords/literals are their own distinct tree-sitter node kinds
-//!   and never reach that far).
-//! - [`is_valid_new_name`] gates the *new* name: a syntactically valid Java
-//!   identifier that isn't a reserved word or literal.
-//! - [`collides_with_existing`] is the cheap, conservative same-scope
-//!   collision guard: does the declaring scope already bind the new name to
-//!   a sibling of the same kind (namespace-aware for members, via the same
-//!   substrate `references.rs` uses)?
-//! - [`is_public_top_level_type`] answers the file-rename question: is this
-//!   target a `public` type declared directly at a compilation unit's top
-//!   level (as opposed to nested, package-private, or a member/local)?
+//! Conservative syntax helpers for prepare-rename and rename validation.
+//! The server owns scanning, edit assembly, and optional file renames.
 
 use std::ops::Range;
 
@@ -36,23 +14,17 @@ use crate::references::{reference_target, ReferenceTarget};
 use crate::resolve;
 use crate::{node_text, LineIndex, OpenDoc};
 
-/// The range of the identifier under the cursor (in the *requesting*
-/// document — not necessarily where the symbol is declared) plus its
-/// current text as the rename placeholder.
+/// Identifier range under the cursor in the requesting document (not
+/// necessarily where the symbol is declared), plus its text as the
+/// rename placeholder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareRename {
     pub range: Range<usize>,
     pub placeholder: String,
 }
 
-/// Resolve the cursor to a renameable target: `Some` only when it lands on
-/// an identifier [`crate::reference_target`] resolves to an in-project
-/// declaration. Everything that must be refused — an external (JDK/
-/// dependency) symbol, a keyword, a literal, `this`/`super`, or a
-/// non-identifier — already yields `None` from `reference_target` itself
-/// (or, for `this`/`super`, is filtered here since `identifier_at` also
-/// matches those two node kinds, which `reference_target`'s own `classify`
-/// step does not consider renameable in the first place).
+/// Resolves the cursor to a renameable target: `None` for external
+/// (JDK/dependency) symbols, keywords, literals, and `this`/`super`.
 pub fn prepare_rename(
     docs: &[OpenDoc],
     current: usize,
@@ -66,9 +38,7 @@ pub fn prepare_rename(
     if !matches!(name_node.kind(), "identifier" | "type_identifier") {
         return None; // `this`/`super` are not renameable
     }
-    // Confirms the cursor resolves to an in-project declaration — refuses
-    // external (JDK/dependency) symbols for free, the same way
-    // `textDocument/references` does.
+    // Refuses external (JDK/dependency) symbols, same as `textDocument/references`.
     reference_target(docs, current, index, pos, symbols)?;
     Some(PrepareRename {
         range: name_node.byte_range(),
@@ -76,16 +46,13 @@ pub fn prepare_rename(
     })
 }
 
-/// Reserved words a rename must refuse that `completion::KEYWORDS` (a
-/// completion-offer list, not a validity list) deliberately omits: `goto`
-/// and `const` are JLS §3.9 reserved-but-unusable keywords (`int goto = 1;`
-/// does not compile, so completion never offers them), and a lone `_` is a
-/// reserved identifier since Java 9 (JLS §3.8).
+/// Reserved words a rename must refuse that completion's `KEYWORDS` list
+/// omits: `goto`/`const` are JLS reserved-but-unusable keywords, and a
+/// lone `_` is reserved since Java 9.
 const RENAME_RESERVED: &[&str] = &["goto", "const", "_"];
 
-/// Whether `name` is a syntactically valid Java identifier (starts with a
-/// letter/`_`/`$`, continues with letters/digits/`_`/`$`) and not a reserved
-/// word or literal (`class`, `true`, `goto`, a lone `_`, …).
+/// Whether `name` is a valid Java identifier and not a reserved word or
+/// literal.
 pub fn is_valid_new_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -100,20 +67,12 @@ pub fn is_valid_new_name(name: &str) -> bool {
     !KEYWORDS.contains(&name) && !RENAME_RESERVED.contains(&name)
 }
 
-/// Cheap, conservative same-scope collision guard: does the scope that
-/// declares `target` already bind `new_name` to a sibling of the same kind —
-/// another local/parameter in the same method, a field/method of the
-/// enclosing type (namespace-aware — a field named `new_name` doesn't
-/// collide with a method rename, and vice versa), or a sibling type
-/// (nested-in-the-same-enclosing-type, or top-level-in-the-same-file)?
+/// Conservative same-scope collision guard: does the scope that declares
+/// `target` already bind `new_name` to a sibling of the same kind
+/// (namespace-aware for members)?
 ///
-/// Deliberately cheap rather than exhaustive: locals/params are checked
-/// against whatever [`resolve::collect_bindings`] already reports in scope
-/// *before* the declaration point (the same substrate `lookup_binding`
-/// uses) — a same-named sibling declared *later* in the identical block is
-/// not caught. Members and types (own_members/sibling scan) have no such
-/// direction bias since Java's own scoping doesn't care about declaration
-/// order there.
+/// Cheap, not exhaustive: for locals/params, a same-named sibling declared
+/// *later* in the identical block is not caught.
 pub fn collides_with_existing(docs: &[OpenDoc], target: &ReferenceTarget, new_name: &str) -> bool {
     let Some(doc) = docs.get(target.doc) else {
         return false;
@@ -139,14 +98,14 @@ pub fn collides_with_existing(docs: &[OpenDoc], target: &ReferenceTarget, new_na
             } else {
                 // `field_declaration` / `constant_declaration` / a record
                 // component's `formal_parameter` grandparent.
-                member_collision(doc, target, decl_node, new_name, MemberNamespace::Field)
+                member_collision(docs, target, decl_node, new_name, MemberNamespace::Field)
             }
         }
         "method_declaration" => {
-            member_collision(doc, target, decl_node, new_name, MemberNamespace::Method)
+            member_collision(docs, target, decl_node, new_name, MemberNamespace::Method)
         }
         "enum_constant" => {
-            member_collision(doc, target, decl_node, new_name, MemberNamespace::Field)
+            member_collision(docs, target, decl_node, new_name, MemberNamespace::Field)
         }
         k if resolve::is_type_decl(k) => type_sibling_collision(doc, target, decl_node, new_name),
         _ => false,
@@ -181,31 +140,27 @@ fn kind_matches_namespace(kind: MemberKind, ns: MemberNamespace) -> bool {
     }
 }
 
-/// Which Java member namespace to check for a collision — mirrors
-/// `resolve::MemberNamespace` (fields/methods live in separate namespaces,
-/// JLS §6.5), duplicated here rather than reused since that type is
-/// `pub(crate)` to `resolve.rs`'s own confirm-by-resolution machinery and
-/// this check needs no receiver/hierarchy resolution at all — just the
-/// enclosing type's own declared members.
+/// Java member namespace for collision checks — fields and methods are
+/// separate namespaces (JLS §6.5). Duplicated from `resolve::MemberNamespace`
+/// since this check needs no receiver/hierarchy resolution.
 #[derive(Clone, Copy)]
 enum MemberNamespace {
     Method,
     Field,
 }
 
-/// Does the enclosing type already declare another member named `new_name`
-/// in the same namespace as the one being renamed? The target itself is
-/// excluded (same `!= target.name` style as [`type_sibling_collision`]), so
-/// renaming a member to its own current name isn't misreported as a
-/// collision.
+/// Whether the enclosing type already declares another member named
+/// `new_name` in the same namespace; the target itself is excluded so
+/// renaming to its own name isn't a false collision.
 fn member_collision(
-    doc: &OpenDoc,
+    docs: &[OpenDoc],
     target: &ReferenceTarget,
     decl_node: Node,
     new_name: &str,
     ns: MemberNamespace,
 ) -> bool {
-    let Some(td) = resolve::enclosing_typedecl(decl_node, doc.source, target.doc) else {
+    let table = TypeTable::build(docs, target.doc);
+    let Some(td) = resolve::enclosing_typedecl(decl_node, &table, target.doc) else {
         return false;
     };
     td.own_members()
@@ -229,7 +184,8 @@ fn type_sibling_collision(
     let outer = type_node.parent().and_then(resolve::enclosing_type_node);
     match outer {
         Some(outer_node) => {
-            let Some(outer_td) = TypeDecl::from_node(outer_node, doc.source, target.doc) else {
+            let Some(outer_td) = TypeDecl::from_node(outer_node, doc.source, target.doc, None)
+            else {
                 return false;
             };
             outer_td
@@ -239,16 +195,13 @@ fn type_sibling_collision(
         }
         None => named_children(doc.tree.root_node())
             .into_iter()
-            .filter_map(|c| TypeDecl::from_node(c, doc.source, target.doc))
+            .filter_map(|c| TypeDecl::from_node(c, doc.source, target.doc, None))
             .any(|td| td.name == new_name && td.name != target.name),
     }
 }
 
-/// Whether `target` is a `public` type declared directly at its
-/// compilation unit's top level (no enclosing type) — the condition under
-/// which the server's rename handler also emits a `RenameFile` resource op
-/// (when the file's name matches the type's old name and the client
-/// supports it).
+/// Whether `target` is a `public` top-level type, which triggers a
+/// `RenameFile` resource op in the server's rename handler.
 pub fn is_public_top_level_type(docs: &[OpenDoc], target: &ReferenceTarget) -> bool {
     let Some(doc) = docs.get(target.doc) else {
         return false;
@@ -306,10 +259,8 @@ mod tests {
         assert!(!is_valid_new_name("true"));
     }
 
-    /// `goto`/`const` are JLS §3.9 reserved-but-unusable
-    /// keywords and a lone `_` is reserved since Java 9 — none appear in the
-    /// completion-oriented `KEYWORDS` list, but a rename must refuse all
-    /// three (while `_`-prefixed and `_`-containing names stay legal).
+    /// `goto`, `const`, and lone `_` must be refused even though completion's
+    /// `KEYWORDS` list omits them; `_`-prefixed/`_`-containing names stay legal.
     #[test]
     fn is_valid_new_name_rejects_jls_reserved_and_lone_underscore() {
         assert!(!is_valid_new_name("goto"));
@@ -410,9 +361,8 @@ mod tests {
         assert!(!collides_with_existing(&docs, &target, "d"));
     }
 
-    /// Renaming a member to its own current name must not
-    /// be misreported as a same-scope collision — the target itself is
-    /// excluded from the sibling scan (fields and methods alike).
+    /// Renaming a member to its own name is not a collision; the target is
+    /// excluded from the sibling scan.
     #[test]
     fn member_renamed_to_its_own_name_is_not_a_collision() {
         let src = "class C { int a; void foo() {} }\n";

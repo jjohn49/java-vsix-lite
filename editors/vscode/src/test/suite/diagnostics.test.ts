@@ -1,10 +1,6 @@
-// The regression suite for the class of bug that motivated this harness: the
-// server can be perfectly correct on the wire while the extension shell
-// swallows everything (the M7 `onNotification("textDocument/publishDiagnostics")`
-// incident killed every squiggle for several releases and no test noticed).
-// These tests assert on `vscode.languages.getDiagnostics` — the editor-side
-// collection that squiggles, Problems, and red file-name decorations all
-// read from — so a break anywhere in the pipeline fails here.
+// Regression suite for diagnostics reaching the editor, not just the wire.
+// Assertions use `vscode.languages.getDiagnostics`, the same collection
+// squiggles, Problems, and file decorations all read from.
 import * as assert from "assert";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -29,9 +25,8 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 
 suite("diagnostics pipeline", () => {
   test("syntax errors reach the editor's diagnostics collection", async () => {
-    // Lives under a dot-directory: visible to the editor, but skipped by
-    // the javac check's source walk — so the malformed file can't poison
-    // the compiler run the second test depends on.
+    // Lives under a dot-directory so the javac source walk skips it,
+    // keeping this malformed file from poisoning later javac runs.
     const uri = fixtureUri(".syntax-fixture", "Syntax.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
@@ -48,47 +43,143 @@ suite("diagnostics pipeline", () => {
     );
   });
 
-  test("javac check-on-load publishes real compiler errors", async function () {
+  test("javac backstop runs only after a save", async function () {
     this.timeout(120_000);
-    // Foundry-target behavior: the background javac check runs on project
-    // load and lands type errors in the collection without any edit. Skip
-    // (not fail) when no JDK is discoverable in the test environment.
+    // The javac backstop must only run after a save, batched, at most
+    // once every 30 seconds.
+    // The fixture's error (an unreported checked exception) is one only javac
+    // can see, so a `source === "javac"` diagnostic proves the compiler ran.
     const uri = fixtureUri("src", "main", "java", "demo", "Broken.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
+    const originalText = doc.getText();
 
-    const arrived = await waitFor(
-      () =>
+    try {
+      // Real wall-clock wait: no fake-timer seam crosses the
+      // extension/LSP-client boundary.
+      await new Promise((r) => setTimeout(r, 5_000));
+      const onOpen = vscode.languages.getDiagnostics(uri).filter((d) => d.source === "javac");
+      assert.strictEqual(
+        onOpen.length,
+        0,
+        `javac must never run on open/load, got: ${onOpen.map((d) => d.message).join("; ")}`,
+      );
+
+      // A harmless whitespace-only edit + save is the only thing that may
+      // trigger the automatic check.
+      const appendEdit = new vscode.WorkspaceEdit();
+      appendEdit.insert(uri, doc.positionAt(originalText.length), "\n");
+      assert.ok(await vscode.workspace.applyEdit(appendEdit), "workspace edit was not applied");
+      assert.ok(await doc.save(), "save failed");
+
+      const arrived = await waitFor(
+        () => vscode.languages.getDiagnostics(uri).some((d) => d.source === "javac"),
+        60_000,
+      );
+      if (!arrived) {
+        // Skip only when javac plausibly couldn't run — the syntax
+        // pipeline test above already proves diagnostics flow.
+        if (process.env.JVL_TEST_REQUIRE_JAVAC === "1") {
+          assert.fail("javac diagnostics did not arrive and JVL_TEST_REQUIRE_JAVAC=1");
+        }
+        this.skip();
+      }
+      const javacDiags = vscode.languages
+        .getDiagnostics(uri)
+        .filter((d) => d.source === "javac");
+      assert.ok(
+        javacDiags.some((d) => /unreported exception|IOException/.test(d.message)),
+        `expected the unreported-exception error, got: ${javacDiags
+          .map((d) => d.message)
+          .join("; ")}`,
+      );
+    } finally {
+      const restoreEdit = new vscode.WorkspaceEdit();
+      restoreEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)),
+        originalText,
+      );
+      await vscode.workspace.applyEdit(restoreEdit);
+      await doc.save();
+    }
+  });
+
+  test("javac backstop honors the 30-second floor", async function () {
+    this.timeout(180_000);
+    // A second, distinct javac-only error must not be reported before
+    // the scheduler's 30-second floor since the first run started.
+    const uri = fixtureUri("src", "main", "java", "demo", "Broken.java");
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+    const originalText = doc.getText();
+
+    try {
+      // Establish a first javac result so the scheduler has a `lastStart`
+      // to measure the floor from. Force a real dirty-then-save cycle —
+      // a no-op save on a clean buffer may not fire `onDidSaveTextDocument`.
+      const primeEdit = new vscode.WorkspaceEdit();
+      primeEdit.insert(uri, doc.positionAt(originalText.length), "\n");
+      assert.ok(await vscode.workspace.applyEdit(primeEdit), "workspace edit was not applied");
+      assert.ok(await doc.save(), "initial save failed");
+      const firstArrived = await waitFor(
+        () => vscode.languages.getDiagnostics(uri).some((d) => d.source === "javac"),
+        60_000,
+      );
+      if (!firstArrived) {
+        if (process.env.JVL_TEST_REQUIRE_JAVAC === "1") {
+          assert.fail("javac diagnostics did not arrive and JVL_TEST_REQUIRE_JAVAC=1");
+        }
+        this.skip();
+      }
+
+      // Introduce a second, distinct error. The native tier flags it too,
+      // but only javac's `source === "javac"` copy is used to measure
+      // the floor.
+      const distinctMarker = "doesNotExistOnList";
+      const anchor = "nums.add(1);";
+      const text = doc.getText();
+      const anchorOffset = text.indexOf(anchor);
+      assert.ok(anchorOffset >= 0, "fixture must contain the anchor line");
+      const insertOffset = anchorOffset + anchor.length;
+      const addEdit = new vscode.WorkspaceEdit();
+      addEdit.insert(uri, doc.positionAt(insertOffset), `\n        nums.${distinctMarker}();`);
+      assert.ok(await vscode.workspace.applyEdit(addEdit), "workspace edit was not applied");
+      assert.ok(await doc.save(), "second save failed");
+
+      const hasDistinct = () =>
         vscode.languages
           .getDiagnostics(uri)
-          .some((d) => d.source === "javac"),
-      60_000,
-    );
-    if (!arrived) {
-      // Distinguish "no JDK here" from a real regression: the syntax
-      // pipeline test above already proves diagnostics flow, so only skip
-      // when javac plausibly couldn't run at all.
-      if (process.env.JVL_TEST_REQUIRE_JAVAC === "1") {
-        assert.fail("javac diagnostics did not arrive and JVL_TEST_REQUIRE_JAVAC=1");
-      }
-      this.skip();
+          .some((d) => d.source === "javac" && d.message.includes(distinctMarker));
+
+      const tooSoon = await waitFor(hasDistinct, 20_000);
+      assert.strictEqual(
+        tooSoon,
+        false,
+        "the second javac run must not fire before the 30s floor since the first run's start",
+      );
+
+      const arrivedLater = await waitFor(hasDistinct, 50_000);
+      assert.ok(
+        arrivedLater,
+        "expected the second, distinct javac diagnostic to arrive once the 30s floor elapsed",
+      );
+    } finally {
+      const restoreEdit = new vscode.WorkspaceEdit();
+      restoreEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)),
+        originalText,
+      );
+      await vscode.workspace.applyEdit(restoreEdit);
+      await doc.save();
     }
-    const javacDiags = vscode.languages
-      .getDiagnostics(uri)
-      .filter((d) => d.source === "javac");
-    assert.ok(
-      javacDiags.some((d) => /incompatible types|String/.test(d.message)),
-      `expected the int-from-String type error, got: ${javacDiags
-        .map((d) => d.message)
-        .join("; ")}`,
-    );
   });
 
   test("native return diagnostic arrives without a save and survives the compiler pass", async function () {
     this.timeout(120_000);
-    // Task 4 proof: the pure-Rust return check must land in the editor's
-    // collection from a `didChange` alone — no save, no subprocess — and the
-    // save-triggered javac pass must dedupe against it, never duplicate it.
+    // The native return check must land from a `didChange` alone — no
+    // save, no subprocess — and the javac save pass must dedupe against it.
     const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypes.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
@@ -137,16 +228,9 @@ suite("diagnostics pipeline", () => {
         "incompatible types: String cannot be converted to int",
       );
 
-      // Save to trigger the automatic (trust-gated, checkOnSave) javac pass,
-      // then explicitly run the manual `Check Project` command and await its
-      // full request/response round trip as the deterministic "the compiler
-      // pass has completed and republished" signal. A content-based poll
-      // (e.g. waiting for a `source: "javac"` diagnostic) cannot serve that
-      // role here: when a JDK is available, javac CONFIRMS the exact same
-      // incompatibility the native pass already reported, and the merge
-      // keeps the native entry in place rather than swapping in javac's
-      // redundant copy (see `merge_javac_diagnostics`) — so `source` stays
-      // `"java-vsix-lite"` even after a real, successful compiler pass.
+      // Await `Check Project`'s full round trip as the "compiler finished"
+      // signal — polling for `source: "javac"` won't work, since the merge
+      // keeps the native diagnostic and drops javac's redundant confirmation.
       assert.ok(await doc.save(), "save failed");
       await vscode.commands.executeCommand("java-vsix-lite.checkProject");
       const matching = vscode.languages
@@ -161,9 +245,8 @@ suite("diagnostics pipeline", () => {
             .join("; ")}`,
       );
     } finally {
-      // Leave the fixture clean on disk AND in the buffer even when an
-      // assertion above failed — later tests (and later suite runs against
-      // the same checkout) must never see the broken return.
+      // Restore the fixture on disk and in the buffer even on failure —
+      // later tests must never see the broken return.
       const restoreEdit = new vscode.WorkspaceEdit();
       restoreEdit.replace(
         uri,
@@ -177,10 +260,9 @@ suite("diagnostics pipeline", () => {
 
   test("reassignment declaration link lives only in the styled hover", async function () {
     this.timeout(60_000);
-    // Part D proof: the native reassignment check ships relatedInformation
-    // over the wire, but the client relocates it into the styled hover so
-    // the editor's plain hover block stays a single message line (see
-    // relocateRelatedInformation in styledHover.ts).
+    // The native reassignment check ships relatedInformation over the
+    // wire, but the client relocates it into the styled hover so the
+    // plain hover block stays a single message line.
     const uri = fixtureUri("src", "main", "java", "demo", "ReturnTypes.java");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);

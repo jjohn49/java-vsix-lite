@@ -1,10 +1,6 @@
-// Thin extension shell for java-vsix-lite.
-//
-// Per the implementation plan's "Process topology", this shell does NOT contain
-// analysis logic. Its entire job is: resolve and launch the single Rust LSP
-// server over stdio, surface its state in the status bar, and wire a couple of
-// commands. All parsing/lint/IntelliSense (and, later, supervision of the
-// optional javac tier) lives inside the Rust server.
+// Thin extension shell for java-vsix-lite: resolves and launches the Rust
+// LSP server over stdio, surfaces its state in the status bar, and wires a
+// few commands. All parsing/lint/IntelliSense logic lives in the Rust server.
 
 import { execFile, spawn } from "child_process";
 import * as fs from "fs";
@@ -24,12 +20,13 @@ import {
 import * as mavenFetch from "./mavenFetch";
 import { activateStyledHover, relocateRelatedInformation } from "./styledHover";
 import { activateTesting, TestingApi } from "./testing";
+import { createJavacScheduler, JavacScheduler } from "./javacScheduler";
 
-// M5.4: the one-shot javac check command. The result shape mirrors the
-// server's `checkProject` executeCommand response (see `crates/server/src/
-// main.rs`'s `run_check_project` and `javac.rs`'s module doc comment for the
-// security invariants — `-proc:none` mandatory, JDK discovered never
-// downloaded, explicit invocation only).
+// Result shape mirrors the server's `checkProject` response. javac
+// invariants: `-proc:none` mandatory, JDK never auto-downloaded, explicit
+// invocation only.
+// status: "ok" | "already-running" | "stale" | "jdk-too-old"
+//       | "unsupported-layout" | "javac-not-found" | "timeout" | "error"
 interface CheckProjectResult {
   status: string;
   message?: string;
@@ -39,38 +36,29 @@ interface CheckProjectResult {
 
 // The user-facing command (contributed in package.json, trust-gated below).
 const CHECK_PROJECT_COMMAND = "java-vsix-lite.checkProject";
-// The server-internal executeCommand id it forwards to. Deliberately NOT the
-// same id: vscode-languageclient auto-registers a VS Code command for every
-// id the server advertises in `executeCommandProvider`, and a duplicate of a
-// command this extension registers itself would throw
-// `command '<id>' already exists` during client startup.
+// The server-internal executeCommand id it forwards to. Must differ from
+// CHECK_PROJECT_COMMAND, or vscode-languageclient's auto-registered command
+// collides with this extension's own and throws at startup.
 const SERVER_CHECK_PROJECT_COMMAND = "jvl.checkProject.run";
 
-// M6.2: the consent-gated dependency download command. Same collision-
-// avoidance pattern as `CHECK_PROJECT_COMMAND`/`SERVER_CHECK_PROJECT_COMMAND`
-// above — this extension-contributed id and the server's internal
-// executeCommand id it drives (`SERVER_REBUILD_CLASSPATH_COMMAND`) must never
-// be the same string.
+// The consent-gated dependency download command. Same collision-avoidance
+// pattern as above: this id and `SERVER_REBUILD_CLASSPATH_COMMAND` must
+// never be the same string.
 const DOWNLOAD_DEPENDENCIES_COMMAND = "java-vsix-lite.downloadDependencies";
 const INSTALL_DEPENDENCIES_COMMAND = "java-vsix-lite.installDependencies";
 const SERVER_REBUILD_CLASSPATH_COMMAND = "jvl.classpath.rebuild";
 
-// User-facing "refresh" command: re-reads the build files and local caches
-// (`~/.m2`/`~/.gradle`) and republishes diagnostics WITHOUT restarting the
-// server process — the light counterpart to `restartServer`. Drives the same
-// server-internal `SERVER_REBUILD_CLASSPATH_COMMAND` the post-install loop
-// uses. Purely offline (no network, no build-script execution), so unlike the
+// User-facing "refresh": re-reads build files and local caches, republishes
+// diagnostics, without restarting the server. Offline only, so unlike the
 // download/install commands it is not trust-gated.
 const REBUILD_CLASSPATH_COMMAND = "java-vsix-lite.rebuildClasspath";
 
-// Hard ceiling on a build-tool run before it's killed (dependency resolution
-// can legitimately take minutes on a cold cache; a hung/interactive process
-// must not block forever).
+// Hard ceiling on a build-tool run before it's killed; a hung process must
+// not block forever.
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 
-// Fixed-point loop bounds (see the task brief): a runaway or maliciously deep
-// transitive graph must never turn one consented download into an unbounded
-// one.
+// Fixed-point loop bounds: a deep transitive graph must never turn one
+// consented download into an unbounded one.
 const MAX_DOWNLOAD_ROUNDS = 5;
 const MAX_ARTIFACTS_PER_INVOCATION = 300;
 const MAX_TOTAL_BYTES_PER_INVOCATION = 200 * 1024 * 1024;
@@ -103,11 +91,49 @@ function coordLabel(coord: ServerCoordinate): string {
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
+let javacScheduler: JavacScheduler | undefined;
+let clientGeneration = 0; // bumped in start(); a run from an old client never touches a new one
+
+function hasDirtyJavaBuffers(): boolean {
+  return vscode.workspace.textDocuments.some(
+    (d) => d.languageId === "java" && d.uri.scheme === "file" && d.isDirty,
+  );
+}
+
+/** Forwards saved URIs to the server's javac check, silently — unlike the
+ * manual command, which reports errors. `busy` means requeue the URIs for
+ * the next dispatch. */
+async function runBackgroundCheck(uris: readonly string[]): Promise<"completed" | "busy"> {
+  const generation = clientGeneration;
+  const c = client;
+  if (!c) return "completed";
+  try {
+    const result = (await c.sendRequest(ExecuteCommandRequest.type, {
+      command: SERVER_CHECK_PROJECT_COMMAND,
+      arguments: [{ scope: "modules", documentUris: [...uris] }],
+    })) as CheckProjectResult;
+    if (generation !== clientGeneration) return "completed";
+    // `stale`: the run was outrun by a provider change, so the saved files
+    // still have not been compiled against current state — requeue.
+    if (result.status === "already-running" || result.status === "stale") return "busy";
+    if (result.status === "jdk-too-old") {
+      if (!jdkTooOldNotified) {
+        jdkTooOldNotified = true;
+        notifyJdkTooOld(result);
+      }
+    } else {
+      jdkTooOldNotified = false;
+    }
+    return "completed";
+  } catch {
+    return "completed"; // silent by design; the manual command reports errors
+  }
+}
 
 // ---------------------------------------------------------------------------
-// Status bar: one renderer owns every mutation. State is composed from the
-// server's lifecycle, an optional transient activity (spinner text), and
-// live Java diagnostic counts; nothing else writes `statusBar.*` directly.
+// Status bar: one renderer owns every mutation; nothing else writes
+// `statusBar.*` directly. State is composed from server lifecycle,
+// transient activity text, and live diagnostic counts.
 // ---------------------------------------------------------------------------
 
 type ServerStateKind = "starting" | "running" | "stopped" | "missing-binary";
@@ -193,10 +219,8 @@ function renderStatusBar(): void {
 }
 
 // Read-only virtual documents for external (JDK/dependency) goto-definition
-// targets: the server resolves these to `jvl-src:/<fqn>.java` `Location`s;
-// this provider fetches their content on demand via the `jvl/externalSource`
-// custom request (real source when available, else a signature-only stub —
-// the server decides which).
+// targets. Fetches content on demand via `jvl/externalSource`: real source
+// when available, else a signature-only stub.
 class ExternalSourceProvider implements vscode.TextDocumentContentProvider {
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
     if (!client) {
@@ -258,56 +282,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     vscode.workspace.registerTextDocumentContentProvider("jvl-src", new ExternalSourceProvider()),
   );
 
-  // M8b: real compiler errors on save — a debounced, silent `checkProject`
-  // run after every Java file save, in trusted workspaces only (the same
-  // trust gate as the manual command; `javac` is a spawned process). Silent
-  // means silent: results reach Problems via the server's published
-  // diagnostics, never a pop-up.
+  // Automatic javac backstop: batches saved Java files, dispatching at
+  // most once every 30s, deferring while any buffer is dirty (javac
+  // compiles disk, not the buffer). Never runs on open/load.
+  javacScheduler = createJavacScheduler({
+    now: () => performance.now(),
+    setTimer: (cb, ms) => setTimeout(cb, ms),
+    clearTimer: (h) => clearTimeout(h as NodeJS.Timeout),
+    enabled: () => javacBackgroundCheckEnabled() && client !== undefined,
+    blocked: hasDirtyJavaBuffers,
+    run: runBackgroundCheck,
+  });
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (
-        doc.languageId === "java" &&
-        doc.uri.scheme === "file" &&
-        javacBackgroundCheckEnabled()
-      ) {
-        scheduleSaveCheck(doc.uri.toString());
+      if (doc.languageId === "java" && doc.uri.scheme === "file" && javacBackgroundCheckEnabled()) {
+        javacScheduler?.enqueue(doc.uri.toString());
+      } else {
+        javacScheduler?.poke(); // a dirty buffer became clean: unblock a queued batch
       }
     }),
-  );
-
-  // M8b follow-up: the one-shot activation sweep below only covers Java
-  // documents already open at that exact instant — in practice activation
-  // routinely completes before the user (or a restored session) has opened
-  // any Java file at all, leaving that sweep a permanent no-op. Cover the
-  // realistic case too: opening a Java file later in the session schedules
-  // the same debounced, single-flighted module check as a save, so its
-  // pre-existing errors surface without requiring an edit first.
-  context.subscriptions.push(
-    vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (
-        doc.languageId === "java" &&
-        doc.uri.scheme === "file" &&
-        javacBackgroundCheckEnabled()
-      ) {
-        scheduleSaveCheck(doc.uri.toString());
+    vscode.workspace.onDidCloseTextDocument((doc) => {
+      if (doc.languageId === "java") {
+        javacScheduler?.poke();
       }
     }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("java-vsix-lite.javac.checkOnSave")) {
+        if (javacBackgroundCheckEnabled()) {
+          javacScheduler?.poke();
+        } else {
+          javacScheduler?.cancelPending();
+        }
+      }
+    }),
+    { dispose: () => javacScheduler?.dispose() },
   );
 
-  // M8b follow-up: granting trust mid-session unlocks the background check
-  // — run the on-load pass then, since activation skipped it.
+  // Granting trust mid-session unlocks the background check; poke in case a
+  // batch was queued and blocked on the trust gate. Never a full open-docs
+  // sweep — automatic javac must never run on open/load.
   context.subscriptions.push(
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
-      if (javacBackgroundCheckEnabled()) {
-        scheduleOpenDocsCheck();
-      }
+      javacScheduler?.poke();
     }),
   );
 
-  // VS Code normally infers the `java` language id from the `.java` extension
-  // in a jvl-src URI's path, but that inference is what the documentSelector
-  // match (and thus server sync) hinges on — pin it explicitly so the virtual
-  // docs always reach the server regardless of detection quirks.
+  // Pin the language id explicitly for jvl-src docs: documentSelector match
+  // (and thus server sync) depends on it, and auto-detection can miss.
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
       if (doc.uri.scheme === "jvl-src" && doc.languageId !== "java") {
@@ -316,12 +337,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     }),
   );
 
-  // Debugging: the DAP adapter is the same machine-scoped `jvl-server`
-  // binary (env override → machine setting → bundled) run with the `dap`
-  // subcommand, so a workspace can never redirect which binary debugs it.
-  // The configuration provider enforces the Workspace Trust gate — the
-  // debugger runs project code, so this refusal is load-bearing, exactly
-  // like `checkProject()`'s.
+  // The DAP adapter reuses the same machine-scoped jvl-server binary, so a
+  // workspace can never redirect which binary debugs it. The configuration
+  // provider enforces the Workspace Trust gate since debugging runs project
+  // code.
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterDescriptorFactory("java-vsix-lite", {
       createDebugAdapterDescriptor(): vscode.DebugAdapterDescriptor | undefined {
@@ -357,6 +376,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
 }
 
 export async function deactivate(): Promise<void> {
+  javacScheduler?.dispose();
   await client?.stop();
   client = undefined;
 }
@@ -437,11 +457,10 @@ class JavaDebugConfigurationProvider implements vscode.DebugConfigurationProvide
       };
     }
 
-    // Unconditionally inject the machine-scoped JDK home, overwriting
-    // anything workspace-provided — a workspace launch.json must never be
-    // able to redirect which JVM binary runs (same rationale as the
-    // machine-scoped path settings). Undefined is fine: the adapter falls
-    // back to $JAVA_HOME, then filesystem JDK discovery.
+    // Inject the machine-scoped JDK home, overwriting anything workspace-
+    // provided: a workspace launch.json must never redirect which JVM
+    // binary runs. Undefined falls back to $JAVA_HOME, then filesystem
+    // discovery.
     const jdkHome = vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home");
     config.__jvlJdkHome = jdkHome && jdkHome.length > 0 ? jdkHome : undefined;
 
@@ -461,16 +480,8 @@ class JavaDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 
 const execFileAsync = util.promisify(execFile);
 
-// Version handshake: runs the server binary with `--version` and warns (via
-// the LSP output channel, non-fatally) if it disagrees with the extension's
-// own version. Catches a stale bundled binary left over from a partial
-// update; never blocks startup — a spawn failure or an older binary that
-// doesn't understand `--version` is swallowed as a warning too.
-//
-// Runs asynchronously and is fire-and-forget from the caller's perspective:
-// a hung or misbehaving binary must not stall activation (the previous
-// execFileSync-based implementation could block the entire shared extension
-// host for up to its 5s timeout).
+// Verify the bundled server version asynchronously; mismatches warn but never
+// block activation.
 async function checkVersionHandshake(
   serverPath: string,
   extensionVersion: string,
@@ -514,10 +525,9 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   };
 
   const clientOptions: LanguageClientOptions = {
-    // `jvl-src` is included so the virtual documents served by
-    // ExternalSourceProvider are synced to the server too — hover, further
-    // go-to-definition, and semantic tokens keep working while browsing
-    // external/JDK source.
+    // `jvl-src` is included so ExternalSourceProvider's virtual documents
+    // sync to the server too, keeping hover/definition/semantic tokens
+    // working for external/JDK source.
     documentSelector: [
       { scheme: "file", language: "java" },
       { scheme: "jvl-src", language: "java" },
@@ -530,26 +540,22 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
       unusedDiagnostics: vscode.workspace
         .getConfiguration("java-vsix-lite")
         .get<boolean>("diagnostics.unused", true),
-      // M5.4: an explicit override for where to find `javac`, tried before
-      // $JAVA_HOME (empty string means "unset" — the server falls back).
+      // Explicit override for where to find javac, tried before $JAVA_HOME
+      // (empty string means "unset").
       jdkHome: vscode.workspace.getConfiguration("java-vsix-lite").get<string>("jdk.home", ""),
       javacTimeoutSecs: vscode.workspace
         .getConfiguration("java-vsix-lite")
         .get<number>("javac.timeoutSecs", 120),
     },
     middleware: {
-      // M7 (fixed): the first `publishDiagnostics` after startup signals
-      // that the classpath has been built at least once — the proactive
-      // dependency check's trigger. This MUST be middleware, never
-      // `client.onNotification("textDocument/publishDiagnostics", …)`:
-      // the underlying jsonrpc connection keeps ONE handler per method, so
-      // a user-registered handler *replaces* the client's built-in
-      // diagnostics handling and silently kills every squiggle, Problems
-      // entry, and error file-name decoration (field-reported).
+      // The first publishDiagnostics after startup triggers the proactive
+      // dependency check. Must stay middleware, never
+      // client.onNotification(...): jsonrpc keeps one handler per method, so
+      // a second handler would replace the client's diagnostics handling and
+      // kill every squiggle.
       handleDiagnostics: (uri, diagnostics, next) => {
-        // Move relatedInformation out of the published diagnostics and into
-        // the styled hover, so the editor's plain hover block shows only
-        // the single message line VS Code always renders (styledHover.ts).
+        // Move relatedInformation into the styled hover so the plain hover
+        // block shows only the single message line VS Code renders.
         relocateRelatedInformation(uri, diagnostics);
         next(uri, diagnostics);
         if (!proactiveTriggerFired) {
@@ -562,6 +568,7 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
     },
   };
 
+  clientGeneration += 1;
   client = new LanguageClient(
     "java-vsix-lite",
     "java-vsix-lite",
@@ -581,15 +588,6 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(client);
 
   await client.start();
-
-  // M8b follow-up: one silent check when the project loads (and again after
-  // a server restart), so pre-existing errors surface without waiting for
-  // the first save. Now scoped to the modules of whatever Java documents are
-  // already open — activation never eagerly compiles the whole workspace. Same
-  // gate, debounce, and single-flight as the on-save path.
-  if (javacBackgroundCheckEnabled()) {
-    scheduleOpenDocsCheck();
-  }
 }
 
 // Shared gate for the background (save/load-triggered) javac checks:
@@ -606,17 +604,15 @@ function javacBackgroundCheckEnabled(): boolean {
 }
 
 async function restart(context: vscode.ExtensionContext): Promise<void> {
+  javacScheduler?.reset();
   await client?.stop();
   client = undefined;
   await start(context);
 }
 
-// The light "refresh": ask the running server to re-read the build files and
-// local dependency caches and rebuild the classpath, then republish
-// diagnostics — without tearing down the process (that's `restartServer`).
-// Use it after editing a `pom.xml`/`build.gradle` the watcher didn't catch, or
-// after dropping a jar into `~/.m2` by hand. Offline and side-effect-free
-// (no network, no build-script execution), so no trust gate.
+// Light "refresh": rebuilds the classpath and republishes diagnostics
+// without restarting the server. Offline and side-effect-free, so no
+// trust gate.
 async function rebuildClasspath(): Promise<void> {
   if (!client) {
     void vscode.window.showErrorMessage("java-vsix-lite: the language server is not running.");
@@ -630,11 +626,9 @@ async function rebuildClasspath(): Promise<void> {
       arguments: [],
     });
     void vscode.window.showInformationMessage("java-vsix-lite: classpath rebuilt.");
-    // Re-run the silent javac check so Problems reflects the refreshed
-    // classpath too (same gate/debounce as save; no-op in untrusted workspaces).
-    if (javacBackgroundCheckEnabled()) {
-      scheduleOpenDocsCheck();
-    }
+    // Re-evaluate the scheduler so a batch waiting on a stale classpath can
+    // dispatch; never enqueues anything new.
+    javacScheduler?.poke();
   } catch (err) {
     void vscode.window.showErrorMessage(
       `java-vsix-lite: could not rebuild the classpath: ${String(err)}`,
@@ -644,13 +638,10 @@ async function rebuildClasspath(): Promise<void> {
   }
 }
 
-// M5.4: the one-shot, trust-gated javac check command. Spawning javac is
-// build-adjacent (it compiles project code), so — per the threat model —
-// this refuses outright in an untrusted workspace, same as the (still
-// unimplemented) Gradle/Maven build commands. This is the *only* place that
-// gate is enforced on the extension side; the server has no notion of
-// Workspace Trust and just does what it's told, so this check is load-
-// bearing, not decorative.
+// One-shot, trust-gated javac check: refuses outright in an untrusted
+// workspace since spawning javac compiles project code. The server has no
+// notion of Workspace Trust, so this is the only enforcement and is
+// load-bearing.
 async function checkProject(): Promise<void> {
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showErrorMessage(
@@ -699,6 +690,11 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
         "java-vsix-lite: Check Project is already running.",
       );
       break;
+    case "stale":
+      void vscode.window.showInformationMessage(
+        "java-vsix-lite: the workspace changed while Check Project was running; run it again.",
+      );
+      break;
     case "javac-not-found":
       void vscode.window.showErrorMessage(
         `java-vsix-lite: could not locate javac (${result.message ?? "not found"}). Set $JAVA_HOME or the java-vsix-lite.jdk.home setting.`,
@@ -720,9 +716,8 @@ function reportCheckProjectResult(result: CheckProjectResult): void {
 }
 
 // The detected JDK is older than the project's declared Java level, so the
-// javac check was skipped (the server already published a single diagnostic on
-// the build file). Surface it as a notification too, with a shortcut to the
-// machine-scoped JDK override.
+// javac check was skipped. Surface it as a notification too, with a
+// shortcut to the JDK override setting.
 function notifyJdkTooOld(result: CheckProjectResult): void {
   const detail =
     result.message ?? "the detected JDK is too old for this project's Java level";
@@ -741,130 +736,18 @@ function notifyJdkTooOld(result: CheckProjectResult): void {
     });
 }
 
-// M8b: check-on-save plumbing, now MODULE-SCOPED. Each background check
-// compiles only the Maven/Gradle modules owning the files saved in the debounce
-// window — not the whole workspace (the manual `Check Project (javac)` command
-// stays project-wide). `pendingSaveCheckUris` accumulates the file-backed Java
-// document URIs to check next; the debounce coalesces a burst of saves ("Save
-// All") into one run, and any save landing mid-run stays in the set for exactly
-// one follow-up run with the newest set (the server answers `already-running`
-// to a concurrent request, so at most one javac ever runs).
-const pendingSaveCheckUris = new Set<string>();
-let saveCheckTimer: ReturnType<typeof setTimeout> | undefined;
-let saveCheckRunning = false;
-const SAVE_CHECK_DEBOUNCE_MS = 1500;
-// The background check is silent, but the JDK-too-old *configuration* problem
-// is surfaced once (not on every save). Reset when a check no longer reports
-// it, so fixing then re-breaking the JDK notifies again.
+// The background check is silent, but a JDK-too-old config problem is
+// surfaced once, not on every save. Reset when a check stops reporting it,
+// so fixing then re-breaking notifies again.
 let jdkTooOldNotified = false;
 
-/** (Re)arm the shared debounce timer without touching the pending set. */
-function armSaveCheckTimer(): void {
-  if (saveCheckTimer !== undefined) {
-    clearTimeout(saveCheckTimer);
-  }
-  saveCheckTimer = setTimeout(() => {
-    saveCheckTimer = undefined;
-    void runSaveCheck();
-  }, SAVE_CHECK_DEBOUNCE_MS);
-}
-
-/** Queue one saved Java document for the next scoped background check. */
-function scheduleSaveCheck(uri: string): void {
-  pendingSaveCheckUris.add(uri);
-  armSaveCheckTimer();
-}
-
-/**
- * Queue every currently-open, file-backed Java document for a scoped check —
- * the activation / restart / trust-grant / post-install entry point (there is
- * no single "saved file" to key off in those cases). Deliberately does NOT
- * fall back to a whole-project compile: if no Java documents are open, there is
- * nothing to check yet, so it schedules nothing.
- */
-function scheduleOpenDocsCheck(): void {
-  let queuedAny = false;
-  for (const doc of vscode.workspace.textDocuments) {
-    if (doc.languageId === "java" && doc.uri.scheme === "file") {
-      pendingSaveCheckUris.add(doc.uri.toString());
-      queuedAny = true;
-    }
-  }
-  if (queuedAny) {
-    armSaveCheckTimer();
-  }
-}
-
-async function runSaveCheck(): Promise<void> {
-  if (saveCheckRunning) {
-    // A check is in flight; the pending set is left intact so the follow-up
-    // scheduled in `finally` picks these saves up.
-    return;
-  }
-  // Re-checked here (not just at schedule time): trust or the running client
-  // can be gone by the time the debounce fires.
-  if (!client || !vscode.workspace.isTrusted) {
-    pendingSaveCheckUris.clear();
-    return;
-  }
-  if (pendingSaveCheckUris.size === 0) {
-    return;
-  }
-  // Snapshot and clear: saves landing during the run re-populate the set for a
-  // follow-up, rather than being lost or folded into this run's fixed input.
-  const documentUris = [...pendingSaveCheckUris];
-  pendingSaveCheckUris.clear();
-  saveCheckRunning = true;
-  try {
-    const result = (await client.sendRequest(ExecuteCommandRequest.type, {
-      command: SERVER_CHECK_PROJECT_COMMAND,
-      arguments: [{ scope: "modules", documentUris }],
-    })) as CheckProjectResult;
-    // Otherwise silent, but the JDK-too-old state is a config problem worth a
-    // one-time toast (the diagnostic on the build file is easy to miss).
-    if (result.status === "jdk-too-old") {
-      if (!jdkTooOldNotified) {
-        jdkTooOldNotified = true;
-        notifyJdkTooOld(result);
-      }
-    } else {
-      jdkTooOldNotified = false;
-    }
-  } catch {
-    // Silent by design — a failed background check must never toast on save.
-    // The manual `Java: Check Project (javac)` command reports errors.
-  } finally {
-    saveCheckRunning = false;
-    // A save landed during the run (or the timer fired mid-run): run once more
-    // with whatever accumulated.
-    if (pendingSaveCheckUris.size > 0) {
-      armSaveCheckTimer();
-    }
-  }
-}
-
-// M6.2: one download invocation at a time — `true` while one is in flight
-// (from the missing-deps query through the end of the download loop). The
-// extension-side mirror of `checkProject`'s single-flight pattern (the server
-// enforces that one via `javac_running`; downloads are driven entirely by
-// this process, so the flag lives here). No queuing: a second invocation is
-// simply told one is already running.
+// True while a download is in flight, start to end of the loop. Mirrors
+// `checkProject`'s single-flight pattern; no queuing — a second invocation
+// is just told one is already running.
 let downloadInFlight = false;
 
-// ---------------------------------------------------------------------------
-// Install dependencies by running the project's build tool (Maven/Gradle).
-//
-// SECURITY: unlike `Download Missing Dependencies` (direct HTTPS + checksum,
-// no tool execution), this runs `mvn`/`gradle`, which EXECUTES the project's
-// build scripts — Maven plugins run through the lifecycle; a `build.gradle` is
-// a Groovy/Kotlin program. That is arbitrary code from the workspace, so it is
-// gated exactly like the `javac` tier (trusted workspaces only) AND requires
-// an explicit per-invocation confirmation. It is never run automatically. Its
-// purpose is to populate the local cache (`~/.m2`, `~/.gradle`) with the
-// BOM/parent-managed transitive versions the offline resolver can't determine
-// on its own (the case where `Download Missing Dependencies` finds nothing to
-// fetch because every needed coordinate has an unresolved version).
-// ---------------------------------------------------------------------------
+// Running Maven or Gradle executes workspace code, so installation is trusted,
+// explicit, and never automatic. It fills local caches for unresolved versions.
 
 let installInFlight = false;
 
@@ -934,10 +817,9 @@ async function installDependencies(): Promise<void> {
 }
 
 /**
- * Locate the build tool for `root`: Maven when a `pom.xml` is present, else
- * Gradle when a Gradle build/settings file is. Prefers the project wrapper
- * (`mvnw`/`gradlew`), then a machine-configured path, then the tool on `PATH`.
- * `undefined` when neither project type applies.
+ * Locate the build tool for `root`: Maven if `pom.xml` is present, else
+ * Gradle if a Gradle build file is. Prefers the project wrapper, then a
+ * configured path, then `PATH`; `undefined` if neither applies.
  */
 function detectBuildTool(root: string): BuildTool | undefined {
   const win = process.platform === "win32";
@@ -961,12 +843,9 @@ function detectBuildTool(root: string): BuildTool | undefined {
 }
 
 /**
- * Pick the executable to run: the project wrapper if present, else a
- * machine-configured absolute path, else the tool discovered on `PATH` or in
- * common install locations, else the bare name (so a clean ENOENT still tells
- * the user what's missing). The common-location probe matters because a
- * GUI-launched editor often has a minimal `PATH` that omits Homebrew/SDKMAN —
- * the same reason `$JAVA_HOME` is empty there.
+ * Pick the executable: project wrapper, else configured path, else PATH or
+ * common install dirs, else the bare name. Probes common dirs because a
+ * GUI-launched editor's PATH often omits Homebrew/SDKMAN.
  */
 function resolveTool(
   kind: "maven" | "gradle",
@@ -1060,17 +939,14 @@ async function runInstall(tool: BuildTool): Promise<void> {
         arguments: [],
       })
       .catch(() => undefined);
-    if (javacBackgroundCheckEnabled()) {
-      scheduleOpenDocsCheck();
-    }
+    javacScheduler?.poke();
   }
 }
 
 /**
- * Run `tool`, streaming stdout/stderr to `channel`, killed on cancellation or
- * the hard timeout. Resolves to the exit code, or `"cancelled"` /
- * `"spawn-error"`. Uses `spawn` (no shell — args are a fixed array, never
- * concatenated) so a crafted path can't inject extra commands.
+ * Run `tool`, streaming output to `channel`, killed on cancellation or
+ * timeout. Uses `spawn` with no shell so a crafted path can't inject extra
+ * commands.
  */
 function runBuildTool(
   tool: BuildTool,
@@ -1105,13 +981,9 @@ function runBuildTool(
   });
 }
 
-// M6.2: the consent-gated dependency download command. Trust-gated like
-// `checkProject` (this one performs network I/O and writes into `~/.m2`,
-// both squarely "acts on behalf of this project" territory), then:
-// `jvl/missingDependencies` -> one modal consent dialog -> a bounded
-// fixed-point download/rebuild loop. See `mavenFetch.ts` for the actual
-// HTTPS/checksum/install logic and the threat-model notes on what checksum
-// verification does and doesn't protect against.
+// Consent-gated dependency download: trust-gated like `checkProject`
+// (network I/O + writes to `~/.m2`), then `jvl/missingDependencies` -> one
+// modal consent dialog -> a bounded fixed-point download/rebuild loop.
 async function downloadDependencies(): Promise<void> {
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showErrorMessage(
@@ -1139,9 +1011,9 @@ async function downloadDependencies(): Promise<void> {
 
 /** The body of `downloadDependencies`, guarded single-flight by its caller. */
 async function runDownloadDependencies(activeClient: LanguageClient): Promise<void> {
-  // `activeClient` was captured once by the caller: `client` is mutable
-  // module state (a restart could swap it out from under an in-flight,
-  // possibly long-running, download loop).
+  // `activeClient` is captured once by the caller: `client` is mutable
+  // module state that a restart could swap out from under a long-running
+  // download.
   let initial: MissingDependenciesResult;
   try {
     initial = await activeClient.sendRequest<MissingDependenciesResult>(
@@ -1156,10 +1028,9 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
 
   if (initial.missing.length === 0) {
     if (initial.skipped.length > 0) {
-      // These couldn't be resolved to a downloadable `g:a:v` — most commonly
-      // a version managed by a parent POM / BOM that isn't in the local cache
-      // (so the offline resolver can't tell which version to fetch). Direct
-      // download can't help here; running the build tool once can.
+      // These couldn't be resolved to a downloadable g:a:v — usually a
+      // version managed by a parent POM/BOM missing from the local cache.
+      // Direct download can't help; running the build tool once can.
       const choice = await vscode.window.showInformationMessage(
         `java-vsix-lite: nothing can be downloaded directly — ` +
           `${initial.skipped.length} dependency(ies) have an unresolved version ` +
@@ -1188,11 +1059,9 @@ async function runDownloadDependencies(activeClient: LanguageClient): Promise<vo
 }
 
 /**
- * The bounded download loop wrapped in a cancellable progress notification —
- * factored out of `runDownloadDependencies` so the M7 proactive path (which
- * has its own, lighter consent step — see `maybeProactiveDependencyCheck`)
- * can drive the same verified-HTTPS, capped, fixed-point machinery without
- * showing the manual command's heavier modal dialog on top.
+ * The bounded download loop wrapped in a cancellable progress notification.
+ * Factored out so the proactive path can drive the same capped, fixed-point
+ * machinery without the manual command's heavier modal dialog.
  */
 async function startDownloadProgress(
   activeClient: LanguageClient,
@@ -1209,19 +1078,14 @@ async function startDownloadProgress(
   );
 }
 
-// M7: proactive dependency detection — fires at most once per extension
-// session (see `proactiveDependencyCheckDone`), the first time diagnostics
-// are published after startup (a reliable, already-happening signal that
-// the classpath has been resolved at least once — see `Backend::classpath`'s
-// lazy-build-on-first-use doc comment; querying any earlier could race a
-// still-empty classpath). Trust-gated and single-flight-guarded exactly like
-// the manual command, since it can trigger the same network + `~/.m2` write.
+// Proactive dependency detection: fires once per session, on the first
+// diagnostics publish after startup (a signal the classpath has been built
+// at least once — querying earlier could race an empty classpath).
+// Trust-gated and single-flight-guarded like the manual command.
 let proactiveDependencyCheckDone = false;
 
-// M7 (fixed): set by the diagnostics middleware the first time the server
-// publishes diagnostics — the "classpath built at least once" trigger for
-// the proactive check. Session-scoped like `proactiveDependencyCheckDone`
-// (the check itself is one-shot regardless).
+// Set by the diagnostics middleware on the first publish — the "classpath
+// built at least once" trigger for the proactive check.
 let proactiveTriggerFired = false;
 
 type AutoDownloadSetting = "prompt" | "always" | "never";
@@ -1238,10 +1102,9 @@ async function persistAutoDownloadSetting(value: AutoDownloadSetting): Promise<v
       .getConfiguration("java-vsix-lite")
       .update("dependencies.autoDownload", value, vscode.ConfigurationTarget.Workspace);
   } catch {
-    // No open workspace folder (single-file mode) or another write race —
-    // the choice still applies to *this* session via the local variable in
-    // `maybeProactiveDependencyCheck`; only persistence across sessions is
-    // lost, which is a soft failure, not worth surfacing to the user.
+    // No open workspace folder, or a write race — the choice still applies
+    // to this session; only cross-session persistence is lost, a soft
+    // failure not worth surfacing.
   }
 }
 
@@ -1283,11 +1146,9 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
     return;
   }
 
-  // "prompt": one lightweight (non-modal) notification — deliberately not
-  // the manual command's heavier modal dialog, since this fires
-  // unprompted. "Always"/"Never" persist the choice for future sessions in
-  // this workspace; dismissing the notification (no button) asks again
-  // next session rather than silently deciding "never".
+  // "prompt": one lightweight, non-modal notification since this fires
+  // unprompted. "Always"/"Never" persist the choice; dismissing without a
+  // button asks again next session rather than defaulting to "never".
   const count = initial.missing.length;
   const choice = await vscode.window.showInformationMessage(
     `java-vsix-lite: ${count} missing dependenc${count === 1 ? "y" : "ies"} can be downloaded from ${repo.host}.`,
@@ -1314,12 +1175,10 @@ async function maybeProactiveDependencyCheck(activeClient: LanguageClient): Prom
 }
 
 /**
- * M8f (Foundry): the effective download repository. Read from the
- * machine-scoped `dependencies.repository` setting (an internal Maven proxy
- * for governed networks); empty means Maven Central. `undefined` means the
- * configured value is invalid (non-HTTPS, credentials, query/fragment) —
- * callers must refuse to download, with the message below, never fall back
- * to Central silently (the user's intent was clearly "not the internet").
+ * The effective download repository, from the machine-scoped
+ * `dependencies.repository` setting (empty means Maven Central).
+ * `undefined` means the value is invalid; callers must refuse to download,
+ * never fall back to Central silently.
  */
 function configuredRepository(): { base: string; host: string } | undefined {
   const raw = vscode.workspace
@@ -1337,10 +1196,9 @@ function configuredRepository(): { base: string; host: string } | undefined {
 }
 
 /**
- * The single consent dialog the brief requires: modal, names the artifacts
- * (capped display), states the source and destination, and notes that
- * transitives may follow under this same consent. Cancel (or dismissing the
- * dialog) does nothing — only the "Download" choice proceeds.
+ * The single consent dialog: modal, names the artifacts (capped), states
+ * source/destination, and notes transitives may follow under this consent.
+ * Only the "Download" choice proceeds.
  */
 async function confirmDownloadConsent(
   initial: MissingDependenciesResult,
@@ -1368,14 +1226,11 @@ async function confirmDownloadConsent(
 }
 
 /**
- * The bounded fixed-point loop: download this round's missing coordinates,
- * ask the server to rebuild the classpath, re-query for newly-surfaced
- * transitives, repeat — until nothing's left, a round makes no progress, a
- * bound is hit, or the user cancels. Cancellation is only ever observed
- * between artifacts (see the check before each `fetchAndInstallArtifact`
- * call): a coordinate already in flight always finishes installing (both
- * files) or fails cleanly, so no partial file is ever left at its `~/.m2`
- * path.
+ * Bounded fixed-point loop: download missing coordinates, rebuild the
+ * classpath, re-query for transitives, repeat until done, stalled, capped,
+ * or cancelled. Cancellation is only observed between artifacts, so an
+ * in-flight coordinate always finishes or fails cleanly — never a partial
+ * file in `~/.m2`.
  */
 async function runDownloadLoop(
   activeClient: LanguageClient,
@@ -1391,13 +1246,9 @@ async function runDownloadLoop(
   let totalBytes = 0;
   let capNote: string | undefined;
   let cancelled = false;
-  // Whether anything has been installed since the last successful rebuild —
-  // set on every successful install, cleared once a rebuild for it runs.
-  // Tracked separately from the in-loop rebuild below so that a cap/cancel
-  // exit (which `break`s out before reaching that rebuild) still gets one
-  // final rebuild for whatever *did* install — leaving downloaded jars
-  // sitting in `~/.m2` unindexed until a later, unrelated rebuild would be a
-  // needless surprise for the user.
+  // Whether anything installed since the last rebuild. Tracked separately
+  // so a cap/cancel exit still gets one final rebuild for whatever did
+  // install, rather than leaving jars unindexed.
   let needsRebuild = false;
 
   let pending = initial.missing;
@@ -1469,10 +1320,9 @@ async function runDownloadLoop(
   }
 
   if (needsRebuild) {
-    // Best-effort: a cap or cancellation cut the loop short after an install
-    // — still surface it to IntelliSense rather than leaving a downloaded
-    // jar sitting unindexed. Failure here doesn't change the summary; the
-    // next build-file change or restart would pick it up regardless.
+    // Best-effort: a cap or cancellation cut the loop short after an
+    // install, so surface it to IntelliSense rather than leave a jar
+    // unindexed. Failure here doesn't change the summary.
     await activeClient
       .sendRequest(ExecuteCommandRequest.type, {
         command: SERVER_REBUILD_CLASSPATH_COMMAND,

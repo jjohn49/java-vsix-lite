@@ -1,16 +1,9 @@
-//! End-to-end test driving the real `jvl-server` binary over raw LSP
+//! End-to-end tests driving the real `jvl-server` binary over raw LSP
 //! (JSON-RPC + `Content-Length` framing on stdio).
 //!
-//! Covers the lifecycle and the M1 default-tier features end to end:
-//! `initialize` (capabilities) -> open invalid Java (syntax diagnostic) ->
-//! full-replace to valid (diagnostics clear) -> INCREMENTAL ranged edits
-//! (delete `;` -> error, re-insert -> clear) -> `documentSymbol` (outline) ->
-//! `shutdown` -> `exit`.
-//!
-//! It drives the server like a real client would — waiting for each response
-//! before sending the next request — because the server handles messages
-//! concurrently, so firing everything at once lets `exit` race ahead and tear
-//! the server down mid-handshake.
+//! Each request waits for its response before the next is sent: the server
+//! handles messages concurrently, so sending everything at once could let
+//! `exit` race ahead and tear the server down mid-handshake.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -22,11 +15,9 @@ fn frame(payload: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", payload.len(), payload)
 }
 
-/// Escape a Java source string for embedding as a JSON string literal's
-/// contents inside one of this file's hand-written request bodies —
-/// backslashes and quotes (`"hello"` literals are common in real source),
-/// then newlines. Order matters: backslashes first, so escaping quotes and
-/// newlines doesn't get double-escaped.
+/// Escape a Java source string for embedding in a JSON string literal.
+/// Backslashes are escaped first so the later quote/newline escaping isn't
+/// doubled.
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -188,10 +179,8 @@ fn lifecycle_smoke() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4.2: `textDocument/signatureHelp` end-to-end — a call site with two
-/// in-project overloads (`helper(int)` / `helper(int, int)`) returns both
-/// signatures, with `activeParameter` correctly picking out the second
-/// argument (one comma precedes the cursor).
+/// `textDocument/signatureHelp` round trip: a call site with two in-project
+/// overloads picks the right signature and `activeParameter`.
 #[test]
 fn signature_help_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -249,9 +238,9 @@ fn signature_help_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4.1: `textDocument/definition` end-to-end, ladder step (b) — a
-/// cross-document member call (`this.methodFromA()` in an open doc `B` that
-/// extends an open doc `A`) resolves into `A`, at `methodFromA`'s name.
+/// `textDocument/definition` round trip: a cross-document member call
+/// (`this.methodFromA()` in open doc `B` extending open doc `A`) resolves
+/// into `A`, at `methodFromA`'s declaration.
 #[test]
 fn definition_cross_doc_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -318,10 +307,9 @@ fn definition_cross_doc_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4.1: `textDocument/definition` end-to-end, ladder step (c) — a type
-/// referenced from an open document but declared in an *unopened* project
-/// source file resolves by locating and parsing that file on demand, using
-/// the workspace folder + conventional `src/main/java` source root.
+/// `textDocument/definition` round trip: a type referenced from an open
+/// document but declared in an unopened project file resolves by locating
+/// and parsing that file via the conventional `src/main/java` source root.
 #[test]
 fn definition_into_unopened_project_file() {
     let root = std::env::temp_dir().join(format!(
@@ -396,13 +384,10 @@ fn definition_into_unopened_project_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4.1: `textDocument/definition` end-to-end, ladder step (d) — a member
-/// call on an externally-typed receiver (`"".length()`) resolves to a
-/// `jvl-src:` virtual-document `Location`, and the extension-side
-/// `jvl/externalSource` request returns non-empty content for it (real JDK
-/// source, or a signature-only stub — either is acceptable here). Skips
-/// (gracefully, like `jvl-classpath`'s own JDK-gated tests) if no JDK is
-/// discoverable in this environment.
+/// `textDocument/definition` round trip: a member call on an externally
+/// typed receiver (`"".length()`) resolves to a `jvl-src:` virtual location,
+/// and `jvl/externalSource` returns non-empty content for it. Skips if no
+/// JDK is discoverable.
 #[test]
 fn definition_external_jdk_member_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -464,16 +449,10 @@ fn definition_external_jdk_member_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M5 (5.3b): parameterized-supertype type arguments flow through the real
-/// classpath into inherited-member hover, end to end. `ArrayList<String>`
-/// does NOT declare `stream()` — it inherits it from `java.util.Collection`
-/// (a default method), so rendering `Stream<String> stream()` proves the
-/// whole chain: `ClassInfo::super_type_args` → `ClasspathSymbols` →
-/// `walk_members`'s substitution mapping. (Hovering `get` would prove
-/// nothing: `ArrayList` declares `get` itself, and direct-member
-/// substitution predates this work.) Skips gracefully (like the definition
-/// round-trip above and `jvl-classpath`'s own JDK-gated tests) if no JDK is
-/// discoverable.
+/// `textDocument/hover` on an inherited generic member: `ArrayList<String>`
+/// inherits `stream()` from `Collection`, so the rendered
+/// `Stream<String> stream()` proves supertype type arguments substitute
+/// correctly. Skips if no JDK is discoverable.
 #[test]
 fn hover_inherited_generic_member_jdk_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -527,13 +506,67 @@ fn hover_inherited_generic_member_jdk_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4.5: `workspace/symbol` end-to-end — the lazy, bounded index built on
-/// the first request finds a top-level type declared in an *unopened*
-/// project source file (via the conventional `src/main/java` source root),
-/// with a zero-length 0:0 range (never parsed). Once that same file is
-/// opened, a later query for the same name returns the *live*
-/// `document_symbol`-derived range instead — the open-document-shadows-the-
-/// index behavior.
+/// `textDocument/hover` on a generic static call: `Objects.requireNonNull(xs)`
+/// with `List<String> xs` infers `T` from the argument, so the rendered
+/// `static List<String> requireNonNull(List<String>)` proves method type
+/// arguments are substituted at the call site rather than showing the erased
+/// `Object requireNonNull(Object)`. Skips if no JDK is discoverable.
+#[test]
+fn hover_generic_method_call_substitutes_inferred_argument_jdk_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    send(
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///HoverCtx.java","languageId":"java","version":1,"text":"import java.util.*; class H { void m(List<String> xs) { Objects.requireNonNull(xs); } }\n"}}}"#,
+    );
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    // Cursor on `requireNonNull` (line 0, char 64).
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///HoverCtx.java"},"position":{"line":0,"character":64}}}"#,
+    );
+    let hover = read_until(&mut reader, "\"id\":2", &mut seen);
+
+    if hover.contains("\"result\":null") {
+        // No JDK discoverable in this environment — nothing further to check.
+    } else {
+        assert!(
+            hover.contains("static List<String> requireNonNull(List<String>)"),
+            "call-site hover should substitute the inferred method type argument: {hover}"
+        );
+    }
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+}
+
+/// `workspace/symbol` round trip: the lazy on-disk index finds an unopened
+/// project type with a zero-length 0:0 range; once that file is opened, the
+/// same query returns the live `document_symbol` range instead.
 #[test]
 fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
     let root = std::env::temp_dir().join(format!(
@@ -593,10 +626,8 @@ fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
         "expected a zero-length 0:0 range for the unopened file: {unopened}"
     );
 
-    // 2. Camel-hump query: "Fo" alone also matches (substring), and "F" would
-    // too, but exercise the documented camel-hump rule with a query that
-    // isn't a plain substring is covered by the module's own unit tests;
-    // here just confirm a case-insensitive substring query also finds it.
+    // 2. Case-insensitive substring query ("foo") also finds it; the fuller
+    // camel-hump matching rule is covered by unit tests elsewhere.
     send(r#"{"jsonrpc":"2.0","id":3,"method":"workspace/symbol","params":{"query":"foo"}}"#);
     let ci = read_until(&mut reader, "\"id\":3", &mut seen);
     assert!(
@@ -612,9 +643,8 @@ fn workspace_symbol_unopened_then_shadowed_by_open_doc() {
         "expected an empty result for a non-matching query: {none}"
     );
 
-    // 4. Open `Foo.java` -> a later query must return the *live* range from
-    // `document_symbol` (line 2, char 13 — "Foo" in "public class Foo"),
-    // shadowing the index's zero-length entry for the same path.
+    // 4. Once `Foo.java` is open, the same query must return the live
+    // `document_symbol` range (line 2, char 13), shadowing the index entry.
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{foo_uri}","languageId":"java","version":1,"text":"package p;\n\npublic class Foo {{\n}}\n"}}}}}}"#
     ));
@@ -659,12 +689,10 @@ fn temp_root(label: &str) -> std::path::PathBuf {
     ))
 }
 
-/// M4 (4.3): `textDocument/references` end-to-end, Tier 2 (Workspace
-/// visibility — `public`) — a public class's references are found across
-/// three files: the declaring file (open, cursor on its own declaration
-/// name) plus two same-package unopened files on disk, each holding a plain
-/// field-typed use. `includeDeclaration` gates whether the declaration's own
-/// occurrence is included.
+/// `textDocument/references` round trip: a public class's references are
+/// found across the declaring (open) file and two same-package unopened
+/// files on disk. `includeDeclaration` gates whether the declaration itself
+/// is included.
 #[test]
 fn references_cross_file_public_class_round_trip() {
     let root = temp_root("cross-file");
@@ -764,10 +792,9 @@ fn references_cross_file_public_class_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.3): `textDocument/references` end-to-end — a workspace with more
-/// `.java` files under the source root than the hardcoded 500-file scan cap
-/// surfaces truncation via a `window/showMessage` (Info) notification,
-/// worded per the task brief.
+/// `textDocument/references` round trip: a workspace with more `.java`
+/// files than the 500-file scan cap surfaces truncation via a
+/// `window/showMessage` notification.
 #[test]
 fn references_truncation_notice_round_trip() {
     let root = temp_root("truncation");
@@ -821,13 +848,9 @@ fn references_truncation_notice_round_trip() {
     send(&format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{target_uri}"}},"position":{{"line":2,"character":13}},"context":{{"includeDeclaration":true}}}}}}"#
     ));
-    // The `window/showMessage` notification and the `id:2` response reach
-    // stdout via independent server output paths, so their relative order is
-    // NOT guaranteed. Wait for the notification first (`read_until`
-    // accumulates whatever else arrives — possibly the response — into
-    // `seen`), then only read further frames for the response if it didn't
-    // already race ahead of the notification; a second blocking read for a
-    // frame that was already consumed would hang forever.
+    // The notification and the id:2 response race on independent output
+    // paths; wait for the notification first, then only read further for
+    // the response if it hasn't already arrived, to avoid blocking forever.
     let notice = read_until(&mut reader, "window/showMessage", &mut seen);
     assert!(
         notice.contains("truncated at 500 files"),
@@ -851,9 +874,9 @@ fn references_truncation_notice_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.3): `textDocument/references` end-to-end — a file under `target/`
-/// (build output) whose content textually matches the searched identifier is
-/// never scanned, even though it lies under the workspace root.
+/// `textDocument/references` round trip: a file under `target/` (build
+/// output) with a textual match is never scanned, even under the workspace
+/// root.
 #[test]
 fn references_skips_target_directory() {
     let root = temp_root("skip-target");
@@ -926,11 +949,9 @@ fn references_skips_target_directory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.6): `textDocument/implementation` end-to-end — an interface (open)
-/// with two same-package files on disk: one implements it (`Bar`), the other
-/// doesn't (`Other`). The request confirms the on-disk implementor and
-/// excludes the unrelated file, exactly like `references`'s bounded
-/// workspace scan.
+/// `textDocument/implementation` round trip: of two same-package files on
+/// disk, only the one that actually implements the open interface (`Bar`,
+/// not `Other`) is returned.
 #[test]
 fn implementation_cross_file_round_trip() {
     let root = temp_root("impl-cross-file");
@@ -941,9 +962,8 @@ fn implementation_cross_file_round_trip() {
         "package p;\nclass Bar implements Foo {\n  public void run() {}\n}\n",
     )
     .expect("write Bar.java");
-    // Textually mentions `Foo` (so it survives the bounded prefilter's
-    // substring scan) but doesn't `implements` it — the per-file confirm
-    // (not just the prefilter) must exclude it.
+    // Mentions `Foo` textually (passes the substring prefilter) but doesn't
+    // implement it — the per-file confirm must still exclude it.
     std::fs::write(
         src_dir.join("Other.java"),
         "package p;\nclass Other {\n  Foo f;\n  void run() {}\n}\n",
@@ -1032,10 +1052,8 @@ fn implementation_cross_file_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.6): `textDocument/implementation` end-to-end — reuses the exact
-/// same bounded-prefilter cap and truncation notice wording as `references`
-/// (M4.3): a workspace with more `.java` files than the 500-file scan cap
-/// still surfaces the identical `window/showMessage` text.
+/// `textDocument/implementation` round trip: reuses the same 500-file scan
+/// cap and truncation notice wording as `references`.
 #[test]
 fn implementation_truncation_notice_reuses_references_wording() {
     let root = temp_root("impl-truncation");
@@ -1087,9 +1105,8 @@ fn implementation_truncation_notice_reuses_references_wording() {
     send(&format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{target_uri}"}},"position":{{"line":2,"character":17}}}}}}"#
     ));
-    // Same race as `references_truncation_notice_round_trip`: the
-    // notification and the `id:2` response arrive via independent output
-    // paths, so order isn't guaranteed.
+    // Same notification/response race as
+    // `references_truncation_notice_round_trip`.
     let notice = read_until(&mut reader, "window/showMessage", &mut seen);
     assert!(
         notice.contains("truncated at 500 files") && notice.contains("References search"),
@@ -1111,10 +1128,9 @@ fn implementation_truncation_notice_reuses_references_wording() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — a local variable's
-/// declaration and both outer occurrences are edited in the one open
-/// document; a same-named variable in a *shadowed* inner block is untouched
-/// (no edit at line 5, where the shadow's declaration/uses live).
+/// `textDocument/rename` round trip: a local variable's declaration and
+/// both outer occurrences are renamed, but a same-named variable in a
+/// shadowed inner block is left untouched.
 #[test]
 fn rename_local_variable_in_one_doc_shadow_untouched() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -1197,9 +1213,8 @@ fn rename_local_variable_in_one_doc_shadow_untouched() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4 (4.4): `textDocument/prepareRename` end-to-end — an external (JDK)
-/// symbol and a keyword/literal are both refused (`result: null`), never an
-/// error (the client should simply not offer rename UI for these).
+/// `textDocument/prepareRename` round trip: an external (JDK) symbol and a
+/// keyword/literal are refused with `result: null`, never an error.
 #[test]
 fn prepare_rename_refuses_external_symbol_and_keyword_and_literal() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -1273,9 +1288,8 @@ fn prepare_rename_refuses_external_symbol_and_keyword_and_literal() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — an invalid new name
-/// ("123abc": leading digit; "class": a reserved word) is refused with an
-/// LSP error, never a (partial) edit.
+/// `textDocument/rename` round trip: an invalid new name (leading digit, or
+/// a reserved word) is refused with an LSP error, never a partial edit.
 #[test]
 fn rename_rejects_invalid_new_name() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -1323,10 +1337,8 @@ fn rename_rejects_invalid_new_name() {
         "reserved-word new name must be refused: {reserved}"
     );
 
-    // M4.4 fix round 1: `goto`/`const` (JLS §3.9 reserved-but-unusable
-    // keywords) and a lone `_` (reserved since Java 9) are absent from the
-    // completion-oriented keyword list but must still be refused, with the
-    // invalid-name error specifically.
+    // `goto`/`const` and a lone `_` aren't in the completion keyword list
+    // but must still be refused as invalid identifiers.
     for (id, name) in [(4, "goto"), (5, "const"), (6, "_")] {
         send(&format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"textDocument/rename","params":{{"textDocument":{{"uri":"file:///InvalidName.java"}},"position":{{"line":0,"character":25}},"newName":"{name}"}}}}"#
@@ -1348,9 +1360,8 @@ fn rename_rejects_invalid_new_name() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — the same-name collision
-/// guard refuses renaming local `a` to `b` when `b` already exists in the
-/// same enclosing scope.
+/// `textDocument/rename` round trip: renaming local `a` to `b` is refused
+/// when `b` already exists in the same enclosing scope.
 #[test]
 fn rename_refuses_same_scope_collision() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -1399,10 +1410,9 @@ fn rename_refuses_same_scope_collision() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — a workspace with more
-/// `.java` files under the source root than the hardcoded 500-file scan cap
-/// refuses the rename outright (never a partial edit), with a message
-/// mentioning full confirmation, per the task brief's wording.
+/// `textDocument/rename` round trip: a workspace with more `.java` files
+/// than the 500-file scan cap refuses the rename outright, with a message
+/// mentioning full confirmation.
 #[test]
 fn rename_refuses_when_scan_truncated() {
     let root = temp_root("rename-truncation");
@@ -1472,12 +1482,10 @@ fn rename_refuses_when_scan_truncated() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — renaming a `public`
-/// top-level type whose file name matches it, across three files (one open,
-/// two on disk), when the client advertises
-/// `workspace.workspaceEdit.resourceOperations` including `"rename"`:
-/// expects text edits in all three files AND a `RenameFile` resource op
-/// renaming the declaring file to match.
+/// `textDocument/rename` round trip: renaming a public top-level type
+/// across three files (one open, two on disk) produces text edits in all
+/// three plus a `RenameFile` op, when the client advertises rename
+/// resource-operation support.
 #[test]
 fn rename_public_class_includes_file_rename_when_capability_advertised() {
     let root = temp_root("rename-file-op");
@@ -1557,9 +1565,8 @@ fn rename_public_class_includes_file_rename_when_capability_advertised() {
         result.contains(&bar_uri),
         "expected the RenameFile op's newUri to be {bar_uri}: {result}"
     );
-    // M4.4 fix round 1: versioned TextDocumentEdits — the open declaring
-    // file carries its LSP version (1, from didOpen); the two on-disk-only
-    // files carry an explicit null version.
+    // The open declaring file's edit carries its LSP version; the two
+    // on-disk-only files carry an explicit null version.
     assert!(
         result.contains("\"version\":1"),
         "expected the open Foo.java edit to carry version 1: {result}"
@@ -1582,11 +1589,10 @@ fn rename_public_class_includes_file_rename_when_capability_advertised() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M4 (4.4): `textDocument/rename` end-to-end — the same scenario as
-/// [`rename_public_class_includes_file_rename_when_capability_advertised`]
-/// but the client does NOT advertise
-/// `workspace.workspaceEdit.resourceOperations` including `"rename"`: the
-/// text edits must still succeed, but no `RenameFile` op may be present.
+/// Same scenario as
+/// [`rename_public_class_includes_file_rename_when_capability_advertised`],
+/// but without rename resource-operation support advertised: text edits
+/// must still succeed, with no `RenameFile` op present.
 #[test]
 fn rename_public_class_skips_file_rename_without_capability() {
     let root = temp_root("rename-no-file-op");
@@ -1670,21 +1676,11 @@ fn rename_public_class_skips_file_rename_without_capability() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M5.2: classpath invalidation on build-file change, end to end. A Maven
-/// project declares a dependency (`com.example:extlib:1.0`) that isn't yet
-/// present in the (fixture, per-test) local `~/.m2/repository`, so a member
-/// call on it doesn't resolve (`textDocument/hover` -> `null`). The
-/// dependency's real jar (compiled with `javac`/`jar`, not hand-rolled
-/// bytecode) then appears in the fixture repo, `pom.xml` is "touched" by
-/// driving a `workspace/didChangeWatchedFiles` notification directly over
-/// stdio (matching the task brief — no real filesystem watcher is
-/// involved), and — after the debounced rebuild (overridden via
-/// `initializationOptions.classpathDebounceMs` to a few ms so this test
-/// doesn't sleep multiple seconds) swaps in the new classpath and
-/// republishes diagnostics — the same hover now resolves it.
-///
-/// Skips gracefully if `javac`/`jar` aren't on `PATH` (mirrors this suite's
-/// JDK-gated skips elsewhere): there's no fixture dependency to build.
+/// Classpath invalidation on build-file change: hover on an unresolved
+/// Maven dependency returns null until its jar is installed and a
+/// `workspace/didChangeWatchedFiles` notification for `pom.xml` triggers a
+/// debounced classpath rebuild, after which hover resolves. Skips if
+/// `javac`/`jar` aren't on `PATH`.
 #[test]
 fn classpath_invalidation_on_build_file_change_round_trip() {
     if Command::new("javac").arg("-version").output().is_err()
@@ -1833,13 +1829,9 @@ fn classpath_invalidation_on_build_file_change_round_trip() {
     let _ = std::fs::remove_dir_all(&build_dir);
 }
 
-/// M5.2 negative case: a `workspace/didChangeWatchedFiles` notification for
-/// a file that isn't one of the watched build files must never trigger a
-/// classpath rebuild. Verified via log absence: with the debounce
-/// overridden to 20ms, a deliberate (bounded, short) wait comfortably longer
-/// than that gives a wrongly-triggered rebuild time to have logged
-/// "classpath rebuild: started" before a follow-up request/response pair
-/// (used only as a synchronization point) is checked against.
+/// A `workspace/didChangeWatchedFiles` notification for an unwatched file
+/// must never trigger a classpath rebuild — verified via log absence after
+/// waiting past the debounce window.
 #[test]
 fn did_change_watched_files_ignores_unrelated_file() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -1865,9 +1857,10 @@ fn did_change_watched_files_ignores_unrelated_file() {
     let _ = read_until(&mut reader, "\"id\":1", &mut seen);
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
 
-    // Not one of the watched build files (a plain `.java` file).
+    // Not a watched build file and not `.java` either — must trigger no
+    // classpath rebuild and no `on_java_source_events` pass.
     send(
-        r#"{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":"file:///Sample.java","type":2}]}}"#,
+        r#"{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":"file:///Sample.txt","type":2}]}}"#,
     );
 
     // Give a (hypothetically, wrongly triggered) rebuild time to have
@@ -1900,16 +1893,9 @@ fn did_change_watched_files_ignores_unrelated_file() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// The JDK's home directory for M5.4's `checkProject` end-to-end test,
-/// which needs a *real* `javac` to invoke — unlike the JDK-gated
-/// definition/hover round trips above (which only need `jvl-classpath`'s
-/// broader `best_jdk()` probing, i.e. jmods on disk), `javac::locate_javac`
-/// deliberately only checks `$JAVA_HOME`/an explicit override (per the task
-/// brief — never a PATH search), so this test sets `JAVA_HOME` explicitly
-/// on the spawned server's environment rather than relying on the ambient
-/// one (which may well be unset even where a JDK is otherwise
-/// discoverable, e.g. via `/usr/libexec/java_home` on macOS or a `java` on
-/// PATH). Still filesystem/OS-tool probing only, never a network fetch.
+/// Finds a JDK home for the `checkProject` test to set as `JAVA_HOME`:
+/// `locate_javac` only checks `$JAVA_HOME`/an explicit override, never a
+/// PATH search, so the ambient environment can't be relied on.
 fn discover_java_home() -> Option<String> {
     if let Ok(existing) = std::env::var("JAVA_HOME") {
         if !existing.is_empty() {
@@ -1927,21 +1913,11 @@ fn discover_java_home() -> Option<String> {
     None
 }
 
-/// M5 (5.4): the one-shot `javac` check command, end to end.
-/// Workspace-Trust gating lives entirely in `editors/vscode` (out of scope
-/// for a server-only test — the server has no notion of it and just does
-/// what it's told); this drives `workspace/executeCommand` directly, as the
-/// extension would after confirming trust. Covers: a broken and a good file
-/// on disk (neither ever opened) → `checkProject` → a `javac`-sourced
-/// diagnostic published against the broken file's URI and *no*
-/// `publishDiagnostics` at all for the good one; opening the broken file
-/// then runs the native initializer check too, which independently confirms
-/// the identical incompatibility — the stored `javac` diagnostic is dropped
-/// as redundant rather than duplicating the now-native-sourced one (merged,
-/// not clobbered); and editing it clears that diagnostic immediately (stale
-/// after edit), well before any second `checkProject` run. Skips gracefully
-/// (like the JDK round trips above) if no JDK is discoverable in this
-/// environment.
+/// `jvl.checkProject.run` end to end: checking a broken and a good file on
+/// disk (both closed) publishes a javac diagnostic only for the broken
+/// file. Opening it then runs the native check too, which drops the stored
+/// javac diagnostic as redundant instead of duplicating it; editing the
+/// file clears the diagnostic immediately.
 #[test]
 fn check_project_javac_round_trip() {
     let Some(java_home) = discover_java_home() else {
@@ -1997,11 +1973,9 @@ fn check_project_javac_round_trip() {
     send(
         r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
     );
-    // The handler's diagnostics publish and its own response are written by
-    // independent tower-lsp paths, so their wire order is NOT guaranteed
-    // (the same race the references truncation-notice test hit). Read the
-    // response first, then keep reading order-tolerantly until the publish
-    // for Broken.java has also arrived.
+    // The response and the diagnostics publish race on independent output
+    // paths; read the response first, then keep reading until the publish
+    // for Broken.java arrives too.
     let result = read_until(&mut reader, "\"id\":2", &mut seen);
     assert!(
         result.contains("\"status\":\"ok\""),
@@ -2028,10 +2002,8 @@ fn check_project_javac_round_trip() {
         "Good.java compiled clean — it must never receive a publishDiagnostics notification: {seen:#?}"
     );
 
-    // Opening the broken file's native initializer check independently
-    // confirms the identical incompatibility; the stored javac diagnostic
-    // is dropped as redundant (kept-native semantics) rather than
-    // duplicating it, so exactly the native-sourced diagnostic remains.
+    // Opening it runs the native check too; the javac diagnostic is
+    // dropped as redundant instead of being shown alongside the native one.
     let escaped_broken_text = json_escape(broken_text);
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{broken_uri}","languageId":"java","version":1,"text":"{escaped_broken_text}"}}}}}}"#
@@ -2047,8 +2019,7 @@ fn check_project_javac_round_trip() {
         "the confirmed javac copy must be dropped, not shown alongside the native one: {opened_diags}"
     );
 
-    // Editing it clears the javac diagnostic immediately (stale after
-    // edit), before any second checkProject run.
+    // Editing the file clears the stale javac diagnostic immediately.
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{broken_uri}","version":2}},"contentChanges":[{{"text":"{escaped_broken_text}// edited\n"}}]}}}}"#
     ));
@@ -2070,11 +2041,9 @@ fn check_project_javac_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M6.2: `jvl/missingDependencies` reports the current classpath's degraded
-/// coordinates split into `missing` (a real `g:a:v` absent from the fixture
-/// `~/.m2` — the extension's download candidate) and `skipped` (a
-/// classifier variant resolution deliberately won't pursue, surfaced with a
-/// reason so the UI can explain the gap instead of silently dropping it).
+/// `jvl/missingDependencies` splits degraded classpath coordinates into
+/// `missing` (fetchable) and `skipped` (a classifier variant, with a reason
+/// so the UI can explain the gap).
 #[test]
 fn missing_dependencies_reports_fetchable_and_skipped_coordinates() {
     let root = temp_root("missing-deps");
@@ -2121,9 +2090,7 @@ fn missing_dependencies_reports_fetchable_and_skipped_coordinates() {
     let _ = read_until(&mut reader, "\"id\":1", &mut seen);
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
 
-    // No `params` field at all — `jvl/missingDependencies` takes none (see
-    // `tower_lsp_server`'s `FromParams for ()`, which only accepts an
-    // absent/`null` params value).
+    // No `params` field: `jvl/missingDependencies` takes none.
     send(r#"{"jsonrpc":"2.0","id":2,"method":"jvl/missingDependencies"}"#);
     let result = read_until(&mut reader, "\"id\":2", &mut seen);
     let json: Value = serde_json::from_str(&result).expect("parse missingDependencies response");
@@ -2157,13 +2124,10 @@ fn missing_dependencies_reports_fetchable_and_skipped_coordinates() {
     let _ = std::fs::remove_dir_all(&fixture_home);
 }
 
-/// M6.2: the fixed-point rebuild loop's server-side half — after the
-/// extension installs a consented-to dependency into `~/.m2` and calls
+/// After installing a dependency into `~/.m2` and calling
 /// `jvl.classpath.rebuild`, a follow-up `jvl/missingDependencies` query must
-/// no longer report it. Uses dummy (non-`javac`-built) jar/pom bytes, same as
-/// the `resolve.rs`/`gradle.rs` unit tests — this test is about the
-/// rebuild/re-query wiring, not the jar's actual bytecode, so it never needs
-/// a real JDK and always runs.
+/// no longer report it. Uses dummy jar/pom bytes since only the
+/// rebuild/re-query wiring is under test.
 #[test]
 fn rebuild_classpath_command_shrinks_missing_dependencies_list() {
     let root = temp_root("rebuild-missing-deps");
@@ -2222,9 +2186,8 @@ fn rebuild_classpath_command_shrinks_missing_dependencies_list() {
         "expected extlib to be missing before install: {before}"
     );
 
-    // Simulate what `mavenFetch.ts` does after a consented download:
-    // install the pom + jar directly into the fixture `~/.m2/repository`,
-    // laid out exactly as the Maven backend expects.
+    // Simulate a consented download: install the pom + jar directly into
+    // the fixture `~/.m2/repository`, laid out as the Maven backend expects.
     let artifact_dir = fixture_home.join(".m2/repository/com/example/extlib/1.0");
     std::fs::create_dir_all(&artifact_dir).expect("create m2 artifact dir");
     std::fs::write(artifact_dir.join("extlib-1.0.jar"), b"jar").expect("install fixture jar");
@@ -2269,15 +2232,10 @@ fn rebuild_classpath_command_shrinks_missing_dependencies_list() {
     let _ = std::fs::remove_dir_all(&fixture_home);
 }
 
-/// The VS Code extension registers its user-facing commands itself (with a
-/// Workspace-Trust gate), and `vscode-languageclient` ALSO auto-registers a
-/// VS Code command for every ID the server advertises in
-/// `executeCommandProvider` — so a server-advertised ID that matches an
-/// extension-contributed ID throws `command '<id>' already exists` during
-/// `initializeFeatures` and kills client startup ("Server initialization
-/// failed" in the editor). Raw-LSP tests can't see the VS Code command
-/// registry, so this guards the invariant statically: the two ID sets must
-/// be disjoint.
+/// `vscode-languageclient` auto-registers a VS Code command for every
+/// server-advertised `executeCommand` id, so an id that collides with an
+/// extension-contributed command breaks client startup. This statically
+/// checks the two ID sets stay disjoint.
 #[test]
 fn server_commands_do_not_collide_with_extension_commands() {
     // The extension's contributed (user-facing) command IDs.
@@ -2352,11 +2310,9 @@ fn server_commands_do_not_collide_with_extension_commands() {
     let _ = child.wait();
 }
 
-/// M6 (6.1): structural Java-rule diagnostics end to end, rule (a) — a lone
-/// file (no workspace) at `file:///Foo.java` declaring `public class Bar`
-/// gets the javac-worded "should be declared in a file named" error; this is
-/// the user-reported motivating case (`MavenDemo2.java` / `class
-/// MavenDemo3`) reproduced directly.
+/// A lone file (no workspace) declaring a public class whose name doesn't
+/// match the filename gets the javac-worded "should be declared in a file
+/// named" error.
 #[test]
 fn structural_filename_mismatch_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -2404,10 +2360,8 @@ fn structural_filename_mismatch_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M6 (6.1): structural Java-rule diagnostics end to end, rule (c) — a
-/// workspace file under `src/main/java/com/x/` declaring `package com.y;`
-/// gets a package/directory mismatch error; the same file with a matching
-/// `package com.x;` is clean.
+/// A file under `src/main/java/com/x/` declaring `package com.y;` gets a
+/// package/directory mismatch error; matching `package com.x;` is clean.
 #[test]
 fn structural_package_mismatch_then_clean_round_trip() {
     let root = temp_root("structural-package");
@@ -2478,15 +2432,10 @@ fn structural_package_mismatch_then_clean_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M6 (6.1) fix round 1: the package-vs-directory diagnostic must use only
-/// the fixed conventional source roots — never roots *inferred from other
-/// open documents* (`infer_source_root`), which are fine for best-effort
-/// navigation but would make what error a file gets depend on which
-/// unrelated sibling files happen to be open. Scenario: doc A at
-/// `root/lib/a/b/A.java` declaring `package a.b;` makes `root/lib` an
-/// inferred source root; doc B at `root/lib/c/B.java` declaring an
-/// unrelated `package x.y;` would then have "expected package c" under the
-/// old behavior and get a false mismatch error. It must stay silent.
+/// The package-vs-directory diagnostic must use only conventional source
+/// roots, never a root inferred from another open document — otherwise a
+/// file's diagnostic would depend on which unrelated siblings happen to be
+/// open.
 #[test]
 fn structural_package_rule_ignores_open_doc_inferred_roots() {
     let root = temp_root("structural-inferred-root");
@@ -2527,14 +2476,15 @@ fn structural_package_rule_ignores_open_doc_inferred_roots() {
     ));
     let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
 
-    // Doc B: under `root/lib/c/` with an unrelated package. The inferred
-    // `root/lib` root "contains" it, but only conventional roots may drive
-    // the diagnostic — B must publish NO diagnostics at all.
+    // Doc B: under the inferred `root/lib`, but only conventional roots may
+    // drive the diagnostic — B must publish no diagnostics at all.
     let b_uri = format!("file://{}", b_dir.join("B.java").display());
     send(&format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{b_uri}","languageId":"java","version":1,"text":"package x.y;\nclass B {{}}\n"}}}}}}"#
     ));
-    let b_diag = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    // Opening B recomputes diagnostics for every open document, so A's own
+    // republish may arrive first; wait specifically for the frame naming B.
+    let b_diag = read_until(&mut reader, &b_uri, &mut seen);
     assert!(
         b_diag.contains(&b_uri),
         "expected B's own diagnostics notification: {b_diag}"
@@ -2557,11 +2507,9 @@ fn structural_package_rule_ignores_open_doc_inferred_roots() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M6 (6.3): `textDocument/completion` never fetches Javadoc — items come
-/// back with a `data` payload but no `documentation` — and
-/// `completionItem/resolve` is what actually fetches it, on demand, for an
-/// in-project member. No JDK needed (in-project resolution only), so this
-/// always runs.
+/// `textDocument/completion` never fetches Javadoc eagerly; items carry a
+/// `data` payload, and `completionItem/resolve` fetches documentation on
+/// demand.
 #[test]
 fn completion_resolve_lazy_documentation_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -2647,13 +2595,10 @@ fn completion_resolve_lazy_documentation_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M6 (6.3) fix round 1: with TWO open documents declaring the same type
-/// simple name AND the same member name (different Javadoc), resolve returns
-/// the doc from the ORIGINATING document — the item's `data.uri`, stamped at
-/// completion time — never whichever same-named type an unordered all-docs
-/// scan happens to find first. And once the originating document is closed
-/// (stale URI), resolve returns the item with no documentation, without
-/// erroring.
+/// With two open documents declaring the same type/member name, resolve
+/// uses the completion item's stamped `data.uri` (the originating
+/// document), never an unordered scan. If that document is later closed,
+/// resolve returns no documentation rather than erroring.
 #[test]
 fn completion_resolve_same_named_types_uses_originating_document() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -2756,15 +2701,10 @@ fn completion_resolve_same_named_types_uses_originating_document() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M6 (6.3): the same lazy-resolve round trip for an *external* member —
-/// `String.length`'s Javadoc, recovered from the JDK's `src.zip` only when
-/// `completionItem/resolve` is actually invoked. Skips gracefully (like the
-/// other JDK-gated round trips in this file) if no JDK is discoverable —
-/// signaled here by the completion request returning no items at all (no
-/// classpath means `resolve_type_node`'s external branch never resolves) —
-/// and skips the documentation assertion specifically (leaving the
-/// lazy-resolve wiring assertions above it in force) if the discovered JDK
-/// has no bundled `src.zip` at all, e.g. Alpine's `openjdk21-jdk` package.
+/// Same lazy-resolve round trip as above, but for an external member:
+/// `String.length`'s Javadoc comes from the JDK's `src.zip` only when
+/// `completionItem/resolve` is invoked. Skips if no JDK is discoverable, and
+/// skips just the documentation check if the JDK has no bundled `src.zip`.
 #[test]
 fn completion_resolve_external_member_jdk_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -2833,12 +2773,8 @@ fn completion_resolve_external_member_jdk_round_trip() {
         let has_documentation = resolved_json["result"]["documentation"].is_object()
             || resolved_json["result"]["documentation"].is_string();
         if !has_documentation {
-            // A discoverable JDK without a bundled `src.zip` is a real,
-            // valid environment, not a broken one — the server already
-            // degrades gracefully here (a well-formed resolve response,
-            // simply with no `documentation`, exactly as asserted above via
-            // the lazy-resolve `data` payload), so there is nothing further
-            // this JDK can prove about `src.zip` extraction specifically.
+            // No bundled `src.zip` is a valid JDK environment, not a
+            // broken one — nothing further to prove here.
             eprintln!(
                 "skipping completion_resolve_external_member_jdk_round_trip's documentation assertion: this JDK has no src.zip"
             );
@@ -2855,10 +2791,9 @@ fn completion_resolve_external_member_jdk_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// M7: project-source symbol layer end-to-end — a workspace type the user
-/// never opens (`Person.java`) still drives member completion, classpath-
-/// style type-name completion, and lazy Javadoc, identically to a compiled
-/// dependency. Only `Main.java` is opened.
+/// A workspace type the user never opens (`Person.java`) still drives
+/// member completion, type-name completion, and lazy Javadoc, identically
+/// to a compiled dependency.
 #[test]
 fn project_source_symbols_closed_file_round_trip() {
     let root = temp_root("project-symbols");
@@ -2898,9 +2833,8 @@ fn project_source_symbols_closed_file_round_trip() {
     let _ = read_until(&mut reader, "\"id\":1", &mut seen);
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
 
-    // `Person` used (same package, no import needed), but its own file is
-    // never opened. Kept on a single line so a byte offset from `.find`
-    // doubles as the `character` column (`line` stays 0).
+    // `Person` is used but never opened. Kept single-line so a `.find`
+    // byte offset also works as the `character` column.
     let main_uri = format!(
         "file://{}",
         root.join("src/main/java/demo/Main.java").display()
@@ -2992,9 +2926,9 @@ fn project_source_symbols_closed_file_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M8a: `textDocument/codeAction` end-to-end — an add-import quick fix for a
-/// closed project type used from another package, and "Organize Imports"
-/// rewriting an unsorted import block with an unused entry.
+/// `textDocument/codeAction` round trip: an add-import quick fix for a
+/// closed project type, and "Organize Imports" rewriting an unsorted import
+/// block with an unused entry.
 #[test]
 fn code_actions_add_import_and_organize_imports_round_trip() {
     let root = temp_root("code-actions");
@@ -3111,9 +3045,9 @@ fn code_actions_add_import_and_organize_imports_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M8c: Lombok synthesis end-to-end for a **closed** project file — `@Data`
-/// getters complete on `p.`, and a `@Builder` chain resolves through the
-/// synthesized `Person.PersonBuilder` companion type.
+/// Lombok synthesis for a closed project file: `@Data` getters complete on
+/// `p.`, and a `@Builder` chain resolves through the synthesized
+/// `PersonBuilder`.
 #[test]
 fn lombok_members_from_closed_file_round_trip() {
     let root = temp_root("lombok");
@@ -3205,9 +3139,9 @@ fn lombok_members_from_closed_file_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M8e: call + type hierarchy end-to-end — prepare/incoming/outgoing on a
-/// method, prepare/supertypes/subtypes on a type, with the subtype scan
-/// finding an implementor in a **closed** workspace file.
+/// Call + type hierarchy round trip: prepare/incoming/outgoing on a method,
+/// prepare/supertypes/subtypes on a type, with the subtype scan finding an
+/// implementor in a closed workspace file.
 #[test]
 fn call_and_type_hierarchy_round_trip() {
     let root = temp_root("hierarchy");
@@ -3377,11 +3311,8 @@ fn call_and_type_hierarchy_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// M8b fix: `checkProject` must locate `javac` with **no** `$JAVA_HOME` and
-/// no `jdk.home` override — the GUI-launched-editor environment — via the
-/// classpath layer's filesystem JDK discovery. This was a field failure:
-/// intellisense worked (jmods discovered by probing) while check-on-save
-/// reported "could not locate javac".
+/// `checkProject` must locate `javac` via filesystem JDK discovery even
+/// with no `$JAVA_HOME` and no `jdk.home` override set.
 #[test]
 fn check_project_locates_javac_without_java_home() {
     if jvl_classpath::best_jdk()
@@ -3451,11 +3382,10 @@ fn check_project_locates_javac_without_java_home() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Scoped (module) checks reject malformed requests outright — a non-`.java`
-/// URI, a non-`file:` URI, an out-of-workspace file, and an empty module list
-/// must each come back `status:"error"` and NEVER be silently widened into a
-/// project-wide compile. No JDK needed: every rejection happens before javac
-/// is ever located.
+/// Scoped (module) checks reject malformed requests (bad URI scheme,
+/// non-`.java`, out-of-workspace, or empty module list) with
+/// `status:"error"`, never silently widened into a project-wide compile.
+/// Rejection happens before javac is located, so no JDK is needed.
 #[test]
 fn check_scoped_rejects_invalid_and_outside_uris() {
     let root = temp_root("scoped-reject");
@@ -3538,16 +3468,8 @@ fn check_scoped_rejects_invalid_and_outside_uris() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
-/// A "modules" batch mixing a real, checkable module file with a stray file
-/// the server can't resolve to any module/source root (the exact shape a
-/// real editor session produces: e.g. one open document lives under a
-/// dot-directory test fixture outside any `src/main/java` convention) must
-/// still check whatever it CAN resolve — one unsupported-layout straggler
-/// must never silently drop every other, perfectly valid file in the same
-/// batch. Only when EVERY uri in the batch is unsupported does the request
-/// fail with `"unsupported-layout"` (phase 2) — this is the one case, not a
-/// batch-wide veto by a single bad entry.
-/// Skips gracefully if no JDK is discoverable.
+/// A mixed scoped batch checks resolvable modules and skips unsupported files.
+/// An all-unsupported batch fails; the test skips when no JDK is available.
 #[test]
 fn check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one() {
     let Some(java_home) = discover_java_home() else {
@@ -3568,10 +3490,8 @@ fn check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one() {
         "package a;\npublic class A {\n    void m() {\n        int x = \"nope\";\n    }\n}\n";
     std::fs::write(&a_path, a_broken).expect("write A");
 
-    // A real .java file inside the workspace, but outside any Maven/Gradle
-    // module and outside the workspace-root conventional source roots —
-    // mirrors a dot-directory test fixture deliberately kept off the javac
-    // source walk (see the VS Code suite's `.syntax-fixture/Syntax.java`).
+    // A real .java file inside the workspace but outside any module or
+    // conventional source root — an unresolvable "stray" file.
     let stray_dir = root.join("stray");
     std::fs::create_dir_all(&stray_dir).expect("stray dir");
     let stray_path = stray_dir.join("Stray.java");
@@ -3604,9 +3524,8 @@ fn check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one() {
     let a_uri = format!("file://{}", a_path.display());
     let stray_uri = format!("file://{}", stray_path.display());
 
-    // Phase 1: a batch with BOTH uris must still check mod-a (the stray
-    // entry is silently left unchecked, exactly like a save-triggered batch
-    // that happens to include an unrelated open document).
+    // Phase 1: a batch with both uris must still check mod-a; the stray
+    // entry is silently left unchecked.
     send(&format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{{"command":"jvl.checkProject.run","arguments":[{{"scope":"modules","documentUris":["{a_uri}","{stray_uri}"]}}]}}}}"#
     ));
@@ -3647,23 +3566,8 @@ fn check_scoped_mixed_batch_checks_resolvable_uris_despite_unsupported_one() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The heart of the scoped-check design, end to end against real `javac` on a
-/// two-module Maven project (`mod-a` depends on `mod-b`):
-///
-/// 1. **`-sourcepath` resolves a sibling**: a scoped check of `mod-a` — whose
-///    class references `mod-b`'s — compiles cleanly (0 errors), proving the
-///    sibling source resolved without being an explicit input.
-/// 2. **External error → full-project fallback**: breaking `mod-b` and
-///    re-checking only `mod-a` (which references it) makes javac flag a file
-///    outside the checked module; the run must transparently fall back to a
-///    full project check (result has NO `"scope":"modules"` and reports the
-///    error) rather than publish a misleading clean scoped result.
-/// 3. **Module isolation + clean recheck clears**: with both modules broken
-///    *independently*, a full project check flags both; fixing `mod-a` and
-///    scoped-checking it clears `mod-a`'s diagnostic while leaving `mod-b`'s
-///    untouched (verified by reopening each file).
-///
-/// Skips gracefully if no JDK is discoverable.
+/// End-to-end scoped javac coverage for sibling sourcepath resolution, fallback
+/// when errors escape the module, and isolation between modules. Skips without a JDK.
 #[test]
 fn check_scoped_sourcepath_isolation_and_fallback() {
     let Some(java_home) = discover_java_home() else {
@@ -3739,9 +3643,8 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
         "sibling must resolve via -sourcepath (0 errors): {raw}"
     );
 
-    // Phase 2: break B (a type error in its body), keep A referencing it, and
-    // re-check ONLY mod-a. javac loads B via -sourcepath, flags it → external
-    // scope → the run falls back to a full project check.
+    // Phase 2: break B while A still references it; checking only mod-a
+    // makes javac flag B (external scope) and fall back to a full check.
     let b_broken = "package b;\npublic class B {\n    public void hello() {\n        int x = \"nope\";\n    }\n}\n";
     std::fs::write(&b_path, b_broken).expect("rewrite B broken");
     send(&format!(
@@ -3785,9 +3688,8 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
         "a full project check must flag BOTH modules: {raw}"
     );
 
-    // Fix A on disk; scoped-check mod-a only. A is now clean and does not
-    // reference B, so there is no external error and no fallback: A's diagnostic
-    // clears while B's is preserved untouched.
+    // Fix A and scoped-check mod-a only: A no longer references B, so
+    // there's no external error/fallback — A clears, B stays untouched.
     let a_fixed = "package a;\npublic class A {\n    void m() {}\n}\n";
     std::fs::write(&a_path, a_fixed).expect("fix A");
     send(&format!(
@@ -3804,10 +3706,9 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
         "fixed module A must be clean: {raw}"
     );
 
-    // Verify preservation/clearing deterministically: a classpath rebuild
-    // republishes every open document's diagnostics straight from the server's
-    // javac map WITHOUT recompiling — so B (untouched by the module-A scoped
-    // check) still carries its javac error, and A (cleared) does not.
+    // A classpath rebuild republishes every open document's diagnostics
+    // from the server's javac map without recompiling, so we can verify
+    // B still carries its error while A's has cleared.
     let mark = seen.len();
     send(
         r#"{"jsonrpc":"2.0","id":6,"method":"workspace/executeCommand","params":{"command":"jvl.classpath.rebuild","arguments":[]}}"#,
@@ -3861,18 +3762,10 @@ fn check_scoped_sourcepath_isolation_and_fallback() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Task 3/4: the no-save native return diagnostic, end to end over raw LSP.
-/// Opens a valid document, then makes it wrong-return (`int code() {
-/// return "bad"; }` shape) via `didChange` — with a timestamp taken
-/// immediately before the notification is written. The very next
-/// publication must carry exactly ONE `jvl.incompatibleReturn` ERROR
-/// (source `java-vsix-lite`, exact Task 2 message) and — because live
-/// buffers publish versioned diagnostics — `version` equal to the
-/// `didChange`'s document version. No save and no `workspace/executeCommand`
-/// is ever sent before the assertion, so the arrival is causally
-/// save-free and subprocess-free. The elapsed time is printed as
-/// `native_return_diagnostic_ms=<elapsed>` for observability only — per the
-/// Task 4 brief there is deliberately NO machine-specific timing threshold.
+/// The native return-type diagnostic must arrive on a plain `didChange`
+/// (no save, no `workspace/executeCommand`), as exactly one
+/// `jvl.incompatibleReturn` ERROR carrying the change's document version.
+/// Elapsed time is printed for observability only, with no timing assertion.
 #[test]
 fn native_return_diagnostic_round_trip() {
     let bin = env!("CARGO_BIN_EXE_jvl-server");
@@ -3962,16 +3855,10 @@ fn native_return_diagnostic_round_trip() {
     assert!(status.success(), "server exited with failure: {status:?}");
 }
 
-/// A fake-`javac` JDK home for the Task 3 dedup/race lifecycle tests, in
-/// the same spirit as `javac_tests.rs`'s `write_slow_fake_javac` safety
-/// fixture: a `sh` script standing in for the compiler, wired in through
-/// the `jdkHome` initialization option (`java-vsix-lite.jdk.home`), which
-/// `locate_javac` requires to resolve to `<home>/bin/javac`. The script
-/// ignores its arguments, optionally touches `marker` and then sleeps
-/// `sleep_secs` (the stale-race half needs "compiler started, result not
-/// yet delivered" to be observable), then emits `stderr` — a valid javac
-/// wrong-return record — and exits 1 (a nonzero exit for compile errors is
-/// normal javac behavior). Unix-only, exactly like the existing fixture.
+/// Builds a fake `javac` JDK home wired in via the `jdkHome` init option: a
+/// shell script at `<home>/bin/javac` that ignores its args, optionally
+/// touches `marker` then sleeps `sleep_secs` (to make an in-flight compile
+/// observable), then emits `stderr` and exits 1. Unix-only.
 #[cfg(unix)]
 fn write_fake_javac_jdk(
     root: &std::path::Path,
@@ -3994,11 +3881,9 @@ fn write_fake_javac_jdk(
     jdk_home
 }
 
-/// The wrong-return source used by both fake-javac lifecycle tests. Line 5
-/// (1-based) is `        return "bad";` — the returned expression `"bad"`
-/// spans characters 15..20, so the native return diagnostic and the fake
-/// compiler record (caret at column 15, line length 21) overlap on the
-/// same line with the identical `incompatible types: ` payload.
+/// The wrong-return source shared by both fake-javac tests. Line 5's
+/// returned `"bad"` spans characters 15..20, matching the fake compiler
+/// record's caret column so both diagnostics land on the same span.
 #[cfg(unix)]
 const WRONG_RETURN_SOURCE: &str =
     "package demo;\n\npublic class Sample {\n    int code() {\n        return \"bad\";\n    }\n}\n";
@@ -4013,15 +3898,10 @@ fn wrong_return_stderr(path: &std::path::Path) -> String {
     )
 }
 
-/// Task 3: an equivalent compiler result must CONFIRM the native return
-/// diagnostic, never duplicate it. A wrong-return document is open (native
-/// `jvl.incompatibleReturn` published), then a fake `javac` (see
-/// [`write_fake_javac_jdk`]) reports the identical incompatibility for the
-/// same expression. After the check completes, the editor-visible set for
-/// the file must contain exactly ONE matching incompatibility — the native
-/// one, kept in place rather than swapped for javac's copy — not a
-/// native+javac pair; and, as a compiler republish snapshot of a live
-/// buffer, the publication must carry the document's version.
+/// A compiler result reporting the same incompatibility as an already-open
+/// native return diagnostic must confirm it, not duplicate it: exactly one
+/// matching diagnostic remains (the native one), and the republish still
+/// carries the document's version.
 #[cfg(unix)]
 #[test]
 fn javac_result_does_not_duplicate_native_return_diagnostic() {
@@ -4067,9 +3947,8 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
         "the native return diagnostic must arrive on open: {opened}"
     );
 
-    // Run the (fake) compiler; its publish and its response are written by
-    // independent tower-lsp paths, so collect order-tolerantly until BOTH
-    // the response and a post-check publication for the file have arrived.
+    // The fake compiler's publish and response race on independent paths;
+    // collect frames until both have arrived.
     let mark = seen.len();
     send(
         r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
@@ -4142,14 +4021,10 @@ fn javac_result_does_not_duplicate_native_return_diagnostic() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Task 3, the revision race: a compiler run STARTED BEFORE an edit must
-/// never reintroduce its (now stale) error. The fake `javac` touches a
-/// marker, sleeps, and only then reports the wrong-return error — so the
-/// test can deterministically fix the buffer via `didChange` while the
-/// compiler is provably in flight. Once the run's response and the
-/// follow-up sync point have arrived, the LAST publication for the file
-/// must contain neither the native return error (the buffer is fixed) nor
-/// the stale javac error (its start version predates the edit).
+/// A compiler run started before an edit must never reintroduce its now-
+/// stale error. The fake `javac` sleeps after touching a marker, so the
+/// test can fix the buffer mid-flight; the final publication must contain
+/// neither the (now fixed) native error nor the stale javac error.
 #[cfg(unix)]
 #[test]
 fn javac_result_started_before_edit_cannot_reintroduce_error() {
@@ -4225,11 +4100,8 @@ fn javac_result_started_before_edit_cannot_reintroduce_error() {
         "the native error must clear on the fixing didChange: {after_fix}"
     );
 
-    // Let the stale compiler run finish: collect frames until its response
-    // arrives, give any (wrongly) queued publication time to hit the wire,
-    // then use a request/response pair as a sync point (same pattern as
-    // did_change_watched_files_ignores_unrelated_file) before judging the
-    // final published state.
+    // Let the stale run finish, give any wrongly-queued publication time to
+    // arrive, then use a request/response pair as a sync point.
     let _ = read_until(&mut reader, "\"id\":2", &mut seen);
     std::thread::sleep(std::time::Duration::from_millis(300));
     send(&format!(
@@ -4250,6 +4122,126 @@ fn javac_result_started_before_edit_cannot_reintroduce_error() {
     assert!(
         !last_publication.contains("\"source\":\"javac\""),
         "a compiler run started before the edit must never reintroduce its stale error: {last_publication}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":9", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A compiler run that started before a *different* file changed on disk
+/// must not publish: its result no longer describes the workspace. The
+/// server answers `{"status":"stale"}` and the client re-queues.
+#[cfg(unix)]
+#[test]
+fn javac_result_started_before_provider_change_is_dropped() {
+    let root = temp_root("javac-provider-race");
+    let src_dir = root.join("src/main/java/demo");
+    std::fs::create_dir_all(&src_dir).expect("create temp project dirs");
+    let src_path = src_dir.join("Sample.java");
+    std::fs::write(&src_path, WRONG_RETURN_SOURCE).expect("write Sample.java");
+    let marker = root.join("javac-started");
+    let jdk_home = write_fake_javac_jdk(&root, &wrong_return_stderr(&src_path), Some((&marker, 3)));
+
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    let root_uri = format!("file://{}", root.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{"workspace":{{"didChangeWatchedFiles":{{"dynamicRegistration":true}}}}}},"initializationOptions":{{"jdkHome":"{}"}},"workspaceFolders":[{{"uri":"{root_uri}","name":"proj"}}]}}}}"#,
+        jdk_home.display()
+    ));
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // The server registers the `**/*.java` watcher dynamically and waits
+    // for the reply; without it no watched event is ever delivered.
+    let register = read_until(&mut reader, "client/registerCapability", &mut seen);
+    let register: serde_json::Value = serde_json::from_str(&register).expect("json");
+    let register_id = register["id"].clone();
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":{register_id},"result":null}}"#
+    ));
+
+    let uri = format!("file://{}", src_path.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(WRONG_RETURN_SOURCE)
+    ));
+    let opened = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+    assert!(
+        opened.contains("jvl.incompatibleReturn"),
+        "the native return diagnostic must arrive on open: {opened}"
+    );
+
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand","params":{"command":"jvl.checkProject.run","arguments":[]}}"#,
+    );
+    let mut started = false;
+    for _ in 0..100 {
+        if marker.exists() {
+            started = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(started, "the fake javac never started (no marker file)");
+
+    // A *provider* appears on disk while the compiler sleeps. The consumer
+    // buffer is untouched, so its version cannot fence the stale result.
+    let other_path = src_dir.join("Other.java");
+    std::fs::write(&other_path, "package demo;\npublic class Other { }\n").expect("write Other");
+    let other_uri = format!("file://{}", other_path.display());
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{{"changes":[{{"uri":"{other_uri}","type":1}}]}}}}"#
+    ));
+
+    let response = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        response.contains("\"status\":\"stale\""),
+        "a run outrun by a provider change must report stale: {response}"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    ));
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+
+    assert!(
+        !seen.iter().any(|f| f.contains("publishDiagnostics")
+            && f.contains(&uri)
+            && f.contains("\"source\":\"javac\"")),
+        "the stale run must never publish a compiler diagnostic"
+    );
+    let last_publication = seen
+        .iter()
+        .rev()
+        .find(|f| f.contains("publishDiagnostics") && f.contains(&uri))
+        .cloned()
+        .expect("a publication for the file");
+    assert!(
+        last_publication.contains("jvl.incompatibleReturn"),
+        "the buffer never changed, so the native error must still be shown: {last_publication}"
     );
 
     send(r#"{"jsonrpc":"2.0","id":9,"method":"shutdown"}"#);
@@ -4366,4 +4358,66 @@ fn tests_request_discovers_junit_classes_and_respects_containment() {
     assert!(status.success(), "server exited with failure: {status:?}");
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// Hover ranges must be UTF-16 columns: the rocket emoji before the cursor
+/// is one character but two UTF-16 units, so a byte- or char-based column
+/// would be off by one or two here.
+#[test]
+fn hover_range_uses_utf16_columns_after_astral_character() {
+    let bin = env!("CARGO_BIN_EXE_jvl-server");
+    let mut child: Child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn jvl-server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |msg: &str| {
+        stdin
+            .write_all(frame(msg).as_bytes())
+            .expect("write to server")
+    };
+    let mut seen: Vec<String> = Vec::new();
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let _ = read_until(&mut reader, "\"id\":1", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // `class C { String s = "<rocket>"; int width = 1; }` — the rocket is a
+    // surrogate pair, so `width` starts two UTF-16 units before its byte column.
+    let text = "class C { String s = \"\u{1F680}\"; int width = 1; }\n";
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///Astral.java","languageId":"java","version":1,"text":"{}"}}}}}}"#,
+        json_escape(text)
+    ));
+    let _ = read_until(&mut reader, "textDocument/publishDiagnostics", &mut seen);
+
+    let utf16_column = text
+        .find("width")
+        .map(|byte| text[..byte].chars().map(char::len_utf16).sum::<usize>())
+        .expect("marker present");
+    send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"file:///Astral.java"}},"position":{{"line":0,"character":{utf16_column}}}}}}}"#
+    ));
+    let hover = read_until(&mut reader, "\"id\":2", &mut seen);
+    assert!(
+        hover.contains("int width"),
+        "hover must land on `width` when the column is counted in UTF-16 units: {hover}"
+    );
+    assert!(
+        hover.contains(&format!("\"character\":{utf16_column}")),
+        "the returned range must start at the same UTF-16 column: {hover}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
+    let _ = read_until(&mut reader, "\"id\":3", &mut seen);
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let mut rest = String::new();
+    let _ = reader.read_to_string(&mut rest);
+    let status = child.wait().expect("wait for server exit");
+    assert!(status.success(), "server exited with failure: {status:?}");
 }

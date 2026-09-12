@@ -6,6 +6,7 @@ dist/
 .vscode-test/
 coverage/
 *.tsbuildinfo
+tools/vscode-compare/out/
 
 # Logs
 *.log

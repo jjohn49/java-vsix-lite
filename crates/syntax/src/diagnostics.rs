@@ -15,8 +15,8 @@ use tree_sitter::Node;
 
 use crate::external::SymbolSource;
 use crate::imports::Imports;
-use crate::model::{named_children, TypeDecl, TypeKind, TypeTable};
-use crate::resolve::{self, Ctx, ResolvedType};
+use crate::model::{has_modifier, named_children, TypeKind, TypeTable};
+use crate::resolve::{self, Ctx, FactsCache, ResolvedType};
 use crate::{diagnostic, node_text, LineIndex, OpenDoc, MAX_DIAGNOSTICS};
 
 /// Stable LSP code for a proven incompatible method return.
@@ -34,6 +34,12 @@ pub const CANNOT_FIND_SYMBOL_CODE: &str = "jvl.cannotFindSymbol";
 
 /// Stable LSP code for unused locals, parameters, and private members.
 const UNUSED_CODE: &str = "jvl.unused";
+
+/// Stable LSP code for a proven no-applicable-overload method call.
+pub const INVALID_INVOCATION_CODE: &str = "jvl.invalidInvocation";
+
+/// Stable LSP code for a proven uninstantiable/inaccessible constructor call.
+pub const INVALID_INSTANTIATION_CODE: &str = "jvl.invalidInstantiation";
 
 /// Immediate semantic diagnostics for `docs[current]`.
 ///
@@ -54,20 +60,22 @@ pub fn semantic_diagnostics(
     };
     let table = TypeTable::build(docs, current);
     let imports = Imports::parse(doc.tree, doc.source);
+    let facts = FactsCache::default();
     let ctx = Ctx {
         doc,
         current,
         table: &table,
         imports: &imports,
         symbols,
+        docs,
+        facts: &facts,
     };
 
     let mut out = Vec::new();
     let root = doc.tree.root_node();
     let name_counts = unused.then(|| identifier_counts(root, doc.source));
-    // The unresolved-identifier rule needs a fully clean parse (recovery can
-    // reattach an identifier anywhere) and knowledge of static imports
-    // (which can bind any bare name).
+    // Needs a clean parse (recovery can reattach identifiers anywhere) and
+    // static-import info, since static imports can bind any bare name.
     let static_imports =
         (unresolved_members && !root.has_error()).then(|| StaticImports::parse(root, doc.source));
     let mut stack = vec![root];
@@ -110,12 +118,20 @@ pub fn semantic_diagnostics(
             "field_access" if unresolved_members => {
                 check_member(node, "field", "field", &ctx, index, &mut out)
             }
-            // Only qualified calls (`recv.name()`); unqualified calls may be
-            // inherited or statically imported.
-            "method_invocation"
-                if unresolved_members && node.child_by_field_name("object").is_some() =>
-            {
-                check_member(node, "name", "method", &ctx, index, &mut out)
+            // Qualified calls check member existence first; applicability
+            // runs only if that found nothing. Unqualified calls have no
+            // receiver, so applicability is the only check.
+            "method_invocation" if unresolved_members => {
+                let before = out.len();
+                if node.child_by_field_name("object").is_some() {
+                    check_member(node, "name", "method", &ctx, index, &mut out);
+                }
+                if out.len() == before {
+                    check_invocation(node, &ctx, index, &mut out);
+                }
+            }
+            "object_creation_expression" if unresolved_members => {
+                check_instantiation(node, &ctx, index, &mut out)
             }
             "identifier" => {
                 if let Some(static_imports) = &static_imports {
@@ -153,11 +169,9 @@ fn check_member(
     }
     let member = node_text(member_node, ctx.doc.source);
 
-    // A type-cased segment after a dot is a *nested type* or static-member
-    // reference (`Map.Entry`, `Map.Entry::getKey`, `Outer.Inner`), not an
-    // instance member — those live in the type namespace this member check
-    // doesn't model, so never flag them (conservative-by-design). camelCase
-    // members and SCREAMING_CASE constants (no lowercase) stay checked.
+    // A type-cased segment (`Map.Entry`) is a nested type or static-member
+    // reference, not an instance member — never flag it. camelCase members
+    // and SCREAMING_CASE constants still get checked.
     if member_field == "field" && crate::looks_like_type_name(member) {
         return;
     }
@@ -166,12 +180,9 @@ fn check_member(
     let Some(resolved) = resolve::resolve_receiver_type(object, ctx) else {
         return;
     };
-    // A receiver that resolves to `java.lang.Object` is almost always the
-    // erased fallback of generic inference we couldn't fully carry through a
-    // chain (`list.stream().findFirst().orElseThrow()`, a raw type variable),
-    // not a genuine `Object`-typed value. Flagging members on it produces a
-    // flood of false positives on ordinary generic code, so stay silent —
-    // consistent with this module's conservative-by-design policy.
+    // `java.lang.Object` here is almost always an erased generic-inference
+    // fallback, not a genuine `Object` value, so flagging its members would
+    // flood ordinary generic code with false positives.
     if matches!(&resolved.ty, ResolvedType::External { fqn, .. } if fqn == "java.lang.Object") {
         return;
     }
@@ -183,6 +194,118 @@ fn check_member(
             format!("Cannot resolve {kind_word} '{member}'"),
         ));
     }
+}
+
+/// Argument-applicability check for a call whose member existence
+/// [`check_member`] already resolved. Malformed argument lists stay silent,
+/// but a missing `name`/`arguments` field needs its own guard here.
+fn check_invocation<'t>(
+    call: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+    index: &LineIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    if call.has_error() || call.parent().is_some_and(|p| p.has_error()) {
+        return;
+    }
+    let (Some(name), Some(args)) = (
+        call.child_by_field_name("name"),
+        call.child_by_field_name("arguments"),
+    ) else {
+        return;
+    };
+    match crate::call::resolve_method_call(call, ctx) {
+        crate::call::CallResolution::NoApplicable { candidates } => out.push(coded_diagnostic(
+            index.range(args),
+            INVALID_INVOCATION_CODE,
+            format!(
+                "no applicable method '{}' for argument types ({}); {candidates} candidate(s) considered",
+                node_text(name, ctx.doc.source),
+                argument_display(args, ctx)
+            ),
+        )),
+        crate::call::CallResolution::Ambiguous => out.push(coded_diagnostic(
+            index.range(name),
+            INVALID_INVOCATION_CODE,
+            format!("ambiguous method call '{}'", node_text(name, ctx.doc.source)),
+        )),
+        crate::call::CallResolution::Selected { .. } | crate::call::CallResolution::Unknown => {}
+    }
+}
+
+/// Instantiability + argument-applicability check for `new Type(args)`.
+fn check_instantiation<'t>(
+    call: Node<'t>,
+    ctx: &Ctx<'_, 't>,
+    index: &LineIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    if call.has_error() || call.parent().is_some_and(|p| p.has_error()) {
+        return;
+    }
+    let (Some(ty), Some(args)) = (
+        call.child_by_field_name("type"),
+        call.child_by_field_name("arguments"),
+    ) else {
+        return;
+    };
+    let shown = node_text(ty, ctx.doc.source)
+        .trim_end_matches("<>")
+        .to_string();
+    use crate::call::{CallResolution as R, InstantiationError as E};
+    match crate::call::resolve_constructor_call(call, ctx) {
+        Ok(R::NoApplicable { candidates }) => out.push(coded_diagnostic(
+            index.range(args),
+            INVALID_INSTANTIATION_CODE,
+            format!(
+                "no applicable constructor '{shown}' for argument types ({}); {candidates} candidate(s) considered",
+                argument_display(args, ctx)
+            ),
+        )),
+        Ok(R::Ambiguous) => out.push(coded_diagnostic(
+            index.range(ty),
+            INVALID_INSTANTIATION_CODE,
+            format!("ambiguous constructor call '{shown}'"),
+        )),
+        Err(E::Abstract(kind)) => out.push(coded_diagnostic(
+            index.range(ty),
+            INVALID_INSTANTIATION_CODE,
+            format!(
+                "cannot instantiate {} '{shown}'",
+                match kind {
+                    jvl_types::ClassKind::Interface => "interface",
+                    jvl_types::ClassKind::Annotation => "annotation",
+                    jvl_types::ClassKind::Enum => "enum",
+                    _ => "abstract class",
+                }
+            ),
+        )),
+        Err(E::Inaccessible) => out.push(coded_diagnostic(
+            index.range(ty),
+            INVALID_INSTANTIATION_CODE,
+            format!("constructor '{shown}' is not accessible"),
+        )),
+        Err(E::NeedsEnclosingInstance) => out.push(coded_diagnostic(
+            index.range(ty),
+            INVALID_INSTANTIATION_CODE,
+            format!("enclosing instance required for '{shown}'"),
+        )),
+        Ok(R::Selected { .. }) | Ok(R::Unknown) => {}
+    }
+}
+
+/// Render each argument expression's resolved type (`?` when unresolvable)
+/// for a "no applicable overload" message.
+fn argument_display(args: Node, ctx: &Ctx<'_, '_>) -> String {
+    named_children(args)
+        .into_iter()
+        .map(|a| {
+            resolve::resolve_expression_type(a, ctx)
+                .map(|t| resolve::type_display(&t))
+                .unwrap_or_else(|| "?".into())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Static-import context for the unresolved-identifier rule: a static
@@ -206,8 +329,7 @@ impl StaticImports {
                 continue;
             };
             // `dotted_path` collapses whitespace, so a static import arrives
-            // as `statica.b.C.member` — peel the keyword off (same trick as
-            // `lombok::file_uses_lombok`).
+            // as `statica.b.C.member`; peel the keyword off here.
             let Some(path) = path.strip_prefix("static") else {
                 continue;
             };
@@ -286,14 +408,9 @@ fn binds_resource(try_statement: Node, name: &str, source: &str) -> bool {
         .any(|n| node_text(n, source) == name)
 }
 
-/// Unresolved-identifier rule (`jvl.cannotFindSymbol`): a bare identifier in
-/// a value-only position that provably has no binding — not a local,
-/// parameter, pattern, catch/resource binding, static import, or a member
-/// of any enclosing type's fully-resolvable hierarchy. Anything unprovable
-/// (parse recovery, an unresolvable supertype, an anonymous class body, a
-/// static wildcard import) stays silent — the same conservative contract as
-/// every other rule here. This catches the everyday "deleted the
-/// declaration but a use remains" immediately, without waiting for javac.
+/// Unresolved-identifier rule (`jvl.cannotFindSymbol`): flags a bare
+/// identifier with no local/parameter/pattern/binding, static import, or
+/// resolvable member match. Anything unprovable stays silent.
 fn check_unresolved_identifier<'t>(
     id: Node<'t>,
     ctx: &Ctx<'_, 't>,
@@ -308,10 +425,8 @@ fn check_unresolved_identifier<'t>(
     if name == "_" || static_imports.may_bind(name) {
         return;
     }
-    // Locals, parameters, patterns, and (in-project) fields — the same
-    // position-aware lookup hover and completion use, so scoping matches
-    // Java (a local is invisible before its declaration and outside its
-    // block).
+    // Same position-aware lookup hover/completion use, so scoping matches
+    // Java (a local is invisible before its declaration or outside its block).
     if resolve::lookup_binding(
         ctx.doc.tree,
         ctx.doc.source,
@@ -359,16 +474,18 @@ fn check_unresolved_identifier<'t>(
     if enclosing_types.is_empty() {
         return;
     }
-    // Inherited members: every enclosing type's full hierarchy must be
-    // enumerable before absence is proven (an unresolvable supertype could
-    // declare the field). Member names include methods — a same-named
-    // method keeps the rule silent, conservatively.
+    // Every enclosing type's full hierarchy must be enumerable before
+    // absence is proven — an unresolvable supertype could declare the
+    // field. Method names count too, so a same-named method stays silent.
     for type_node in enclosing_types {
-        let Some(td) = TypeDecl::from_node(type_node, ctx.doc.source, ctx.current) else {
+        let Some(td) = ctx.table.by_node(ctx.current, type_node.id()).cloned() else {
             return;
         };
         let resolved = resolve::Resolved {
-            ty: ResolvedType::InProject(td),
+            ty: ResolvedType::InProject {
+                decl: td,
+                args: Vec::new(),
+            },
             static_only: false,
         };
         let (names, complete) = resolve::member_names(&resolved, ctx);
@@ -614,11 +731,9 @@ fn check_assignment<'t>(
     }
 }
 
-/// The declaration `name`/`type` nodes of a flagged assignment's LHS, found
-/// by a scoped upward textual search: the nearest preceding
-/// `local_variable_declaration` declarator or `formal_parameter` in
-/// enclosing blocks, then the nearest class's `field_declaration`s. A
-/// `this.f` LHS searches fields only (a same-named local must not win).
+/// The declaration `name`/`type` nodes for a flagged assignment's LHS:
+/// nearest local/parameter declaration, else the enclosing class's field.
+/// `this.f` searches fields only, so a same-named local can't win.
 fn lhs_declaration<'t>(
     assignment: Node<'t>,
     left: Node<'t>,
@@ -713,12 +828,8 @@ fn lhs_declaration<'t>(
     None
 }
 
-/// Unreachable-statement rule: plain `block` nodes are inspected (switch case
-/// groups are a different grammar node and stay silent, conservatively).
-/// Direct abrupt statements and `try` statements proven unable to complete
-/// normally make the first later non-comment sibling unreachable. A `finally`
-/// block remains independently reachable and is analyzed as its own block.
-/// One warning per block; recovery anywhere inside the block mutes the rule.
+/// Check unreachable statements in plain blocks only.
+/// Recovery silences the rule, and each block emits at most one warning.
 fn check_unreachable(block: Node, index: &LineIndex, out: &mut Vec<Diagnostic>) {
     if block.has_error() {
         return;
@@ -766,11 +877,9 @@ fn block_can_complete_normally(block: Node) -> bool {
     true
 }
 
-/// A `try` can complete normally iff its body or any catch can complete
-/// normally and its `finally` (when present) can complete normally. All catch
-/// clauses are considered; counting an unreachable catch can only produce
-/// conservative silence. The `finally` block itself is always walked
-/// separately by [`check_unreachable`], even when a pending return/throw exists.
+/// A `try` completes normally iff its body or any catch does, and its
+/// `finally` (if present) also does. `finally` is still walked separately
+/// by [`check_unreachable`], even with a pending return/throw.
 fn try_can_complete_normally(statement: Node) -> bool {
     let Some(body) = statement.child_by_field_name("body") else {
         return true;
@@ -800,10 +909,9 @@ fn try_can_complete_normally(statement: Node) -> bool {
     body_or_catch && finally_can_complete
 }
 
-/// Count identifier spellings once for file-wide private-member usage checks.
-/// Declaration identifiers are included, so a count greater than one means
-/// another same-spelled occurrence exists. Shadowing can only raise a count
-/// and mute a warning, preserving the rule's no-false-positive direction.
+/// Counts identifier spellings file-wide for the unused-private-member check.
+/// A count above one means another occurrence exists; shadowing can only
+/// raise the count, never cause a false unused warning.
 fn identifier_counts<'a>(root: Node, source: &'a str) -> HashMap<&'a str, usize> {
     let mut counts = HashMap::new();
     let mut stack = vec![root];
@@ -817,11 +925,9 @@ fn identifier_counts<'a>(root: Node, source: &'a str) -> HashMap<&'a str, usize>
     counts
 }
 
-/// Whether `name` occurs as an `identifier` anywhere under `scope` other than
-/// at the declaration's own name node. Purely name-occurrence based — field
-/// accesses, method invocations, and `::name` method references all carry
-/// `identifier` nodes — so shadowing can only cause silence, never a false
-/// warning.
+/// Whether `name` occurs as an `identifier` anywhere under `scope`, other
+/// than at its own declaration node. Purely occurrence-based, so shadowing
+/// can only cause silence, never a false warning.
 fn name_used(scope: Node, name_node: Node, name: &str, source: &str) -> bool {
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
@@ -837,10 +943,9 @@ fn name_used(scope: Node, name_node: Node, name: &str, source: &str) -> bool {
     false
 }
 
-/// The body a local's usage scan covers: the enclosing method or constructor
-/// body, a `static` initializer's block, or a bare instance initializer block
-/// (a `block` directly under `class_body`). A lambda-local resolves to the
-/// enclosing method body — a superset scope can only cause silence.
+/// The body a local's usage scan covers: the enclosing method/constructor
+/// body, or a static/instance initializer block. A lambda-local resolves to
+/// the enclosing method body, a superset scope that can only cause silence.
 fn local_scope<'t>(declaration: Node<'t>) -> Option<Node<'t>> {
     let mut node = declaration;
     while let Some(parent) = node.parent() {
@@ -857,31 +962,9 @@ fn local_scope<'t>(declaration: Node<'t>) -> Option<Node<'t>> {
     None
 }
 
-/// The declaration's `modifiers` child, if present.
-fn find_modifiers<'t>(declaration: Node<'t>) -> Option<Node<'t>> {
-    let mut cursor = declaration.walk();
-    let found = declaration
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "modifiers");
-    found
-}
-
-/// Whether the declaration's modifier list contains the bare `modifier`
-/// keyword (`private`, `static`, …).
-fn has_modifier(declaration: Node, source: &str, modifier: &str) -> bool {
-    let Some(modifiers) = find_modifiers(declaration) else {
-        return false;
-    };
-    let mut cursor = modifiers.walk();
-    let found = modifiers
-        .children(&mut cursor)
-        .any(|m| node_text(m, source) == modifier);
-    found
-}
-
 /// Whether the declaration carries any annotation (marker or full form).
 fn has_annotation(declaration: Node) -> bool {
-    let Some(modifiers) = find_modifiers(declaration) else {
+    let Some(modifiers) = crate::model::modifiers_node(declaration) else {
         return false;
     };
     let mut cursor = modifiers.walk();
@@ -893,7 +976,7 @@ fn has_annotation(declaration: Node) -> bool {
 
 /// Whether the declaration carries `@Override` specifically.
 fn has_override(declaration: Node, source: &str) -> bool {
-    let Some(modifiers) = find_modifiers(declaration) else {
+    let Some(modifiers) = crate::model::modifiers_node(declaration) else {
         return false;
     };
     let mut cursor = modifiers.walk();
@@ -906,10 +989,9 @@ fn has_override(declaration: Node, source: &str) -> bool {
     found
 }
 
-/// Unused-local rule: a declarator name that never occurs as an identifier
-/// elsewhere in the enclosing method (or initializer block) body is dead.
-/// Recovery anywhere in that scan scope mutes the check — occurrences inside
-/// a damaged region can't be trusted.
+/// Unused-local rule: a declarator name with no other identifier occurrence
+/// in the enclosing method (or initializer block) is dead. Recovery anywhere
+/// in that scope mutes the check.
 fn check_unused_locals(
     declaration: Node,
     source: &str,
@@ -940,10 +1022,9 @@ fn check_unused_locals(
     }
 }
 
-/// Unused-private-field rule: the usage scan is the whole file (identifiers,
-/// field accesses, and `::name` references all count), so recovery anywhere
-/// in the file mutes it. Annotated members and `serialVersionUID` (a
-/// reflective serialization contract) are exempt.
+/// Unused-private-field rule: the usage scan covers the whole file, so
+/// recovery anywhere in it mutes the check. Annotated members and
+/// `serialVersionUID` (a reflective serialization contract) are exempt.
 fn check_unused_private_fields(
     field: Node,
     root: Node,
@@ -980,10 +1061,8 @@ fn check_unused_private_fields(
 }
 
 /// Unused checks for a `method_declaration`: an unreferenced private method
-/// (any annotation exempts it — `@Override` included), and unused parameters
-/// on `private` or `static` methods with bodies. `@Override`-annotated
-/// methods and `main` keep their parameters — the signature is an inherited
-/// or external contract.
+/// (any annotation exempts it), and unused parameters on `private`/`static`
+/// methods. `@Override` and `main` keep their parameters as external contracts.
 fn check_unused_method(
     method: Node,
     root: Node,
@@ -1017,11 +1096,9 @@ fn check_unused_method(
     }
 }
 
-/// Unused-parameter scan for a method or constructor WITH a body: a formal
-/// parameter whose name never occurs in the body is dead. Bodyless
-/// (`abstract`/`native`) signatures are external contracts and stay silent;
-/// catch and lambda parameters are different grammar nodes and never reach
-/// here. Constructors are always eligible — they cannot be overridden.
+/// Unused-parameter scan for a method/constructor with a body: a parameter
+/// never referenced in the body is dead. Bodyless signatures stay silent;
+/// constructors are always eligible since they can't be overridden.
 fn check_unused_parameters(
     callable: Node,
     source: &str,
@@ -1087,8 +1164,24 @@ mod tests {
                         is_static: false,
                         ret_fqn: None,
                         ret_display: None,
+                        metadata: None,
                     })
                     .collect(),
+                metadata: Some(jvl_types::ClassMetadata {
+                    id: jvl_types::TypeId::named(fqn),
+                    kind: jvl_types::ClassKind::Class,
+                    access: jvl_types::Access::Public,
+                    is_abstract: false,
+                    is_static: true,
+                    enclosing_class: None,
+                    type_parameters: Vec::new(),
+                    supertypes: supers
+                        .iter()
+                        .map(|s| jvl_types::TypeRef::named(s))
+                        .collect(),
+                    hierarchy_complete: true,
+                    constructors_complete: true,
+                }),
             };
             if fqn == "java.lang.Object" {
                 return Some(make(&[], &["toString", "equals", "hashCode", "getClass"]));
@@ -1435,33 +1528,198 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_overload_return_is_silent() {
+    fn overload_resolution_selects_by_arity_and_proves_return_mismatch() {
+        // Arity distinguishes the zero-arg overload from `pick(int)`; its
+        // return type (`int`) is incompatible with `boolean`.
         let src = "class C {
             boolean m() { return pick(); }
             int pick() { return 1; }
             int pick(int value) { return value; }
         }\n";
 
+        let messages = return_messages(src, &NoSymbols);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("int cannot be converted to boolean"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn same_arity_overload_with_unknown_argument_is_silent() {
+        // Same-arity overloads plus an unresolvable argument type must stay
+        // unknown rather than guess a return type.
+        let src = "class C {
+            boolean m() { return pick(new Missing()); }
+            int pick(Foo a) { return 1; }
+            int pick(Bar a) { return 2; }
+        }
+        class Foo {}
+        class Bar {}
+        ";
+
         assert!(return_messages(src, &NoSymbols).is_empty());
+    }
+
+    /// `List.add(E)` re-declared over `Collection.add(E)` is one override,
+    /// not two competing overloads, so `list.add(x)` is never ambiguous.
+    #[test]
+    fn redeclared_inherited_generic_method_is_one_override() {
+        let src = "package p;
+        interface Coll<E> { boolean add(E e); }
+        interface Lst<E> extends Coll<E> { boolean add(E e); boolean add(int i, E e); }
+        class Item {}
+        class C { void m(Lst<Item> l) { l.add(new Item()); } }
+        ";
+        assert!(
+            diags(src, &NoSymbols).is_empty(),
+            "{:?}",
+            diags(src, &NoSymbols)
+        );
+    }
+
+    /// A chained call whose receiver is an unknown generic-method result
+    /// must stay unknown. Mirrors JDK `Optional<T>`: `map` is generic
+    /// (result `Opt<U>` by display only), `orElse(T)` is not.
+    #[test]
+    fn call_on_unknown_generic_result_is_silent() {
+        use jvl_types::{
+            Access, ClassKind, ClassMetadata, MemberMetadata, TypeId, TypeParameter, TypeRef,
+            TypeVariableId,
+        };
+        struct OptLike;
+        impl SymbolSource for OptLike {
+            fn class(&self, fqn: &str) -> Option<ExternalClass> {
+                let object = |members: &[&str]| ExternalClass {
+                    supers: Vec::new(),
+                    type_params: Vec::new(),
+                    members: members
+                        .iter()
+                        .map(|n| ExternalMember {
+                            name: n.to_string(),
+                            kind: ExternalMemberKind::Method,
+                            signature: format!("{n}()"),
+                            template: None,
+                            is_static: false,
+                            ret_fqn: None,
+                            ret_display: None,
+                            metadata: None,
+                        })
+                        .collect(),
+                    metadata: Some(ClassMetadata {
+                        id: TypeId::named(fqn),
+                        kind: ClassKind::Class,
+                        access: Access::Public,
+                        is_abstract: false,
+                        is_static: true,
+                        enclosing_class: None,
+                        type_parameters: Vec::new(),
+                        supertypes: Vec::new(),
+                        hierarchy_complete: true,
+                        constructors_complete: true,
+                    }),
+                };
+                if fqn == "java.lang.Object" {
+                    return Some(object(&["toString"]));
+                }
+                if fqn == "java.lang.String" {
+                    let mut s = object(&[]);
+                    s.supers = vec!["java.lang.Object".to_string()];
+                    s.metadata.as_mut().unwrap().supertypes =
+                        vec![TypeRef::named("java.lang.Object")];
+                    return Some(s);
+                }
+                if fqn != "q.Opt" {
+                    return None;
+                }
+                let t = TypeVariableId {
+                    owner: "q.Opt".into(),
+                    index: 0,
+                };
+                let u = TypeVariableId {
+                    owner: "q.Opt#map(Object)".into(),
+                    index: 0,
+                };
+                let member = |name: &str,
+                              params: Vec<TypeRef>,
+                              result: TypeRef,
+                              tps: Vec<TypeParameter>,
+                              disp: &str| {
+                    ExternalMember {
+                        name: name.to_string(),
+                        kind: ExternalMemberKind::Method,
+                        signature: format!("{name}()"),
+                        template: None,
+                        is_static: false,
+                        ret_fqn: Some("q.Opt".to_string()),
+                        ret_display: Some(disp.to_string()),
+                        metadata: Some(MemberMetadata {
+                            declaring_class: TypeId::named("q.Opt"),
+                            access: Access::Public,
+                            is_static: false,
+                            is_abstract: false,
+                            parameters: Some(params),
+                            result,
+                            type_parameters: tps,
+                            is_varargs: false,
+                        }),
+                    }
+                };
+                Some(ExternalClass {
+                    supers: vec!["java.lang.Object".to_string()],
+                    type_params: vec!["T".to_string()],
+                    members: vec![
+                        member(
+                            "map",
+                            vec![TypeRef::named("java.lang.Object")],
+                            TypeRef::named_with("q.Opt", vec![TypeRef::Variable(u.clone())]),
+                            vec![TypeParameter {
+                                id: u,
+                                bounds: Vec::new(),
+                            }],
+                            "Opt<U>",
+                        ),
+                        member(
+                            "orElse",
+                            vec![TypeRef::Variable(t.clone())],
+                            TypeRef::Variable(t.clone()),
+                            Vec::new(),
+                            "{0}",
+                        ),
+                    ],
+                    metadata: Some(ClassMetadata {
+                        id: TypeId::named("q.Opt"),
+                        kind: ClassKind::Class,
+                        access: Access::Public,
+                        is_abstract: false,
+                        is_static: true,
+                        enclosing_class: None,
+                        type_parameters: vec![TypeParameter {
+                            id: t,
+                            bounds: Vec::new(),
+                        }],
+                        supertypes: vec![TypeRef::named("java.lang.Object")],
+                        hierarchy_complete: true,
+                        constructors_complete: true,
+                    }),
+                })
+            }
+        }
+        let src = "import q.Opt;
+        class Dog {}
+        class C { void m(Opt<Dog> o) { o.map(x -> x).orElse(\"none\"); } }
+        ";
+        assert!(
+            diags(src, &OptLike).is_empty(),
+            "{:?}",
+            diags(src, &OptLike)
+        );
     }
 
     #[test]
     fn unresolved_type_variable_return_is_silent() {
         let src = "class C { <T> T m() { return \"bad\"; } }\n";
         assert!(return_messages(src, &NoSymbols).is_empty());
-    }
-
-    #[test]
-    fn cross_document_project_return_is_silent() {
-        let sources = [
-            "package p; class Other {}\n",
-            "package p; class C { Other m() { return new C(); } }\n",
-        ];
-
-        assert!(
-            semantic_for_sources(&sources, 1, &NoSymbols, false, false).is_empty(),
-            "types declared in another open document remain unknown"
-        );
     }
 
     #[test]
@@ -1496,9 +1754,8 @@ mod tests {
         assert!(diags(src, &ObjectAware(vec![])).is_empty());
     }
 
-    /// Array receivers know their complete member set — `length`/`clone`
-    /// plus Object's — so real members stay silent and bogus ones are
-    /// flagged (an earlier resolver treated `a` as its *element* type).
+    /// Array receivers know their complete member set (`length`/`clone`
+    /// plus Object's), so real members stay silent and bogus ones flagged.
     #[test]
     fn array_members_diagnose_correctly() {
         let src = "class C { void m(int[] a) { int n = a.length; a.clone(); a.toString(); } }\n";
@@ -1550,10 +1807,9 @@ mod tests {
         );
     }
 
-    /// A receiver that erased to `java.lang.Object` (the fallback of
-    /// generic inference we couldn't carry through a chain) is never flagged —
-    /// otherwise ordinary `list.stream().findFirst().orElseThrow().foo()`
-    /// floods with false positives.
+    /// A receiver erased to `java.lang.Object` (a generic-inference
+    /// fallback) is never flagged, or ordinary generic chains would flood
+    /// with false positives.
     #[test]
     fn does_not_flag_members_on_object_receiver() {
         let src = "class C { void m(Object o) { o.definitelyNotAMethod(); } }\n";
@@ -1791,9 +2047,8 @@ mod tests {
 
     // ---- Hygiene rules (initializers, unreachable, unused) ------------------
 
-    /// Hygiene-rule diagnostics: member checks off (gated and tested
-    /// independently above); `unused` gates only the unused-code rule —
-    /// initializer and unreachable checks always run.
+    /// Hygiene-rule diagnostics with member checks off. `unused` gates only
+    /// the unused-code rule; initializer/unreachable checks always run.
     fn hygiene(src: &str, unused: bool) -> Vec<Diagnostic> {
         semantic(src, &NoSymbols, false, unused)
     }
@@ -1860,8 +2115,8 @@ mod tests {
 
     #[test]
     fn constant_narrowing_initializer_is_silent() {
-        // `byte small = 1;` is legal Java (assignment conversion narrows
-        // constants), exactly like the return-check's narrowing silence.
+        // `byte small = 1;` is legal Java — assignment conversion narrows
+        // constants.
         let src = "class C { byte small = 1; }\n";
         assert!(hygiene_messages(src, false).is_empty());
     }
@@ -1999,8 +2254,8 @@ mod tests {
 
     #[test]
     fn constant_narrowing_reassignment_is_silent() {
-        // `byte b; b = 1;` is legal Java (assignment conversion narrows
-        // constants), matching the initializer rule's narrowing silence.
+        // `byte b; b = 1;` is legal Java — assignment conversion narrows
+        // constants.
         let src = "class C { void m() { byte b; b = 1; } }\n";
         assert!(hygiene_messages(src, false).is_empty());
     }
@@ -2420,9 +2675,8 @@ mod tests {
 
     #[test]
     fn bodyless_method_parameters_are_silent() {
-        // `native`: private-and-static but without a body — only methods WITH
-        // bodies are checked (`poke` itself is referenced so the member rule
-        // stays out of the way).
+        // `native`: private-and-static but bodyless; only methods WITH
+        // bodies are checked.
         let src =
             "class C { private static native void poke(int handle); void m() { poke(1); } }\n";
         assert!(hygiene_messages(src, true).is_empty());
@@ -2521,10 +2775,8 @@ mod tests {
 
     #[test]
     fn shadowing_only_ever_silences() {
-        // The local `size` shadows the field, so every `size` use in `m`
-        // binds to the local. Name-occurrence detection cannot tell them
-        // apart, so the truly-unused FIELD must stay silent — shadowing may
-        // only ever cause silence, never a false warning.
+        // The local `size` shadows the field, so name-occurrence detection
+        // can't tell them apart — the truly-unused field stays silent.
         let src = "class C {
             private int size = 1;
             void m() {
@@ -2568,5 +2820,414 @@ mod tests {
             "fixture must contain an ERROR node"
         );
         assert!(hygiene_messages(src, true).is_empty());
+    }
+
+    // ---- Method/constructor applicability -----------------------
+
+    fn codes(src: &str, symbols: &dyn SymbolSource) -> Vec<Option<String>> {
+        semantic(src, symbols, true, false)
+            .into_iter()
+            .map(|d| match d.code {
+                Some(NumberOrString::String(s)) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_code(src: &str, symbols: &dyn SymbolSource, code: &str) -> bool {
+        codes(src, symbols)
+            .iter()
+            .any(|c| c.as_deref() == Some(code))
+    }
+
+    #[test]
+    fn constructor_argument_mismatch_is_invalid_instantiation() {
+        let src = "package demo; class User { User(User copy) {} } class Order {} \
+                   class C { void m() { new User(new Order()); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
+    }
+
+    #[test]
+    fn no_declared_constructor_uses_the_synthesized_default() {
+        let src = "class User {} class C { void m() { new User(); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn declaring_any_constructor_removes_the_synthesized_default() {
+        let src = "package demo; class User { User(User copy) {} } \
+                   class C { void m() { new User(1); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
+    }
+
+    #[test]
+    fn cannot_instantiate_interface_directly() {
+        let src = "interface Named {} class C { void m() { new Named(); } }\n";
+        let msgs = diags(src, &NoSymbols);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("cannot instantiate interface 'Named'")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_interface_implementation_is_clean() {
+        let src = "interface Named {} class C { void m() { new Named() {}; } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn cannot_instantiate_abstract_class_directly() {
+        let src = "abstract class Shape {} class C { void m() { new Shape(); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
+    }
+
+    #[test]
+    fn anonymous_abstract_class_subclass_is_clean() {
+        let src = "abstract class Shape {} class C { void m() { new Shape() {}; } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn cannot_instantiate_enum_directly() {
+        let src = "enum Color { A } class C { void m() { new Color(); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
+    }
+
+    #[test]
+    fn unqualified_inner_class_creation_needs_an_enclosing_instance() {
+        let src = "class Outer { class Inner {} } \
+                   class C { void m() { new Outer.Inner(); } }\n";
+        let msgs = diags(src, &NoSymbols);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("enclosing instance required")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_inner_class_creation_is_clean() {
+        let src = "class Outer { class Inner {} } \
+                   class C { void m() { new Outer().new Inner(); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn static_nested_class_creation_needs_no_enclosing_instance() {
+        let src = "class Outer { static class Inner {} } \
+                   class C { void m() { new Outer.Inner(); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn private_constructor_from_another_top_level_class_is_inaccessible() {
+        let src = "class P { private P() {} } class C { void m() { new P(); } }\n";
+        let msgs = diags(src, &NoSymbols);
+        assert!(
+            msgs.iter().any(|m| m.contains("not accessible")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn private_constructor_from_the_same_top_level_nest_is_clean() {
+        let src = "class P { private P() {} class Inner { void m() { new P(); } } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn package_private_constructor_across_packages_is_inaccessible() {
+        let provider = "package a; public class P { P() {} }\n";
+        let consumer = "package b; import a.P; class C { void m() { new P(); } }\n";
+        let diagnostics = semantic_for_sources(&[provider, consumer], 1, &NoSymbols, true, false);
+        assert!(
+            diagnostics.iter().any(|d| d.code
+                == Some(NumberOrString::String(
+                    INVALID_INSTANTIATION_CODE.to_string()
+                ))),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn package_private_constructor_in_the_same_package_is_clean() {
+        let provider = "package a; public class P { P() {} }\n";
+        let consumer = "package a; class C { void m() { new P(); } }\n";
+        assert!(semantic_for_sources(&[provider, consumer], 1, &NoSymbols, true, false).is_empty());
+    }
+
+    #[test]
+    fn protected_constructor_across_packages_is_silent() {
+        let provider = "package a; public class P { protected P() {} }\n";
+        let consumer = "package b; import a.P; class C { void m() { new P(); } }\n";
+        assert!(semantic_for_sources(&[provider, consumer], 1, &NoSymbols, true, false).is_empty());
+    }
+
+    #[test]
+    fn record_canonical_constructor_checks_argument_types() {
+        let src = "record R(int a) {} class C { void m() { new R(\"x\"); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INSTANTIATION_CODE));
+    }
+
+    #[test]
+    fn record_canonical_constructor_accepts_matching_arguments() {
+        let src = "record R(int a) {} class C { void m() { new R(1); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn overload_selection_proves_the_selected_returns_return_mismatch() {
+        let src = "package demo; class User {} class Order {} \
+                   class C { User pick(User u) { return u; } Order pick(Order o) { return o; } \
+                   void m() { Order o = pick(new User()); } }\n";
+        assert!(has_code(src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    #[test]
+    fn no_overload_accepts_a_primitive_argument() {
+        let src = "package demo; class User {} class Order {} \
+                   class C { User pick(User u) { return u; } Order pick(Order o) { return o; } \
+                   void m() { pick(1); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
+    #[test]
+    fn strict_phase_widening_is_preferred_over_boxing() {
+        let src = "class C { long f(long a) { return a; } boolean f(Integer a) { return false; } \
+                   void m() { long x = f(1); } }\n";
+        let symbols = ObjectAware(vec![("java.lang.Integer", Vec::new(), Vec::new())]);
+        assert!(diags(src, &symbols).is_empty());
+    }
+
+    #[test]
+    fn fixed_arity_overload_beats_varargs() {
+        let src = "class C { void g(int a, int b) {} void g(int... xs) {} \
+                   void m() { g(1, 2); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_call_between_unrelated_reference_overloads() {
+        let src = "package demo; class User {} class Order {} \
+                   class C { void h(User u) {} void h(Order o) {} void m() { h(null); } }\n";
+        assert!(has_code(src, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
+    #[test]
+    fn lambda_argument_is_checked_against_function_arity() {
+        let clean = "interface Fn { void run(); } \
+                     class C { void h(Fn f) {} void m() { h(() -> {}); } }\n";
+        assert!(diags(clean, &NoSymbols).is_empty());
+
+        let wrong = "interface Fn { void run(); } \
+                     class C { void h(Fn f) {} void m() { h(value -> {}); } }\n";
+        assert!(has_code(wrong, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
+    #[test]
+    fn constructor_method_reference_is_applicable_to_function_target() {
+        let src = "interface Factory<T, R> { R make(T value); } \
+                   class Animal { Animal(String name) {} } \
+                   class C { void use(Factory<String, Animal> factory) {} \
+                   void m() { use(Animal::new); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn incomplete_receiver_hierarchy_silences_invocation_checks() {
+        let src = "class Foo extends Missing { void bar(int x) {} } \
+                   class C { void m() { new Foo().bar(1, 2); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn unresolvable_argument_never_produces_an_invocation_error() {
+        let src = "class C { void h(int a) {} void m() { h(new Missing()); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn diamond_constructor_infers_class_type_argument_for_assignment_checks() {
+        let src = "class User {} class Order {} \
+                   class Box<T> { Box(T v) {} T get() { return null; } } \
+                   class C { void m() { Box<User> b = new Box<>(new User()); Order o = b.get(); } }\n";
+        assert!(has_code(src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    #[test]
+    fn diamond_constructor_infers_var_local_type() {
+        let src = "class User {} \
+                   class Box<T> { Box(T v) {} T get() { return null; } } \
+                   class C { void m() { var b = new Box<>(new User()); User u = b.get(); } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn explicit_non_diamond_type_argument_is_honored_over_inference() {
+        let src = "package demo; class User {} class Order {} \
+                   class Box<T> { Box(T v) {} T get() { return null; } } \
+                   class C { void m() { Box<User> b = new Box<Order>(new Order()); } }\n";
+        assert!(has_code(src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    #[test]
+    fn malformed_constructor_call_recovery_stays_silent() {
+        let src = "class User {}\nclass C { void m() { new User(\n } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn check_instantiation_respects_global_cap() {
+        let calls = (0..crate::MAX_DIAGNOSTICS + 7)
+            .map(|i| format!("void m{i}() {{ new Widget(1); }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let src = format!("class Widget {{ Widget() {{}} }}\nclass C {{\n{calls}\n}}\n");
+        let diagnostics = semantic(&src, &NoSymbols, true, false);
+        assert_eq!(diagnostics.len(), crate::MAX_DIAGNOSTICS);
+        assert!(diagnostics.iter().all(|d| d.code
+            == Some(NumberOrString::String(
+                INVALID_INSTANTIATION_CODE.to_string()
+            ))));
+    }
+
+    #[test]
+    fn provider_with_broken_constructor_header_silences_instantiation_checks() {
+        let provider = "package a; public class P { public P(int a, { } }";
+        let consumer = "package a; class C { void m() { new P(\"x\"); } }";
+        assert!(semantic_for_sources(&[provider, consumer], 1, &NoSymbols, true, false).is_empty());
+    }
+
+    #[test]
+    fn provider_with_broken_extends_silences_assignment_checks() {
+        let provider = "package a; public class Dog extends { }";
+        let consumer = "package a; class Animal {} class C { Animal a = new Dog(); }";
+        assert!(semantic_for_sources(&[provider, consumer], 1, &NoSymbols, true, false).is_empty());
+    }
+
+    /// The nesting cap makes resolution recursion depth a constant,
+    /// independent of how deeply the source nests calls. Measured: without
+    /// the cap, 120 nested calls overflow a 1 MiB stack; with it the same
+    /// input completes. 40 levels is past the cap (64 nesting slots = 32
+    /// source levels, two slots per level), so the engine must go silent
+    /// rather than keep descending.
+    #[test]
+    fn nested_call_arguments_past_the_cap_are_silent() {
+        let mut expr = "1".to_string();
+        for _ in 0..40 {
+            expr = format!("id({expr})");
+        }
+        let src = format!(
+            "class Box {{}} class C {{ int id(int x) {{ return x; }} void m() {{ Box b = {expr}; }} }}\n"
+        );
+        assert!(diags(&src, &NoSymbols).is_empty()); // silent, and it returned
+    }
+
+    #[test]
+    fn shallow_nested_call_arguments_are_still_proven() {
+        // 10 levels is far under the cap: the mismatch must still be flagged.
+        let mut expr = "1".to_string();
+        for _ in 0..10 {
+            expr = format!("id({expr})");
+        }
+        let src = format!(
+            "class Box {{}} class C {{ int id(int x) {{ return x; }} void m() {{ Box b = {expr}; }} }}\n"
+        );
+        assert!(has_code(&src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    /// A `package` declaration is required for these: `Imports::candidates`
+    /// never offers the bare simple name, so an unpackaged project class
+    /// can't be resolved from another type's `implements` clause.
+    #[test]
+    fn enhanced_for_over_project_iterable_infers_element() {
+        // `Bag implements Iterable<Item>`: `var i` is Item, so `i.size` (int)
+        // resolves and assigning it to an Item is proven incompatible.
+        let symbols = ObjectAware(vec![("java.lang.Iterable", vec![], vec![])]);
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag implements Iterable<Item> {}\n\
+                   class C { void m(Bag bag) { for (var i : bag) { Item x = i.size; } } }\n";
+        assert!(has_code(src, &symbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    #[test]
+    fn enhanced_for_over_project_iterable_subclass_infers_element() {
+        // Two hops with substitution: `Sack extends Bag<Item>`, `Bag<T> implements Iterable<T>`.
+        let symbols = ObjectAware(vec![("java.lang.Iterable", vec![], vec![])]);
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag<T> implements Iterable<T> {}\n\
+                   class Sack extends Bag<Item> {}\n\
+                   class C { void m(Sack sack) { for (var i : sack) { Item x = i.size; } } }\n";
+        assert!(has_code(src, &symbols, INCOMPATIBLE_ASSIGNMENT_CODE));
+    }
+
+    #[test]
+    fn enhanced_for_over_raw_project_iterable_is_silent() {
+        let symbols = ObjectAware(vec![("java.lang.Iterable", vec![], vec![])]);
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag<T> implements Iterable<T> {}\n\
+                   class C { void m(Bag bag) { for (var i : bag) { Item x = i.size; } } }\n";
+        assert!(diags(src, &symbols).is_empty());
+    }
+
+    #[test]
+    fn enhanced_for_over_wildcard_project_iterable_is_silent() {
+        let symbols = ObjectAware(vec![("java.lang.Iterable", vec![], vec![])]);
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag<T> implements Iterable<T> {}\n\
+                   class C { void m(Bag<? extends Item> bag) { for (var i : bag) { Item x = i.size; } } }\n";
+        assert!(diags(src, &symbols).is_empty());
+    }
+
+    #[test]
+    fn enhanced_for_over_incomplete_hierarchy_is_silent() {
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag extends Missing {}\n\
+                   class C { void m(Bag bag) { for (var i : bag) { Item x = i.size; } } }\n";
+        assert!(diags(src, &NoSymbols).is_empty());
+    }
+
+    #[test]
+    fn enhanced_for_over_non_iterable_project_type_is_silent() {
+        let symbols = ObjectAware(vec![("java.lang.Iterable", vec![], vec![])]);
+        let src = "package p;\n\
+                   class Item { int size; }\n\
+                   class Bag {}\n\
+                   class C { void m(Bag bag) { for (var i : bag) { Item x = i.size; } } }\n";
+        assert!(diags(src, &symbols).is_empty());
+    }
+
+    /// A functional interface nested in the calling class is in scope by
+    /// simple name (JLS 6.5.5.1), but its binary name is `p.C$Fn`, which no
+    /// file-level import candidate can produce. Without nesting-aware
+    /// resolution the whole lambda check silently degrades to Unknown.
+    #[test]
+    fn nested_functional_interface_still_checks_lambda_arity() {
+        let ok = "package p; class C { interface Fn { void run(); } \
+                  void h(Fn f) {} void m() { h(() -> {}); } }\n";
+        assert!(
+            diags(ok, &NoSymbols).is_empty(),
+            "{:?}",
+            diags(ok, &NoSymbols)
+        );
+        let wrong = "package p; class C { interface Fn { void run(); } \
+                     void h(Fn f) {} void m() { h(value -> {}); } }\n";
+        assert!(has_code(wrong, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
+    /// A sibling type in the *unnamed* package is named by its simple name,
+    /// which is also its binary name.
+    #[test]
+    fn default_package_sibling_type_resolves_for_lambda_targets() {
+        let wrong = "interface Fn { void run(); } \
+                     class C { void h(Fn f) {} void m() { h(value -> {}); } }\n";
+        assert!(has_code(wrong, &NoSymbols, INVALID_INVOCATION_CODE));
     }
 }

@@ -1,0 +1,15 @@
+{
+  "vscodeVersion": "1.137.0",
+  "vscodePlatform": "linux-x64 or linux-arm64, matching the build host",
+  "nodeVersion": "20.20.2",
+  "nodeSha256Amd64": "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d",
+  "nodeSha256Arm64": "73093db209e4e9e09dd7d15a47aeaab1b74833830df03efa5f942a1122c5fa71",
+  "rustVersion": "1.98.1",
+  "redhatJava": {
+    "id": "redhat.java",
+    "version": "1.57.2026090408",
+    "url": "https://open-vsx.org/api/redhat/java/1.57.2026090408/file/redhat.java-1.57.2026090408.vsix",
+    "sha256": "2249b3669443f88e82243ad4fae8b1247741bafe341f52d1e6d15cd2e720ed6e",
+    "notes": "1.57.2026091108 (the newest build as of this pin) throws a repeating java.lang.NoSuchFieldError from lombok.eclipse.EclipseAST on every completion/definition/hover request — a real Lombok/JDT-internals version-skew regression in that specific build, not a harness bug. Confirmed absent in this one-build-older 1.57.2026090408. Re-check on upgrade."
+  }
+}
