@@ -92,11 +92,23 @@ pub fn structural_diagnostics(
     out
 }
 
-/// The nearest enclosing type declaration around `node`, or `None` if
-/// `node` isn't nested in one.
+/// The type declaration a node belongs to.
+///
+/// An anonymous class has no `*_declaration` node — it is a bare `class_body`
+/// hanging off an `object_creation_expression` — so a naive walk to the
+/// nearest declaration escapes it and lands on the enclosing type. That made
+/// every method of `return new CloseableIterator<T>() { ... };` inside a
+/// `static` interface method look like an interface method with a body. An
+/// anonymous class is always a class, so its members may have bodies.
 fn enclosing_type(node: Node) -> Option<(Node, TypeKind)> {
     let mut cur = node.parent();
     while let Some(p) = cur {
+        if p.kind() == "class_body"
+            && p.parent()
+                .is_some_and(|g| g.kind() == "object_creation_expression")
+        {
+            return Some((p, TypeKind::Class));
+        }
         if let Some(kind) = TypeKind::from_kind(p.kind()) {
             return Some((p, kind));
         }
@@ -448,9 +460,16 @@ fn check_package(
         // 2+ package declarations is ambiguous for this check: stay
         // silent rather than guess which one is authoritative.
         if decls.is_empty() {
+            // A compilation unit that declares no type cannot be in the
+            // wrong place: an empty file is legal Java (JLS 7.3) and javac
+            // accepts it, as does a file holding only comments or imports.
+            // cbioportal ships a 0-byte `DataAccessTokenConfig.java`.
+            let declares_a_type = named_children(root)
+                .iter()
+                .any(|child| TypeKind::from_kind(child.kind()).is_some());
             // No node to scope an error-guard to for an absent
             // declaration, so fall back to checking the whole file.
-            if !expected.is_empty() && !root.has_error() {
+            if declares_a_type && !expected.is_empty() && !root.has_error() {
                 out.push(diagnostic(
                     index.range(root.child(0).unwrap_or(root)),
                     format!(
@@ -904,6 +923,42 @@ mod tests {
         assert_eq!(
             msgs,
             vec!["interface abstract methods cannot have body".to_string()]
+        );
+    }
+
+    /// An anonymous class inside a `static` interface method is a *class*,
+    /// so its methods may have bodies. The enclosing-type walk used to skip
+    /// the anonymous `class_body` — it has no `*_declaration` node — and
+    /// land on the interface, flagging every method of
+    /// `return new CloseableIterator<T>() { ... };`.
+    #[test]
+    fn anonymous_class_in_an_interface_method_may_have_method_bodies() {
+        let msgs = structural(
+            "interface Iter {\n  static Iter empty() {\n    return new Iter() {\n      public void run() { }\n    };\n  }\n  void run();\n}\n",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    /// A compilation unit that declares no type cannot be in the wrong
+    /// package. An empty file is legal Java (JLS 7.3) and javac accepts it;
+    /// cbioportal ships a 0-byte one.
+    #[test]
+    fn typeless_compilation_unit_has_no_package_mismatch() {
+        assert!(diags("", Some("Empty.java"), Some("demo")).is_empty());
+        assert!(diags("// only a comment\n", Some("C.java"), Some("demo")).is_empty());
+    }
+
+    /// A file that does declare a type still has to sit where its package
+    /// says, so the narrowing above must not silence the real case.
+    #[test]
+    fn missing_package_declaration_is_flagged_when_a_type_is_declared() {
+        let msgs = diags("class A {}\n", Some("A.java"), Some("demo"));
+        assert_eq!(
+            msgs,
+            vec![
+                "The declared package \"\" does not match the expected package \"demo\""
+                    .to_string()
+            ]
         );
     }
 

@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Fixed
+- **Enum `values()`/`valueOf()` resolve inside the enum's own file.** The
+  compiler synthesizes both onto every enum, but only the path that lowers a
+  type for *other* files supplied them. A call reached from another file
+  resolved while the identical call inside the enum's own file reported
+  `Cannot resolve method 'values'`. Both walks now share one definition.
+- **Anonymous classes inside interface methods may have method bodies.** An
+  anonymous class has no declaration node — it is a bare class body on a
+  `new` expression — so the enclosing-type walk stepped over it and landed
+  on the interface, reporting `interface abstract methods cannot have body`
+  for every method of a `return new Foo() { ... };` inside a `static`
+  interface method. A real interface method with a body is still reported.
+- **A file declaring no type is no longer reported as being in the wrong
+  package.** An empty compilation unit is legal Java and javac accepts it; a
+  file that does declare a type is still checked.
 - **Diamond constructors use the target type.** `new Foo<>(...)` inferred its
   type arguments from the constructor arguments alone, ignoring the type the
   expression is required to produce. In Spring code that made

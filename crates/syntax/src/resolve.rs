@@ -2230,6 +2230,14 @@ fn walk_members<'t>(
                     acc,
                     depth + 1,
                 );
+                // `values()`/`valueOf(String)` are synthesized onto the enum
+                // itself, not inherited from `java.lang.Enum`, so the walk
+                // above does not supply them.
+                for m in crate::srcclass::enum_synthetic_members(td.name, td.binary_name.clone()) {
+                    if acc.seen.insert(m.signature.clone()) {
+                        acc.out.push(HierMember::External(m));
+                    }
+                }
             }
         }
         // Arrays expose exactly `length`, `clone()`, and Object's members.
@@ -2460,6 +2468,13 @@ fn diag_walk(
                     visited_fqn,
                     depth + 1,
                 );
+                // Synthesized onto the enum itself rather than inherited, so
+                // the `java.lang.Enum` walk above does not supply them. Their
+                // absence made `E.values()` inside `E`'s own file report
+                // `Cannot resolve method 'values'`.
+                for m in crate::srcclass::enum_synthetic_members(td.name, td.binary_name.clone()) {
+                    names.insert(m.name);
+                }
             }
         }
         // An array's complete member set is `length` + `clone` (plus

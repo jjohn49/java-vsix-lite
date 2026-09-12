@@ -3125,6 +3125,19 @@ mod tests {
         assert!(has_code(src, &NoSymbols, INCOMPATIBLE_ASSIGNMENT_CODE));
     }
 
+    /// `values()`/`valueOf(String)` are synthesized onto the enum itself, not
+    /// inherited from `java.lang.Enum`. Only the external lowering supplied
+    /// them, so a call reached from another file resolved while the same call
+    /// inside the enum's own file reported `Cannot resolve method 'values'`.
+    #[test]
+    fn enum_synthetic_statics_resolve_inside_the_declaring_file() {
+        let src = "enum Color { RED, GREEN; \
+                   static Color pick(String s) { \
+                   for (Color c : Color.values()) { return c; } return Color.valueOf(s); } }\n";
+        let symbols = ObjectAware(vec![("java.lang.Enum", Vec::new(), Vec::new())]);
+        assert!(diags(src, &symbols).is_empty());
+    }
+
     /// A diamond creation is a poly expression: its type arguments come from
     /// the target, which here also decides *which constructor applies*.
     /// Inferring `T` from the argument instead yields `Box<Headers>` and a

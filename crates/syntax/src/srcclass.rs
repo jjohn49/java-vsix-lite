@@ -351,26 +351,10 @@ pub(crate) fn to_external_class(
     // Enums get compiler-synthesized `values()`/`valueOf(String)` statics, absent
     // from source text. Instance methods come from the `java.lang.Enum` supertype above.
     if td.kind == TypeKind::Enum {
-        members.push(ExternalMember {
-            name: "values".to_string(),
-            kind: ExternalMemberKind::Method,
-            signature: format!("{}[] values()", td.name),
-            template: None,
-            is_static: true,
-            ret_fqn: None,
-            ret_display: Some(format!("{}[]", td.name)),
-            metadata: None,
-        });
-        members.push(ExternalMember {
-            name: "valueOf".to_string(),
-            kind: ExternalMemberKind::Method,
-            signature: format!("{} valueOf(String)", td.name),
-            template: None,
-            is_static: true,
-            ret_fqn: pick_fqn(&imports.candidates(td.name)),
-            ret_display: Some(td.name.to_string()),
-            metadata: None,
-        });
+        members.extend(enum_synthetic_members(
+            td.name,
+            pick_fqn(&imports.candidates(td.name)),
+        ));
     }
 
     // Lombok-generated accessors, gated the same as open documents; `synthesize`
@@ -396,6 +380,42 @@ pub(crate) fn to_external_class(
         members,
         metadata,
     }
+}
+
+/// The statics the compiler synthesizes for every enum — `values()` and
+/// `valueOf(String)` — which never appear in source text.
+///
+/// Shared so the external lowering and the in-document member walks in
+/// [`crate::resolve`] cannot disagree about them. They did: `E.values()`
+/// resolved when `E` came from another file and was reported as
+/// `Cannot resolve method 'values'` from inside `E`'s own file, because only
+/// the external path synthesized them.
+pub(crate) fn enum_synthetic_members(
+    simple_name: &str,
+    own_fqn: Option<String>,
+) -> Vec<ExternalMember> {
+    vec![
+        ExternalMember {
+            name: "values".to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: format!("{simple_name}[] values()"),
+            template: None,
+            is_static: true,
+            ret_fqn: None,
+            ret_display: Some(format!("{simple_name}[]")),
+            metadata: None,
+        },
+        ExternalMember {
+            name: "valueOf".to_string(),
+            kind: ExternalMemberKind::Method,
+            signature: format!("{simple_name} valueOf(String)"),
+            template: None,
+            is_static: true,
+            ret_fqn: own_fqn,
+            ret_display: Some(simple_name.to_string()),
+            metadata: None,
+        },
+    ]
 }
 
 /// Lower a `formal_parameters` node's children to structured parameter types, in order.
