@@ -3081,6 +3081,20 @@ mod tests {
         assert!(has_code(src, &NoSymbols, INVALID_INVOCATION_CODE));
     }
 
+    /// When the body's own call cannot be resolved — in cbioportal its
+    /// arguments come from an enclosing lambda's inferred parameter — the
+    /// shape is not knowable. Treating that as "congruent with neither"
+    /// leaves the overload set tied and reports a false ambiguity, so an
+    /// unresolvable statement expression is treated as congruent with both
+    /// and the most-specific rule decides.
+    #[test]
+    fn unresolvable_expression_lambda_still_selects_an_overload() {
+        let src = "interface Task<T> { T call(); } interface Job { void run(); } \
+                   class C { <T> void submit(Task<T> t) {} void submit(Job j) {} \
+                   void m(Mystery m) { submit(() -> m.compute()); } }\n";
+        assert!(!has_code(src, &NoSymbols, INVALID_INVOCATION_CODE));
+    }
+
     #[test]
     fn constructor_method_reference_is_applicable_to_function_target() {
         let src = "interface Factory<T, R> { R make(T value); } \

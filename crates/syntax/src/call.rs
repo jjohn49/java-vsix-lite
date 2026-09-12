@@ -635,7 +635,7 @@ fn lambda_parameters(lambda: Node) -> Vec<Node> {
 /// `ExecutorService.submit(() -> { ... })` looks like it matches both
 /// overloads and gets reported ambiguous, which javac does not do.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BodyShape {
+pub(crate) enum BodyShape {
     /// No `return` yields a value and the body can complete normally.
     VoidOnly,
     /// Some `return` yields a value.
@@ -705,7 +705,28 @@ fn lambda_block_completes_normally(block: Node, source: &str) -> bool {
         })
 }
 
+/// Memoized entry point. The shape depends only on the lambda itself, but
+/// overload resolution asks about it once per candidate per phase, and
+/// computing it can resolve the body expression — which re-enters call
+/// resolution. Recomputing that per candidate is what made a real 219-line
+/// file take over two minutes.
 fn lambda_body_shape<'t>(lambda: Node<'t>, ctx: &Ctx<'_, 't>) -> BodyShape {
+    let key = lambda.id();
+    match ctx.facts.lambda_shape(key) {
+        Some(Some(shape)) => return shape,
+        // Re-entered while computing: resolving this body asked about this
+        // same lambda. `Unknown` constrains nothing, so the cycle ends
+        // without inventing an answer.
+        Some(None) => return BodyShape::Unknown,
+        None => {}
+    }
+    ctx.facts.begin_lambda_shape(key);
+    let shape = compute_lambda_body_shape(lambda, ctx);
+    ctx.facts.set_lambda_shape(key, shape);
+    shape
+}
+
+fn compute_lambda_body_shape<'t>(lambda: Node<'t>, ctx: &Ctx<'_, 't>) -> BodyShape {
     let Some(body) = lambda.child_by_field_name("body") else {
         return BodyShape::Unknown;
     };
@@ -716,13 +737,22 @@ fn lambda_body_shape<'t>(lambda: Node<'t>, ctx: &Ctx<'_, 't>) -> BodyShape {
             // produces a value can it satisfy a non-void one. `() -> work()`
             // on a `void work()` is void-compatible *only*, which is why the
             // expression's own type has to be resolved rather than assumed.
+            // Only a call that is *known* to return void is void-compatible
+            // only. When the call's type cannot be resolved, fall back to
+            // `Either`: a statement expression is certainly void-compatible,
+            // and assuming it is also value-compatible rejects nothing --
+            // `Either` constrains no candidate, it only lets the
+            // most-specific rule choose, which is what javac does. Answering
+            // `Unknown` here instead leaves the overload set tied and
+            // surfaces a false "ambiguous" error; that is what cbioportal's
+            // `threadPoolTaskExecutor.submit(() -> this.fetch(entry.getKey(),
+            // ...))` hits, where the body's own arguments come from an
+            // enclosing lambda's inferred parameter and do not resolve.
             "method_invocation" => match resolve_expression_type(body, ctx) {
-                Some(resolved) => match resolved.type_ref() {
-                    TypeRef::Void => BodyShape::VoidOnly,
-                    TypeRef::Unknown => BodyShape::Unknown,
-                    _ => BodyShape::Either,
-                },
-                None => BodyShape::Unknown,
+                Some(resolved) if matches!(resolved.type_ref(), TypeRef::Void) => {
+                    BodyShape::VoidOnly
+                }
+                _ => BodyShape::Either,
             },
             // These always produce a value and may also stand alone.
             "object_creation_expression" | "assignment_expression" | "update_expression" => {

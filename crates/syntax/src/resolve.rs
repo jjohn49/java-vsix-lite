@@ -717,6 +717,17 @@ pub(crate) struct FactsCache {
     /// across `resolve_receiver_depth` ↔ `call::resolve_method_call`
     /// re-entry, which restarts the per-call `depth` counter.
     nesting: std::cell::Cell<u32>,
+    /// Per-request memo of [`crate::call::lambda_body_shape`], keyed by
+    /// lambda node id. Overload resolution asks the same lambda about every
+    /// candidate in every phase, and answering can mean resolving the body
+    /// expression — which re-enters call resolution. Without this the work
+    /// is redone per candidate and compounds: a 219-line file with stream
+    /// pipelines took over two minutes.
+    ///
+    /// `None` marks a shape still being computed, so a body whose own
+    /// resolution asks about the same lambda terminates instead of
+    /// recursing.
+    lambda_shapes: RefCell<HashMap<usize, Option<crate::call::BodyShape>>>,
 }
 
 /// Ceiling on nested expression resolutions. Real code stays below 20;
@@ -742,6 +753,20 @@ impl FactsCache {
         }
         self.nesting.set(n + 1);
         Some(NestingGuard(&self.nesting))
+    }
+
+    /// Memoized lambda body shape. Outer `None`: never seen. Inner `None`:
+    /// computation in progress (re-entered).
+    pub(crate) fn lambda_shape(&self, id: usize) -> Option<Option<crate::call::BodyShape>> {
+        self.lambda_shapes.borrow().get(&id).copied()
+    }
+
+    pub(crate) fn begin_lambda_shape(&self, id: usize) {
+        self.lambda_shapes.borrow_mut().insert(id, None);
+    }
+
+    pub(crate) fn set_lambda_shape(&self, id: usize, shape: crate::call::BodyShape) {
+        self.lambda_shapes.borrow_mut().insert(id, Some(shape));
     }
 }
 
