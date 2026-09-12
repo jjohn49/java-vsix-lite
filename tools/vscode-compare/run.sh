@@ -35,6 +35,16 @@ case "${runs}" in
 esac
 
 mkdir -p "${out_dir}"
+# Every bind mount of the output directory below carries `:z`. On an
+# SELinux-enforcing host (Fedora, RHEL) a container may not write to a
+# directory that still has its host label, so every report write fails with
+# EACCES — which looks exactly like a crashed launch, and the retry loop
+# gives up after three identical failures. `:z` has Docker relabel the
+# directory for container use; shared rather than private (`:Z`) because
+# each run directory is written by one container and then read by the
+# post-processing ones. Where SELinux is off (Docker Desktop's and colima's
+# VMs, most Ubuntu hosts) Docker ignores it.
+
 # Builds natively for the host's architecture (amd64 or arm64): the
 # Dockerfile detects the target arch at build time and pins matching Node
 # and VS Code downloads for it. Running VS Code's Electron runtime under
@@ -106,7 +116,7 @@ for run in $(seq 1 "${runs}"); do
       --shm-size=2g \
       -e "JVL_COMPARE_FLAVOR=${flavor}" \
       -e "JVL_COMPARE_SETTLE_SECONDS=${settle_seconds}" \
-      -v "${run_dir}:/out" \
+      -v "${run_dir}:/out:z" \
       "${image}"; do
       if [ "${attempt}" -ge 3 ]; then
         echo "flavor ${flavor} failed 3 times; giving up" >&2
@@ -130,14 +140,14 @@ EOF
   # Post-processing, in its own throwaway container so no measured run is
   # perturbed by it: diff the reports, then render the CPU/memory timeline.
   # Reuses the image's pinned Node — no extra host dependency.
-  docker run --rm -v "${run_dir}:/out" --entrypoint node "${image}" \
+  docker run --rm -v "${run_dir}:/out:z" --entrypoint node "${image}" \
     /work/tools/vscode-compare/harness/compareReports.js /out
-  docker run --rm -v "${run_dir}:/out" --entrypoint node "${image}" \
+  docker run --rm -v "${run_dir}:/out:z" --entrypoint node "${image}" \
     /work/tools/vscode-compare/harness/renderTimeline.js
 done
 
 # Aggregate every run into one report carrying n, median, and spread.
-docker run --rm -v "${out_dir}:/out" --entrypoint node "${image}" \
+docker run --rm -v "${out_dir}:/out:z" --entrypoint node "${image}" \
   /work/tools/vscode-compare/harness/aggregate.js /out
 
 echo

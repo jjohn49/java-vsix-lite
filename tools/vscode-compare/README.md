@@ -115,6 +115,14 @@ runtime under QEMU user-mode emulation was measured to make a bare
 kernel OOM-killed it, so an emulated run doesn't just run slower, it doesn't
 run at all on a typical 16 GB machine.
 
+**SELinux hosts** (Fedora, RHEL): `run.sh` bind-mounts `out/` with `:z` so
+Docker relabels it for container access. Without that, an enforcing host
+denies every report write, and the symptom is misleading: each flavor
+"fails" three times as if VS Code had crashed, leaving an empty
+`out/run-01/` and an AVC denial in `journalctl`. Docker ignores `:z` where
+SELinux is off, so the same script runs unchanged on macOS and Ubuntu. If
+you mount `out/` into the image by hand, add `:z` there too.
+
 Output lands in `tools/vscode-compare/out/`. Top level, across all runs:
 
 - `aggregate.md` / `aggregate.json` — median and range per probe and per
