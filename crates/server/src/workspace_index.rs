@@ -717,6 +717,25 @@ mod tests {
         denied.set_mode(0o0);
         fs::set_permissions(&blocked, denied).expect("remove read permission");
 
+        // Mode bits do not stop a privileged reader, and CI runs this suite as
+        // root inside a container. No portable trick induces a read error for
+        // one either: the scanner descends into anything `is_dir()`, so a
+        // directory named `Blocked.java` gets walked rather than read. Probe
+        // the precondition rather than assuming it: asserting `len() == 1`
+        // where the blocked file is in fact readable fails for a reason that
+        // has nothing to do with the behaviour under test. The message shows
+        // under `--nocapture`; libtest offers no way to report a skip.
+        if fs::read(&blocked).is_ok() {
+            eprintln!(
+                "SKIP unreadable_file_keeps_index_dirty_until_retry_succeeds: \
+                 this process can read a 0o000 file (privileged/root), so the \
+                 read-error path cannot be exercised here"
+            );
+            let _ = fs::set_permissions(&blocked, original);
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
         let index = WorkspaceIndex::new();
         built(&index, std::slice::from_ref(&src), &root).await;
         let first_generation = index.generation();
