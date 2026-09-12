@@ -27,8 +27,60 @@ whenever you want a fresh comparison.
 ## Usage
 
 ```sh
-tools/vscode-compare/run.sh
+tools/vscode-compare/run.sh              # one repetition
+tools/vscode-compare/run.sh --runs 9     # nine, with aggregate statistics
 ```
+
+## Repeated runs
+
+A single repetition is an anecdote: it has no sample size, so nothing in it
+distinguishes a real 40 ms result from a 40 ms result that happened to dodge
+a GC pause. `--runs N` repeats the whole three-container sequence N times
+into `out/run-01/`, `out/run-02/`, ... and then aggregates them.
+
+Three things make the repetitions comparable to each other:
+
+- **The image is built once**, before any measuring. A rebuild mid-sequence
+  would silently change the thing under test.
+- **Flavor order rotates** each run (`none ours redhat`, then
+  `ours redhat none`, ...). Flavors run sequentially, so whoever goes last
+  inherits a host that has been busy for minutes — warmer caches, a hotter
+  CPU, less turbo headroom. Over a multiple of three runs every flavor
+  occupies every slot equally and that drift cancels rather than accruing to
+  one plugin.
+- **Retries are counted, not hidden.** VS Code's Electron occasionally dies
+  with `SIGSEGV` at startup; the run retries, and `aggregate.md` reports how
+  often each flavor needed one. A flavor that retries frequently is itself a
+  finding.
+
+`aggregate.md` reports **median [min–max]** per probe and per flavor. Median
+rather than mean because these are latency samples and one descheduled probe
+drags a mean while leaving a median alone; the full range rather than an
+error bar because at these sample sizes the actual spread is more honest
+than a standard deviation implying a normal distribution latency does not
+have. Standard deviation is still in `aggregate.json`, `null` at n=1. Every
+per-run value is listed too, so a cold first run stays visible instead of
+being smoothed away.
+
+Nine runs (three full rotations, roughly 40 minutes) is a reasonable
+default. Below five, read the range rather than the median.
+
+### Two numbers worth understanding
+
+**`core-s`** is CPU time actually consumed over the measured window — the
+integral of the sampler's CPU% trace. This is the metric to compare, because
+peak CPU% only describes how wide a plugin spread itself for one instant,
+and mean CPU% averages over a window whose *length* is itself one of the
+things that differs between flavors: a plugin finishing in 3 s at 300% looks
+worse than one taking 30 s at 80%, having done a tenth of the work.
+
+**`CPU-capped`** is the share of samples pinned at the host's CPU ceiling.
+When this is non-trivial the run has stopped measuring the plugin and
+started measuring the box — demand beyond the ceiling is invisible, so
+wall-clock stretches to absorb it and `core-s` is truncated. The report
+prints a warning naming the affected flavors. Numbers from a capped run are
+lower bounds on cost and upper bounds on speed; get more cores before
+quoting them.
 
 Prerequisites:
 
@@ -63,14 +115,24 @@ runtime under QEMU user-mode emulation was measured to make a bare
 kernel OOM-killed it, so an emulated run doesn't just run slower, it doesn't
 run at all on a typical 16 GB machine.
 
-Output lands in `tools/vscode-compare/out/`:
+Output lands in `tools/vscode-compare/out/`. Top level, across all runs:
+
+- `aggregate.md` / `aggregate.json` — median and range per probe and per
+  flavor, sample size, retry counts, and the CPU-cap warning.
+- `environment.json` — host kernel/arch, Docker version, CPUs and memory
+  available to containers, the image id every run used, and the settle
+  period. Resource figures are not quotable without it.
+
+Then one directory per repetition (`run-01/`, `run-02/`, ...) containing:
 
 - `report-<flavor>.json` — raw probe results per flavor, including
   `settleSeconds`, absolute `flavorStartedAt`/`flavorEndedAt`, and per-probe
   `startedAt`/`endedAt` timestamps.
-- `comparison.json` — machine-readable diff (`{ summary, rows }`).
-- `comparison.md` — human-readable table, with the baseline as a reference
-  column and `same`/`differs` judged between the two plugins.
+- `run-meta.json` — this repetition's flavor order and per-flavor attempt
+  count.
+- `comparison.json` / `comparison.md` — that repetition's diff, with the
+  baseline as a reference column and `same`/`differs` judged between the two
+  plugins.
 - `stats-<flavor>.csv` — `epochMs,cpuPercent,memMB` rows sampled at 20 Hz
   inside that flavor's own container.
 - `timeline.svg` — all three flavors' CPU% and memory overlaid on shared
